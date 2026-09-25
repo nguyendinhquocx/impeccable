@@ -1,0 +1,49 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # 03:17 Asia/Ho_Chi_Minh = 20:17 UTC hôm trước
+    - cron: "17 20 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Sync fork with upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # GITHUB_TOKEN không có quyền modify workflow files (security restriction).
+          # Merge upstream nhưng preserve .github/workflows/ về pre-merge state hoàn toàn.
+          set -e
+          BRANCH="${{ github.event.repository.default_branch }}"
+          UPSTREAM=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name')
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch upstream "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          PRE_MERGE=$(git rev-parse HEAD)
+          # Merge với -X ours: hunk conflict giữ fork version, non-conflict apply upstream
+          if ! git merge "upstream/$BRANCH" --no-edit -X ours; then
+            # Có conflict (thường modify/delete ở workflow files) → resolve giữ PRE_MERGE
+            git diff --name-only --diff-filter=U | while read f; do
+              git checkout "$PRE_MERGE" -- "$f" 2>/dev/null || rm -f "$f"
+              git add "$f" 2>/dev/null || true
+            done
+            git commit --no-edit --no-verify || true
+          fi
+          # Preserve .github/workflows/ về PRE_MERGE state (loại mọi change của upstream)
+          # git rm -rf để remove cả files mới upstream add (không có ở PRE_MERGE)
+          git rm -rf .github/workflows/ 2>/dev/null || true
+          git checkout "$PRE_MERGE" -- .github/workflows/ 2>/dev/null || true
+          git add -A
+          git diff --cached --quiet HEAD || git commit -m "chore: preserve fork workflow files" --no-verify || true
+          git push origin "$BRANCH"
+          echo "sync ok"
