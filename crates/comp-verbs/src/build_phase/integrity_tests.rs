@@ -951,11 +951,11 @@ impl CapturedEntry for ReviewedCapture {
     fn verify_current(&self) -> Result<(), String> { Ok(()) }
 }
 /// Stands in for the reviewed native renderer: `approved` is what the user accepted.
-struct ReviewedRenderer { hero: Vec<u8>, approved: Option<Vec<u8>> }
+struct ReviewedRenderer { hero: Vec<u8>, approved: Option<Vec<u8>>, report: Value }
 impl EntryRenderer for ReviewedRenderer {
     fn capture_entry(&self, _: &EntryRequest) -> Result<Box<dyn CapturedEntry>, String> {
         let frame = crate::entry_capture::FrameEvidence { name: "hero".into(), png: self.hero.clone(), regions: vec![] };
-        Ok(Box::new(ReviewedCapture(crate::entry_capture::EntryEvidence { report: json!({}), frames: vec![frame] },
+        Ok(Box::new(ReviewedCapture(crate::entry_capture::EntryEvidence { report: self.report.clone(), frames: vec![frame] },
             self.approved.clone().map(|png| crate::entry_capture::ApprovedReference { png, proof: json!({"schema": "test-review"}) }))))
     }
 }
@@ -996,7 +996,7 @@ fn run_reviewed_hero_min(capture: &Image, approved: Option<&Image>, html: &str, 
     let io = ws.io();
     let receipt = json!({"status":"ok","score":0.9,"file":"art.png","assetHash":sha256_file(&io,"art.png"),"compHash":sha256_file(&io,"comp.png"),"regionHash":sha256_bytes(util::json_pretty(&art).as_bytes()),"referenceHash":plate_reference_hash(&spec)});
     let mut state = json!({"comp":"comp.png","capturePolicy":"native-html-v1","plates":{"art":receipt},"phases":{"hero":{}}});
-    let renderer = ReviewedRenderer { hero: png(capture), approved: approved.map(png) };
+    let renderer = ReviewedRenderer { hero: png(capture), approved: approved.map(png), report: json!({}) };
     let gate = gate_hero(&io, &mut state, "unused.png", min, "diff", Some("index.html"), &no_organic_scan, Some(&renderer));
     let report = serde_json::from_slice(&std::fs::read(ws.path.join("diff/report.json")).unwrap()).unwrap();
     (gate, report)
@@ -1140,4 +1140,70 @@ fn responsive_does_not_relitigate_an_accepted_first_viewport_score() {
     assert!(!lapsed.ok);
     assert!(lapsed.reasons.iter().any(|r| r.starts_with("the desktop capture no longer matches the first viewport the user accepted") && r.ends_with("Restore what the user accepted; until then the readings apply.")), "{:?}", lapsed.reasons);
     assert!(!lapsed.reasons.iter().any(|r| r.contains("does not survive a common desktop width")), "{:?}", lapsed.reasons);
+}
+
+/// A code-led first viewport (an Operate dashboard's header, headline and a
+/// control) with no raster region: the native renderer returns frames without
+/// region receipts, and the gate reads the same text and control regions.
+fn text_only_hero(restyled: bool) -> Image {
+    let mut img = r::create_image(240, 160, [244, 244, 240, 255]);
+    r::fill_rect(&mut img, 16., 16., 120., 28., [24., 28., 36., 255.]);
+    if restyled {
+        for x in (18..134).step_by(3) { r::fill_rect(&mut img, x as f64, 18., 1., 24., [240., 240., 240., 255.]); }
+    } else {
+        for y in (18..42).step_by(3) { r::fill_rect(&mut img, 20., y as f64, 112., 1., [240., 240., 240., 255.]); }
+    }
+    r::fill_rect(&mut img, 160., 116., 64., 24., [30., 90., 200., 255.]);
+    img
+}
+
+fn run_text_only_hero(capture: &Image, approved: Option<&Image>) -> (Gate, Value) {
+    let ws = Workspace::new();
+    let png = |i: &Image| png_io::encode_png(i, &[]).unwrap();
+    ws.write("comp.png", &png(&text_only_hero(false)));
+    ws.write("index.html", b"<main><h1>Revenue</h1><button>Export</button></main>");
+    let spec = json!({"comp":"comp.png","compSize":{"width":240,"height":160},"regions":[
+        {"id":"headline","kind":"text","medium":"semantic","note":"striped headline lettering","type":{},
+         "box":{"x":0.0667,"y":0.1,"w":0.5,"h":0.175},"px":{"x":16,"y":16,"w":120,"h":28}},
+        {"id":"export","kind":"control","medium":"semantic","note":"blue export button",
+         "box":{"x":0.6667,"y":0.725,"w":0.2667,"h":0.15},"px":{"x":160,"y":116,"w":64,"h":24}}]});
+    ws.write(SPEC_PATH, util::json_pretty(&spec).as_bytes());
+    let io = ws.io();
+    let mut state = json!({"comp":"comp.png","capturePolicy":"native-html-v1","phases":{"hero":{}}});
+    let renderer = ReviewedRenderer { hero: png(capture), approved: approved.map(png), report: json!({"captureMethod":"assembled-page-viewport"}) };
+    let gate = gate_hero(&io, &mut state, "unused.png", HERO_MIN, "diff", Some("index.html"), &no_organic_scan, Some(&renderer));
+    let report = serde_json::from_slice(&std::fs::read(ws.path.join("diff/report.json")).unwrap()).unwrap();
+    (gate, report)
+}
+
+#[test]
+fn text_only_first_viewport_gets_region_readings_from_the_native_frame() {
+    // The comp itself: the gate measures and passes with no raster region at all.
+    let (gate, report) = run_text_only_hero(&text_only_hero(false), None);
+    assert!(gate.ok, "{:?}", gate.reasons);
+    assert!(gate.score.is_some_and(|s| s >= HERO_MIN), "{:?}", gate.score);
+    let ids: Vec<_> = report["regions"].as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
+    assert!(ids.contains(&"headline") && ids.contains(&"export"), "{ids:?}");
+    // No raster region: the report must not claim the presence checks ran.
+    let scope = report["nativeCapture"]["integrityScope"].as_str().unwrap();
+    assert!(scope.contains("no raster presence") && !scope.starts_with("rendered presence"), "{scope}");
+    assert!(report["nativeCapture"]["framePolicy"].is_null(), "{report}");
+    // A restyled headline is read as a text reading, not as a capture failure.
+    let (gate, _) = run_text_only_hero(&text_only_hero(true), None);
+    assert!(!gate.ok);
+    assert!(gate.reasons.iter().any(|r| r.contains("headline (text) is contradicted")), "{:?}", gate.reasons);
+    assert!(!gate.reasons.iter().any(|r| r.contains("capture unavailable")), "{:?}", gate.reasons);
+}
+
+#[test]
+fn accepted_review_of_a_text_only_first_viewport_lets_it_pass() {
+    let current = text_only_hero(true);
+    let (gate, report) = run_text_only_hero(&current, Some(&current));
+    assert!(gate.ok, "{:?}", gate.reasons);
+    assert!(gate.advisories.iter().any(|a| a.contains("first viewport accepted") || a.contains("accepted in the first-viewport review")), "{:?}", gate.advisories);
+    assert_eq!(report["humanHeroReview"]["viewportAccepted"], true, "{report}");
+    // A stale approval (a different rendering) still waives nothing.
+    let (gate, report) = run_text_only_hero(&current, Some(&text_only_hero(false)));
+    assert!(!gate.ok);
+    assert_eq!(report["humanHeroReview"]["viewportAccepted"], false, "{report}");
 }

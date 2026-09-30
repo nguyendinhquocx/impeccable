@@ -1429,7 +1429,13 @@ fn finish_native_capture(io: &Io, out_dir: &str, gate: &mut Gate, native: &Nativ
                 return;
             }
         };
-        report["nativeCapture"] = json!({"directory":native.directory,"inputs":native.capture.evidence().report,"integrityScope":"rendered presence and minimum frame placement; existing visual scores unchanged","framePolicy":"central-half-with-1px-quantization-tolerance","adequateVisibility":"not-established-by-integrity-checks-alone"});
+        let inputs = &native.capture.evidence().report;
+        report["nativeCapture"] = if inputs["captureMethod"] == "assembled-page-viewport" {
+            // No raster region, so no presence or placement check ran; say so.
+            json!({"directory":native.directory,"inputs":inputs,"integrityScope":"assembled-page viewport from frozen inputs; the comp and approved screenshots are never served to the page; no raster presence or placement check (no raster region); existing visual scores unchanged","adequateVisibility":"not-established-by-integrity-checks-alone"})
+        } else {
+            json!({"directory":native.directory,"inputs":inputs,"integrityScope":"rendered presence and minimum frame placement; existing visual scores unchanged","framePolicy":"central-half-with-1px-quantization-tolerance","adequateVisibility":"not-established-by-integrity-checks-alone"})
+        };
         report["gate"]["ok"] = json!(gate.ok);
         report["gate"]["reasons"] = json!(gate.reasons);
         report["gate"]["unscopedReasons"] = json!(

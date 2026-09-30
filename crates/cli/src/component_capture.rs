@@ -54,7 +54,8 @@ fn crop_viewport(png: &[u8], width: u32, height: u32, clip: [f64; 4]) -> Result<
         &image, rect.x as f64, rect.y as f64, rect.w as f64, rect.h as f64,
     ), &[])
 }
-fn render_page(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_page(
     browser: &mut Browser,
     snapshot: Arc<HtmlSnapshot>,
     width: u32,
@@ -63,6 +64,7 @@ fn render_page(
     isolation: Option<&Value>,
     assembled: bool,
     check_fonts: bool,
+    measure_raster: bool,
 ) -> Result<(Vec<u8>, Value), String> {
     let server = if assembled { snapshot.serve_assembled()? } else { snapshot.serve()? };
     let url = server.entry_url();
@@ -86,6 +88,10 @@ fn render_page(
           return {html:document.documentElement.outerHTML,svg:document.querySelectorAll('svg').length,images:document.images.length,controls:document.querySelectorAll('button,input,select,textarea,a[href]').length};
         })()"#.replace("ASSEMBLED", if assembled { "true" } else { "false" });
         let dom=page.evaluate_value_in_world(&world,&inspect).map_err(|e|e.message)?;
+        // Only the entry capture asks; review proofs keep their shape.
+        let raster_coverage = if measure_raster {
+            Some(page.evaluate_value_in_world(&world, &format!("({})()", include_str!("raster_coverage.js"))).map_err(|e| e.message)?)
+        } else { None };
         let urls = page.observed_response_urls().map_err(|e| e.message)?;
         let evidence = page.response_evidence(&urls).map_err(|e| e.message)?;
         if evidence.truncated
@@ -189,6 +195,9 @@ fn render_page(
             proof["capturedDomSha256"] = json!(hash(captured_dom.as_str().unwrap().as_bytes()));
         }
         proof["fonts"] = fonts;
+        if let Some(coverage) = raster_coverage {
+            proof["rasterCoverage"] = coverage;
+        }
         if assembled {
             proof["kind"] = json!("assembled-page");
             proof["scriptPolicy"] = json!("pinned-local-and-inline; network-api-and-workers-disabled");
@@ -239,7 +248,7 @@ impl ComponentCapturer for NativeComponentCapturer {
         if reference_size["width"] != width || reference_size["height"] != height {
             return Err("comp dimensions do not match its image".into());
         }
-        let env = std::env::vars().collect();
+        let env = impeccable_common::process_env();
         let exe =
             discovery::find_browser(&env).map_err(|e| format!("browser unavailable: {e:?}"))?;
         let mut browser = Browser::launch(&exe, &[], false).map_err(|e| e.message)?;
@@ -299,7 +308,7 @@ impl ComponentCapturer for NativeComponentCapturer {
                     let (png, proof) = if let Some(saved) = cache.get(&cache_key) {
                         saved.clone()
                     } else {
-                        let captured = match render_page(&mut browser, snapshot, width, height, &c["box"], isolation.as_ref(), assembled, check_fonts) {
+                        let captured = match render_page(&mut browser, snapshot, width, height, &c["box"], isolation.as_ref(), assembled, check_fonts, false) {
                             Ok(captured) => captured,
                             Err(error) => {
                                 errors.push(format!("{id} {key}: {error}"));

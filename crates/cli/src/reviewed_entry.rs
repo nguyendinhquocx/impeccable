@@ -135,11 +135,13 @@ fn reference(session: &Path, r: &EntryRequest) -> Result<ApprovedReference, Stri
 }
 impl EntryRenderer for ReviewedEntryRenderer {
     fn capture_entry(&self, r: &EntryRequest) -> Result<Box<dyn CapturedEntry>, String> {
-        let source = CdpEntryRenderer.capture_entry(r)?;
         let candidate = self
             .session
             .as_ref()
             .map(|s| reference(s, r));
+        // A code-only page must not load or inline the screenshot the user approved.
+        let approved_png: Vec<&[u8]> = candidate.iter().filter_map(|c| c.as_ref().ok()).map(|a| a.png.as_slice()).collect();
+        let source = CdpEntryRenderer.capture_forbidding(r, &approved_png)?;
         let mut report = source.evidence().report.clone();
         if let Some(Err(reason)) = &candidate {
             report["humanTextReview"] = json!({"status":"not-current","reason":reason});
