@@ -29,6 +29,8 @@ pub struct FakeEl {
     pub client_left: f64,
     pub scroll_width: f64,
     pub scroll_left: f64,
+    /// `scrollHeight`; `None` reads as NaN, a probe that did not measure it.
+    pub scroll_height: Option<f64>,
     pub offset_width: f64,
     pub offset_height: f64,
     pub is_content_editable: bool,
@@ -46,10 +48,24 @@ pub struct FakeEl {
     pub class_name_is_string: bool,
     /// `innerText` override.
     pub inner_text: Option<String>,
+    /// The properties of the animations running on the element; `None` is a
+    /// probe that could not read them.
+    pub running_animations: Option<Vec<String>>,
+    /// [`Dom::shown_when_scrolled_to`].
+    pub shown_on_scroll: Option<bool>,
+    /// The shadow host of a shadow tree's top-level node.
+    pub shadow_host: Option<ElId>,
+    /// `assignedSlot`.
+    pub assigned_slot: Option<ElId>,
+    /// The slot the element's direct text is assigned to.
+    pub text_slot: Option<ElId>,
 }
 
 #[derive(Debug, Default)]
 pub struct FakeDom {
+    /// A recording made before shadow trees were captured
+    /// ([`Dom::shadow_trees_recorded`] answers `false`).
+    pub shadow_trees_unrecorded: bool,
     pub els: Vec<FakeEl>,
     pub document_element: Option<ElId>,
     pub body: Option<ElId>,
@@ -63,6 +79,14 @@ pub struct FakeDom {
     pub keyframes: HashMap<String, Vec<KeyframeFrame>>,
     pub html_for_patterns: String,
 }
+
+/// Tag names a real parser only ever puts in the SVG namespace, so a test
+/// that builds an icon out of them gets the namespace a browser would give
+/// it. Anything not listed here is XHTML.
+const SVG_ONLY_TAGS: [&str; 12] = [
+    "svg", "text", "path", "rect", "circle", "ellipse", "line", "polyline", "polygon", "g", "defs",
+    "use",
+];
 
 impl FakeDom {
     pub fn new() -> Self {
@@ -89,7 +113,7 @@ impl FakeDom {
         self.els.push(FakeEl {
             styles,
             tag: tag.to_string(),
-            ns: if tag == "svg" || tag == "text" || tag == "path" || tag == "rect" {
+            ns: if SVG_ONLY_TAGS.contains(&tag) {
                 "http://www.w3.org/2000/svg".to_string()
             } else {
                 "http://www.w3.org/1999/xhtml".to_string()
@@ -161,9 +185,8 @@ impl FakeDom {
         self.el_mut(id).rect = Rect::from_xywh(x, y, w, h);
         self
     }
-    /// The union rect of `id`'s direct text, and nothing about its lines:
-    /// a DOM that measured the text once, the way a page snapshot captured
-    /// before the lines were recorded did.
+    /// The union of the client rects of `id`'s own text nodes, as
+    /// `getDirectTextRect` reports it: the glyph box, not the line box.
     pub fn set_text_rect(&mut self, id: ElId, x: f64, y: f64, w: f64, h: f64) -> &mut Self {
         self.el_mut(id).direct_text_rect = Some(Rect::from_xywh(x, y, w, h));
         self
@@ -198,8 +221,35 @@ impl FakeDom {
         self.el_mut(id).selectors.push(selector.to_string());
         self
     }
+    /// The properties the animations running on `id` animate, as the capture
+    /// would record them (`&[]`: it looked and found none).
+    pub fn set_shown_on_scroll(&mut self, id: ElId, shown: bool) -> &mut Self {
+        self.el_mut(id).shown_on_scroll = Some(shown);
+        self
+    }
+    pub fn set_running_animations(&mut self, id: ElId, props: &[&str]) -> &mut Self {
+        self.el_mut(id).running_animations = Some(props.iter().map(|p| p.to_string()).collect());
+        self
+    }
     pub fn set_point(&mut self, x: f64, y: f64, stack: Vec<ElId>) -> &mut Self {
         self.points.push(((x, y), stack));
+        self
+    }
+    /// Add a top-level node of `host`'s open shadow tree. It is nobody's
+    /// child, so document queries never reach it, as in a browser.
+    pub fn add_shadow_child(&mut self, host: ElId, tag: &str) -> ElId {
+        let id = self.add(None, tag);
+        self.el_mut(id).shadow_host = Some(host);
+        id
+    }
+    /// Assign `el` (a light-DOM child of a shadow host) to `slot`.
+    pub fn set_assigned_slot(&mut self, el: ElId, slot: ElId) -> &mut Self {
+        self.el_mut(el).assigned_slot = Some(slot);
+        self
+    }
+    /// Assign `el`'s direct text to `slot`.
+    pub fn set_text_slot(&mut self, el: ElId, slot: ElId) -> &mut Self {
+        self.el_mut(el).text_slot = Some(slot);
         self
     }
 
@@ -208,7 +258,10 @@ impl FakeDom {
         let roots: Vec<ElId> = match root {
             Some(r) => self.child_elements(r),
             None => (1..self.els.len() as ElId)
-                .filter(|&i| self.els[i as usize].parent.is_none())
+                .filter(|&i| {
+                    let e = &self.els[i as usize];
+                    e.parent.is_none() && e.shadow_host.is_none()
+                })
                 .collect(),
         };
         fn walk(dom: &FakeDom, el: ElId, out: &mut Vec<ElId>) {
@@ -402,6 +455,15 @@ impl Dom for FakeDom {
         let i = sibs.iter().position(|&s| s == el)?;
         sibs.get(i + 1).copied()
     }
+    fn first_element_child(&self, el: ElId) -> Option<ElId> {
+        self.els[el as usize]
+            .child_nodes
+            .iter()
+            .find_map(|n| match n {
+                FakeNode::El(id) => Some(*id),
+                _ => None,
+            })
+    }
     fn contains(&self, a: ElId, b: ElId) -> bool {
         let mut cur = Some(b);
         while let Some(c) = cur {
@@ -493,6 +555,27 @@ impl Dom for FakeDom {
             .cloned()
             .unwrap_or_default()
     }
+    fn running_animation_properties(&self, el: ElId) -> Option<Vec<String>> {
+        self.els[el as usize].running_animations.clone()
+    }
+    fn shown_when_scrolled_to(&self, el: ElId) -> Option<bool> {
+        self.els[el as usize].shown_on_scroll
+    }
+    fn flat_parent(&self, el: ElId) -> Option<ElId> {
+        let e = &self.els[el as usize];
+        e.assigned_slot.or(e.parent).or(e.shadow_host)
+    }
+    fn text_slot(&self, el: ElId) -> Option<ElId> {
+        self.els[el as usize].text_slot
+    }
+    fn shadow_children(&self, el: ElId) -> Vec<ElId> {
+        (1..self.els.len() as ElId)
+            .filter(|&i| self.els[i as usize].shadow_host == Some(el))
+            .collect()
+    }
+    fn shadow_trees_recorded(&self) -> bool {
+        !self.shadow_trees_unrecorded
+    }
     fn pseudo_style(&self, el: ElId, pseudo: &str, prop: &str) -> Option<String> {
         let e = &self.els[el as usize];
         // A pseudo with no declared props at all reads as `content: none`
@@ -528,6 +611,9 @@ impl Dom for FakeDom {
     }
     fn scroll_left(&self, el: ElId) -> f64 {
         self.els[el as usize].scroll_left
+    }
+    fn scroll_height(&self, el: ElId) -> f64 {
+        self.els[el as usize].scroll_height.unwrap_or(f64::NAN)
     }
     fn offset_width(&self, el: ElId) -> f64 {
         self.els[el as usize].offset_width

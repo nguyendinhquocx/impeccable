@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Framed HTML demos read as mock context by structure (taste call r5-p26)</title>
+<!--
+  Text inside a framed HTML demo counts as mock context without a mock class:
+  a window with three title-bar dots, a framed box under a preview caption, a
+  device frame that is scaled or tilted in 3D. Inside one, undersized-ui-text,
+  tiny-text and low-contrast report as advisory. Sentence-length copy, a link
+  that goes somewhere, a button and the preview caption itself keep failing. Every row
+  reports; the column says at which severity.
+
+  No class here says mock, preview, terminal or code: those are exempt from
+  two of the three rules already.
+-->
+<style>
+  body { font-family: system-ui, sans-serif; font-size: 16px; color: #1a1a1a; background: #fff; }
+  .col { display: inline-block; width: 440px; vertical-align: top; }
+  h2 { font-size: 20px; margin: 0 0 16px; }
+  .shot { width: 400px; height: 150px; margin: 0 0 24px; background-color: #ffffff; border: 1px solid #d0d7de; border-radius: 12px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); overflow: hidden; }
+  .plain { width: 400px; height: 150px; margin: 0 0 24px; background-color: #ffffff; }
+  .bar { width: 400px; height: 32px; background-color: #f1f3f5; }
+  .lights { display: inline-block; padding: 11px 12px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background-color: #e5484d; margin-right: 6px; vertical-align: top; }
+  .pane { padding: 12px; }
+  .small { font-size: 9px; display: block; }
+  .dim { font-size: 12px; color: #b4b4b4; display: block; }
+  .says { font-size: 9px; float: right; padding: 10px 12px; }
+</style>
+</head>
+<body>
+
+<!-- ================= FAILS ================= -->
+<div class="col" id="fails">
+  <h2>Fails</h2>
+
+  <!-- two dots are not a title bar -->
+  <div class="shot">
+    <div class="bar"><span class="lights"><i class="dot"></i><i class="dot"></i></span></div>
+    <div class="pane"><span class="small fail-two-dots">Ready</span></div>
+  </div>
+
+  <!-- pagination bullets are not window chrome -->
+  <div class="shot">
+    <div class="bar"><span class="lights pagination"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div>
+    <div class="pane"><span class="small fail-pager">Slide two</span></div>
+  </div>
+
+  <!-- in a window: sentence-length copy, a link that goes somewhere, a
+       button, and the caption that calls it a preview -->
+  <div class="shot">
+    <div class="bar"><span class="lights"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span><span class="says fail-says-so">Simulated preview</span></div>
+    <div class="pane">
+      <span class="small fail-sentence">Your export is ready to download from the dashboard.</span>
+      <a href="/plans" class="small fail-goes">See plans</a>
+      <button type="button" class="small fail-tab">Any agent</button>
+    </div>
+  </div>
+
+  <!-- a preview caption over a box that is not drawn as a frame -->
+  <div class="plain">
+    <div class="bar"><span class="says">Live preview</span></div>
+    <div class="pane"><span class="small fail-unframed">Draft saved</span></div>
+  </div>
+
+  <!-- scaled, but not drawn as a frame -->
+  <div class="plain" style="transform: scale(0.7)"><div class="pane"><span class="small fail-bare-scale">8:24 AM</span></div></div>
+
+  <!-- a resting card at scale(0.9) is layout -->
+  <div class="shot" style="transform: scale(0.9)"><div class="pane"><span class="small fail-scale-90">Starter</span></div></div>
+
+  <!-- a tilted slide in a coverflow holds real content -->
+  <div class="shot swiper-slide" style="transform: rotateY(40deg)"><div class="pane"><span class="small fail-slide">Jane Doe</span></div></div>
+
+  <!-- a card flipped on its back is not tilted -->
+  <div class="shot" style="transform: rotateY(180deg)"><div class="pane"><span class="small fail-flipped">Back face</span></div></div>
+</div>
+
+<!-- ================= ADVISORY ================= -->
+<div class="col" id="advisory">
+  <h2>Advisory</h2>
+
+  <!-- a window with three title-bar dots: undersized-ui-text, tiny-text, low-contrast -->
+  <div class="shot">
+    <div class="bar"><span class="lights"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div>
+    <div class="pane">
+      <span class="small adv-dots">847 results</span>
+      <span class="small adv-dots-run">VP Sales at Lattice since 2021</span>
+      <span class="dim adv-dots-dim">Draft saved</span>
+    </div>
+  </div>
+
+  <!-- a framed box under a preview caption -->
+  <div class="shot">
+    <div class="bar"><span class="says">Live preview</span></div>
+    <div class="pane"><span class="small adv-captioned">Draft saved</span></div>
+  </div>
+
+  <!-- a device frame scaled down -->
+  <div class="shot" style="transform: scale(0.7)"><div class="pane"><span class="small adv-scaled">8:24 AM</span></div></div>
+
+  <!-- a device frame tilted in 3D -->
+  <div class="shot" style="transform: perspective(900px) rotateX(8deg)"><div class="pane"><span class="small adv-tilted">coldtea.ai</span></div></div>
+</div>
+
+</body>
+</html>

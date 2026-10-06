@@ -26,4 +26,6 @@ sha1 = "0.10"
 sha2 = "0.10"
 
 [dev-dependencies]
+# Encodes a non-PNG comp for the stale-cache crop test.
+image = { version = "0.25", default-features = false, features = ["gif"] }
 serde_json = { workspace = true, features = ["preserve_order", "float_roundtrip"] }

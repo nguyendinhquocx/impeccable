@@ -112,12 +112,6 @@ pub(crate) fn render_page(
             if record.url.starts_with("data:image/") {
                 continue;
             }
-            if record.url == format!("{origin}/favicon.ico")
-                && record.status == Some(404.)
-                && snapshot.bytes("favicon.ico").is_none()
-            {
-                continue;
-            }
             let Some(target) = record.url.strip_prefix(&origin) else {
                 dependency_errors.insert(format!("external dependency: {}", record.url));
                 continue;

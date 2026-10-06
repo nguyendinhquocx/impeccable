@@ -165,6 +165,13 @@ const __impeccableDom = {
   namespace_uri(el) { return __el(el).namespaceURI || ''; },
   parent(el) { return __intern(__el(el).parentElement); },
   children(el) { return __ids_of(__el(el).children); },
+  // The top-level elements of the open shadow tree el hosts; none for a
+  // closed or absent one.
+  shadow_children(el) {
+    let root = null;
+    try { root = __el(el).shadowRoot; } catch { root = null; }
+    return root ? __ids_of(root.children) : [];
+  },
   previous_element_sibling(el) { return __intern(__el(el).previousElementSibling); },
   next_element_sibling(el) { return __intern(__el(el).nextElementSibling); },
   contains(a, b) { return __el(a).contains(__el(b)); },
@@ -232,6 +239,7 @@ const __impeccableDom = {
   client_left(el) { return __el(el).clientLeft; },
   scroll_width(el) { return __el(el).scrollWidth; },
   scroll_left(el) { return __el(el).scrollLeft; },
+  scroll_height(el) { return __el(el).scrollHeight; },
   offset_width(el) { return __el(el).offsetWidth; },
   offset_height(el) { return __el(el).offsetHeight; },
   check_visibility(el) {
@@ -249,6 +257,42 @@ const __impeccableDom = {
     const right = Math.max(...rects.map(r => r.right));
     const bottom = Math.max(...rects.map(r => r.bottom));
     return [left, top, right - left, bottom - top, top, right, bottom, left];
+  },
+  // JSON `["opacity", ...]`: the properties, hyphenated, of every animation
+  // and transition running on the element itself (running or pending, not a
+  // pseudo-element's). The snapshot records the same (15-snapshot.js
+  // __snapRunningAnimations). undefined when the Web Animations API is
+  // missing or throws.
+  running_animation_properties(el) {
+    const node = __el(el);
+    if (typeof node.getAnimations !== 'function') return undefined;
+    let animations;
+    try { animations = node.getAnimations(); } catch { return undefined; }
+    const metadata = new Set(['offset', 'computedOffset', 'easing', 'composite']);
+    const props = [];
+    const add = (property) => {
+      const name = String(property).startsWith('--')
+        ? String(property)
+        : String(property).replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`);
+      if (name && !props.includes(name)) props.push(name);
+    };
+    for (const animation of animations) {
+      let effect;
+      try {
+        if (animation.playState !== 'running' && !animation.pending) continue;
+        effect = animation.effect;
+      } catch { continue; }
+      if (!effect || effect.pseudoElement || effect.target !== node) continue;
+      if (typeof animation.transitionProperty === 'string') add(animation.transitionProperty);
+      let frames = [];
+      try { frames = effect.getKeyframes?.() || []; } catch { frames = []; }
+      for (const frame of frames) {
+        for (const property of Object.keys(frame)) {
+          if (!metadata.has(property)) add(property);
+        }
+      }
+    }
+    return JSON.stringify(props);
   },
   // Every rect of the element's rendered text, descendants included, flattened
   // into eights. The scope is the element's whole text_content, which is the

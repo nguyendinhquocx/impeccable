@@ -903,7 +903,12 @@ fn serve_exits_after_submission_or_idle_and_removes_its_service_record() {
     assert!(!dir.join("service.json").exists());
     let state = store::read(&dir.join("current.json")).unwrap();
     let rx = serve_in_thread(&dir, 60_000);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Wait for the record rather than a fixed delay: a loaded runner can take
+    // longer than any fixed sleep to bind and write it.
+    let started = std::time::Instant::now();
+    while !dir.join("service.json").exists() && started.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     assert!(dir.join("service.json").exists());
     store::submit(&dir, &approve(&state)).unwrap();
     assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(), Ok(0));

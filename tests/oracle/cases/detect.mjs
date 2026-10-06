@@ -13,6 +13,35 @@ import { REPO_ROOT } from '../lib.mjs';
 
 const FIXTURES = path.join(REPO_ROOT, 'tests', 'fixtures', 'antipatterns');
 
+/**
+ * A project whose DESIGN.md declares `primary` and whose pages wear purple:
+ * a static HTML page with a purple heading and a violet gradient, and a
+ * component with Tailwind purple classes.
+ */
+function stageBrandProject(ws, primary) {
+  fs.writeFileSync(path.join(ws, 'package.json'), '{"name":"brand"}\n');
+  fs.writeFileSync(
+    path.join(ws, 'DESIGN.md'),
+    `---\ncolors:\n  primary: "${primary}"\n  surface: "#ffffff"\n---\n# Brand\n\nThe primary colour is the brand.\n`,
+  );
+  fs.mkdirSync(path.join(ws, 'src'), { recursive: true });
+  fs.writeFileSync(
+    path.join(ws, 'src', 'page.html'),
+    '<!doctype html>\n<html lang="en">\n<head>\n<style>\n'
+      + 'h1 { color: #5c2d91; font-size: 32px; }\n'
+      + '.promo { color: #7c3aed; }\n'
+      + '</style>\n</head>\n<body>\n<h1>Featured services</h1>\n'
+      + '<p class="promo">The brand purple on a promotion.</p>\n</body>\n</html>\n',
+  );
+  fs.writeFileSync(
+    path.join(ws, 'src', 'Hero.jsx'),
+    'export const Hero = () => (\n'
+      + '  <section className="bg-gradient-to-r from-violet-600 to-indigo-600">\n'
+      + '    <h1 className="text-purple-700 text-5xl">Featured services</h1>\n'
+      + '  </section>\n);\n',
+  );
+}
+
 export default function cases() {
   const out = [];
   const entries = fs.readdirSync(FIXTURES, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
@@ -111,11 +140,15 @@ function Thumb({ url }: { url?: string }) {
       args: ['--no-config', '--json', 'locked.html'],
     },
     {
+      // The readable file carries a rounded card so it produces a finding:
+      // the point of the case is that a scanned target still reports next to
+      // the unreadable one's error.
       id: 'detect-unreadable-file-in-dir', verb: 'detect',
       setup: (ws) => {
-        fs.writeFileSync(path.join(ws, 'a.html'), '<div style="border-left: 4px solid #ff0000">x</div>\n');
+        const card = '<div style="border-left: 4px solid #ff0000; border-radius: 10px">x</div>\n';
+        fs.writeFileSync(path.join(ws, 'a.html'), card);
         const p = path.join(ws, 'b.html');
-        fs.writeFileSync(p, '<div style="border-left: 4px solid #ff0000">x</div>\n');
+        fs.writeFileSync(p, card);
         fs.chmodSync(p, 0o000);
       },
       args: ['--no-config', '--json', '.'],
@@ -144,6 +177,16 @@ function Thumb({ url }: { url?: string }) {
     { id: 'detect-config-extensions-dir-no-config', verb: 'detect', workspace: 'detect-extensions', args: ['--no-config', '--json', 'app/views'] },
     // A file in one project must not pick up another project's DESIGN.md
     { id: 'detect-config-cross-project', verb: 'detect', workspace: 'detect-config', args: ['--json', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
+
+    // A DESIGN.md that declares a purple switches ai-color-palette's
+    // purple/violet forms off for its project, in the static and the regex
+    // engines alike, and text mode says so; a DESIGN.md without one changes
+    // nothing (corpus decision r3-23-ai-color-palette-brand-hue).
+    ...['purple', 'blue'].flatMap((hue) => ['json', 'text'].map((mode) => ({
+      id: `detect-design-${hue}-${mode}`, verb: 'detect',
+      setup: (ws) => stageBrandProject(ws, hue === 'purple' ? '#5c2d91' : '#1a4d8f'),
+      args: mode === 'json' ? ['--json', 'src'] : ['src'],
+    }))),
   );
 
   return out;

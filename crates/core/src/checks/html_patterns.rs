@@ -3,10 +3,11 @@
 //! `checkHtmlPatterns` (the browser / static shared pattern pass).
 
 use crate::checks::css_scan::{
-    enclosing_css_selector, scan_css_text_for_buried_raster, scan_css_text_for_glow,
+    enclosing_css_selector, scan_css_text_for_buried_raster, scan_css_text_for_glow_with,
     scan_css_text_for_grid_background, scan_css_text_for_inset_stripe, scan_css_text_for_marquee,
     scan_css_text_for_organic_clip_path, scan_css_text_for_pseudo_stripe,
-    scan_css_text_for_pulsing_dot, scan_css_text_for_radial_halo, PatternFinding,
+    scan_css_text_for_pulsing_dot, scan_css_text_for_radial_halo_with, starts_css_property_token,
+    PatternFinding,
 };
 use crate::checks::rules::{RuleHit, ANY, B, BEZIER_RE, D, DOT, W};
 use crate::js::{self, ci, math_round, number_to_string, parse_float, parse_int, WS, WS_CHARS};
@@ -217,12 +218,22 @@ pub fn build_html_pattern_corpora(html: &str) -> HtmlPatternCorpora {
 
 // ─── checkHtmlPatterns ──────────────────────────────────────────────────────
 
-const PURPLE_HEX_ALT: &str = "7c3aed|8b5cf6|a855f7|9333ea|7e22ce|6d28d9|6366f1|764ba2|667eea";
+/// The stock violet hexes the page-level accent check keys on. Kept as a
+/// list rather than a regex fragment because a consumer that can render the
+/// page (the browser pass) asks whether one of them is actually painted
+/// before reporting it.
+pub const PURPLE_ACCENT_HEXES: [&str; 9] = [
+    "7c3aed", "8b5cf6", "a855f7", "9333ea", "7e22ce", "6d28d9", "6366f1", "764ba2", "667eea",
+];
 fn ci_alt(alts: &str) -> String {
     alts.split('|').map(ci).collect::<Vec<_>>().join("|")
 }
 static PURPLE_HEX_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(&format!(r"#(?:{}){B}", ci_alt(PURPLE_HEX_ALT))).expect("PURPLE_HEX_RE")
+    Regex::new(&format!(
+        r"#(?:{}){B}",
+        ci_alt(&PURPLE_ACCENT_HEXES.join("|"))
+    ))
+    .expect("PURPLE_HEX_RE")
 });
 static PURPLE_TEXT_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(&format!(
@@ -355,32 +366,6 @@ re!(
     THEATER_RE,
     format!(r"{B}({W}+){WS}+{theater}{B}", theater = ci("theater"))
 );
-re!(
-    IMG_HOVER_CSS_RE,
-    format!(
-        r"{B}{img}{B}[^,{{}}]*:{hover}{B}[^{{}}]*\{{[^}}]*{B}{transform}{WS}*:{WS}*(?:{scale}|{rotate}|{translate}|{matrix}|{skew})",
-        img = ci("img"),
-        hover = ci("hover"),
-        transform = ci("transform"),
-        scale = ci("scale"),
-        rotate = ci("rotate"),
-        translate = ci("translate"),
-        matrix = ci("matrix"),
-        skew = ci("skew")
-    )
-);
-re!(
-    IMG_TAG_CLASS_RE,
-    format!(
-        r#"<{img}{B}[^>]*{B}{cls}{WS}*={WS}*"([^"]*)""#,
-        img = ci("img"),
-        cls = ci("class")
-    )
-);
-re!(
-    TW_HOVER_TRANSFORM_RE,
-    format!(r"{B}hover:(?:scale|rotate|translate|skew)-")
-);
 
 fn pf(id: &str, snippet: String, selector: Option<String>) -> PatternFinding {
     PatternFinding {
@@ -392,12 +377,67 @@ fn pf(id: &str, snippet: String, selector: Option<String>) -> PatternFinding {
     }
 }
 
+/// What an engine that renders the page knows about it and the pattern pass
+/// cannot read off the text. The default is what the file engines know:
+/// nothing, so every decision comes from the stylesheet text.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PatternContext {
+    /// Whether the page's painted root background is dark. `None` decides
+    /// from dark background declarations in the style text.
+    pub dark_page: Option<bool>,
+}
+
+/// The first `transition` / `transition-property` declaration in the style
+/// text that names a layout property: the one the page-level
+/// `layout-transition` form reports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayoutTransitionDeclaration {
+    /// The layout properties it names, lowercased, in declaration order.
+    pub properties: Vec<String>,
+    /// Byte offset of the declaration in the style text.
+    pub index: usize,
+}
+
+/// See [`LayoutTransitionDeclaration`]. A property token has to be a name of
+/// its own: `border-width`, `line-height`, `scroll-margin` and a custom
+/// property such as `--x-transition` are passed over.
+pub fn first_layout_transition(style_text: &str) -> Option<LayoutTransitionDeclaration> {
+    for tm in TRANSITION_RE.captures_iter(style_text) {
+        let start = tm.get(0).unwrap().start();
+        if !starts_css_property_token(style_text, start) {
+            continue;
+        }
+        let val = js::to_lower_case(&tm[1]);
+        if ALL_WORD_RE.is_match(&val) {
+            continue;
+        }
+        let properties: Vec<String> = LAYOUT_PROP_RE
+            .find_iter(&val)
+            .filter(|m| starts_css_property_token(&val, m.start()))
+            .map(|m| m.as_str().to_string())
+            .collect();
+        if !properties.is_empty() {
+            return Some(LayoutTransitionDeclaration { properties, index: start });
+        }
+    }
+    None
+}
+
 /// JS: checks.mjs#checkHtmlPatterns. `corpora` defaults to
 /// `buildHtmlPatternCorpora(html)`. Findings' `index` fields are byte
 /// offsets into `corpora.style_text`.
 pub fn check_html_patterns(
     html: &str,
     corpora: Option<&HtmlPatternCorpora>,
+) -> Vec<PatternFinding> {
+    check_html_patterns_with(html, corpora, &PatternContext::default())
+}
+
+/// [`check_html_patterns`] with what a rendering engine knows about the page.
+pub fn check_html_patterns_with(
+    html: &str,
+    corpora: Option<&HtmlPatternCorpora>,
+    context: &PatternContext,
 ) -> Vec<PatternFinding> {
     let built;
     let corpora = match corpora {
@@ -513,20 +553,35 @@ pub fn check_html_patterns(
     }
 
     // --- Motion ---
-    if let Some(bm) = BOUNCE_ANIM_RE.captures(style_text) {
+    // The first declaration that names a bounce reports, as before, unless
+    // the stylesheet shows that name's keyframes and they only pulse: a
+    // loader dot scaling from nothing to its size and back is called
+    // `sk-bounceDelay` and neither moves nor overshoots. Then the next
+    // declaration is read, so a pulse never hides a bounce declared after it.
+    // Every bounce-named token in a declaration's list is read the same way,
+    // so a pulse listed first never hides a bounce listed after it.
+    for bm in BOUNCE_ANIM_RE.captures_iter(style_text) {
         let list = &bm[1];
-        let token = COMMA_WS_SPLIT_RE
+        let mut labels: Vec<String> = COMMA_WS_SPLIT_RE
             .split(list)
-            .find(|part| BOUNCE_WORD_RE.is_match(part));
-        let label = match token {
-            Some(t) if !t.is_empty() => t.to_string(),
-            _ => js::trim(list).to_string(),
+            .filter(|part| !part.is_empty() && BOUNCE_WORD_RE.is_match(part))
+            .map(str::to_string)
+            .collect();
+        if labels.is_empty() {
+            labels.push(js::trim(list).to_string());
+        }
+        let Some(label) = labels
+            .into_iter()
+            .find(|label| crate::checks::css_scan::css_keyframes_only_pulse(style_text, label) != Some(true))
+        else {
+            continue;
         };
         findings.push(pf(
             "bounce-easing",
             format!("animation: {}", label),
             enclosing_css_selector(style_text, bm.get(0).unwrap().start()),
         ));
+        break;
     }
 
     for bm in BEZIER_RE.captures_iter(style_text) {
@@ -545,20 +600,12 @@ pub fn check_html_patterns(
         }
     }
 
-    for tm in TRANSITION_RE.captures_iter(style_text) {
-        let val = js::to_lower_case(&tm[1]);
-        if ALL_WORD_RE.is_match(&val) {
-            continue;
-        }
-        let found: Vec<&str> = LAYOUT_PROP_RE.find_iter(&val).map(|m| m.as_str()).collect();
-        if !found.is_empty() {
-            findings.push(pf(
-                "layout-transition",
-                format!("transition: {}", found.join(", ")),
-                None,
-            ));
-            break;
-        }
+    if let Some(declaration) = first_layout_transition(style_text) {
+        findings.push(pf(
+            "layout-transition",
+            format!("transition: {}", declaration.properties.join(", ")),
+            None,
+        ));
     }
 
     findings.extend(scan_css_text_for_pulsing_dot(style_text, Some(html)));
@@ -575,7 +622,7 @@ pub fn check_html_patterns(
     findings.extend(scan_css_text_for_marquee(style_text, Some(html)));
 
     // --- Dark glow / chromatic halo shadows ---
-    let glow_hits = scan_css_text_for_glow(style_text);
+    let glow_hits = scan_css_text_for_glow_with(style_text, context.dark_page);
     if let Some(first) = glow_hits.first() {
         findings.push(pf(
             "dark-glow",
@@ -583,7 +630,7 @@ pub fn check_html_patterns(
             enclosing_css_selector(style_text, first.index),
         ));
     }
-    let halo_hits = scan_css_text_for_radial_halo(style_text);
+    let halo_hits = scan_css_text_for_radial_halo_with(style_text, context.dark_page);
     if let Some(first) = halo_hits.first() {
         findings.push(pf(
             "radial-halo",
@@ -620,25 +667,6 @@ pub fn check_html_patterns(
             findings.push(pf(
                 "theater-slop-phrase",
                 format!("\"{}\"", js::trim(tm.as_str())),
-                None,
-            ));
-        }
-    }
-
-    // --- Generated-UI tells: image hover transform ---
-    if let Some(im) = IMG_HOVER_CSS_RE.find(style_text) {
-        let brace = im.as_str().find('{').unwrap_or(0);
-        findings.push(pf(
-            "image-hover-transform",
-            "img:hover { transform } rule".to_string(),
-            enclosing_css_selector(style_text, im.start() + brace + 1),
-        ));
-    }
-    for im in IMG_TAG_CLASS_RE.captures_iter(html) {
-        if TW_HOVER_TRANSFORM_RE.is_match(&im[1]) {
-            findings.push(pf(
-                "image-hover-transform",
-                "Tailwind hover transform on <img>".to_string(),
                 None,
             ));
         }
@@ -710,5 +738,90 @@ mod tests {
             None,
         );
         assert_eq!(out[0].snippet, "~8px used 11/11 times (100%)");
+    }
+
+    #[test]
+    fn layout_transition_names_only_layout_properties() {
+        let first = |s: &str| first_layout_transition(s).map(|d| d.properties);
+        assert_eq!(first(".a{transition:border-width .2s}"), None);
+        assert_eq!(first(".a{transition:line-height .2s, scroll-margin .2s}"), None);
+        assert_eq!(first(".a{--card-transition:height .2s}"), None);
+        assert_eq!(
+            first(".a{-webkit-transition:max-height .3s}"),
+            Some(vec!["max-height".to_string()])
+        );
+        assert_eq!(
+            first(".a{transition:border-width .2s}.b{transition:padding-top .2s, width .3s}"),
+            Some(vec!["padding-top".to_string(), "width".to_string()])
+        );
+        let css = ".x{color:red}.b{transition:height .3s}";
+        let declaration = first_layout_transition(css).unwrap();
+        assert_eq!(enclosing_css_selector(css, declaration.index).as_deref(), Some(".b"));
+        // The pattern pass reports the first real declaration.
+        let out = check_html_patterns(
+            "<style>.frame{transition:border-width .2s}.tray{transition:height .3s}</style>",
+            None,
+        );
+        let snippets: Vec<&str> = out
+            .iter()
+            .filter(|f| f.id == "layout-transition")
+            .map(|f| f.snippet.as_str())
+            .collect();
+        assert_eq!(snippets, vec!["transition: height"]);
+    }
+
+    /// Hover zoom on card imagery is a long-standing convention, so none of
+    /// the shapes the retired `image-hover-transform` rule used to match are
+    /// reported any more: the CSS rule on the image's own hover, the parent
+    /// card's hover, and the utility-class forms (including the
+    /// `group-hover:` prefix, which fires from the card rather than the
+    /// image).
+    #[test]
+    fn image_hover_zoom_is_silent() {
+        let out = check_html_patterns(
+            "<style>.card img{transition:transform .3s}.card img:hover{transform:scale(1.05)}.card:hover img{transform:scale(1.04)}</style>\
+             <a class=\"card group\"><img class=\"transition-transform group-hover:scale-[1.04] hover:scale-105\" src=\"a.png\" width=\"240\" height=\"160\" alt=\"Card thumbnail\" /></a>",
+            None,
+        );
+        assert!(out.is_empty(), "unexpected findings: {out:?}");
+    }
+    /// epcco.com.sa: SpinKit's loader dots run `sk-circleBounceDelay`, which
+    /// scales a dot from nothing to its size and back.
+    #[test]
+    fn a_bounce_name_whose_keyframes_only_pulse_is_not_a_bounce() {
+        let bounce = |css: &str| -> Vec<String> {
+            check_html_patterns(&format!("<style>{css}</style>"), None)
+                .into_iter()
+                .filter(|f| f.id == "bounce-easing")
+                .map(|f| f.snippet)
+                .collect()
+        };
+        let spinner = ".sk-child:before{animation:sk-circleBounceDelay 1.2s infinite ease-in-out both}\
+@keyframes sk-circleBounceDelay{0%,80%,100%{transform:scale(0)}40%{transform:scale(1)}}";
+        assert!(bounce(spinner).is_empty());
+        // The pulse does not hide a bounce declared after it.
+        let both = format!("{spinner} .ball{{animation:bounce 1s infinite}} @keyframes bounce{{0%,100%{{transform:translateY(-25%)}}50%{{transform:none}}}}");
+        assert_eq!(bounce(&both), vec!["animation: bounce".to_string()]);
+        // Keyframes the stylesheet does not show keep the finding.
+        assert_eq!(
+            bounce(".sk-child:before{animation:sk-circleBounceDelay 1.2s infinite}"),
+            vec!["animation: sk-circleBounceDelay".to_string()]
+        );
+        // A pop past full size is a bounce.
+        assert_eq!(
+            bounce(".badge{animation:bounce-in .4s} @keyframes bounce-in{0%{transform:scale(0)}60%{transform:scale(1.15)}100%{transform:scale(1)}}"),
+            vec!["animation: bounce-in".to_string()]
+        );
+        // review of #947: a pulse listed first in one declaration does not
+        // hide a bounce listed after it in the same list.
+        let listed = ".dot{animation:sk-bounceDelay 1s infinite, bounce-in .4s}\
+@keyframes sk-bounceDelay{0%,100%{transform:scale(0)}50%{transform:scale(1)}}\
+@keyframes bounce-in{0%{transform:scale(0)}60%{transform:scale(1.15)}100%{transform:scale(1)}}";
+        assert_eq!(bounce(listed), vec!["animation: bounce-in".to_string()]);
+        // A list of pulses alone stays quiet.
+        let pulses = ".dot{animation:sk-bounceDelay 1s infinite, sk-bounceDelay2 2s infinite}\
+@keyframes sk-bounceDelay{0%,100%{transform:scale(0)}50%{transform:scale(1)}}\
+@keyframes sk-bounceDelay2{0%,100%{opacity:0}50%{opacity:1}}";
+        assert!(bounce(pulses).is_empty());
     }
 }

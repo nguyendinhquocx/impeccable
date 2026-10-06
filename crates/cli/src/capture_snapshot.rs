@@ -1,5 +1,6 @@
 //! Immutable, explicit static-HTML inputs for native capture. Not a framework server.
 //! The native caller owns the selection; private bound inputs are never HTTP routes.
+use impeccable_browser::html_snapshot::Connections;
 use impeccable_comp_verbs::asset_capture::capture_sha256 as hash;
 use serde_json::{Value, json};
 /// Most raster regions one native capture measures in a frame. The browser
@@ -295,11 +296,16 @@ impl HtmlSnapshot {
         let worker_stop = stop.clone();
         let snapshot = self.clone();
         let worker_host = host.clone();
+        let connections = Connections::default();
+        let worker_connections = connections.clone();
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Acquire) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let _ = respond(&mut stream, &worker_host, &snapshot);
+                    Ok((stream, _)) => {
+                        let (host, snapshot) = (worker_host.clone(), snapshot.clone());
+                        worker_connections.spawn(stream, move |stream| {
+                            let _ = respond(stream, &host, &snapshot);
+                        });
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5))
@@ -313,6 +319,7 @@ impl HtmlSnapshot {
             entry: self.entry.clone(),
             stop,
             worker: Some(worker),
+            connections,
         })
     }
 }
@@ -425,6 +432,7 @@ pub struct SnapshotServer {
     entry: String,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    connections: Connections,
 }
 impl SnapshotServer {
     pub fn entry_url(&self) -> String {
@@ -437,6 +445,7 @@ impl Drop for SnapshotServer {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+        self.connections.close_all();
     }
 }
 fn respond(
@@ -448,8 +457,12 @@ fn respond(
     // switch accepted streams back before write_all; otherwise large bodies
     // stop at EWOULDBLOCK and appear as valid-header/truncated-image responses.
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    // Chrome can connect and then write its request seconds later (see
+    // impeccable_browser::html_snapshot); closing the socket early stalls the
+    // navigation past its timeout. The connection has its own thread, so
+    // waiting longer than any navigation timeout blocks no other request.
+    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut bytes = Vec::new();
     let mut buf = [0u8; 1024];
     while bytes.len() <= 8192 && !bytes.windows(4).any(|x| x == b"\r\n\r\n") {

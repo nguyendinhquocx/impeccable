@@ -20,35 +20,41 @@
 // crates/core/src/browser/snapshot.rs (cargo xtask bundle checks the two
 // lists agree).
 const __SNAP_STYLE_PROPS = [
-  "animationIterationCount", "animationName", "animationTimingFunction",
-  "backdropFilter", "background", "backgroundClip", "backgroundColor",
-  "backgroundImage", "backgroundPosition", "backgroundSize", "blockSize",
-  "borderBottomColor", "borderBottomWidth", "borderBottomStyle",
+  "animationIterationCount", "animationName", "animationTimeline", "animationTimingFunction",
+  "aspectRatio", "backdropFilter", "backfaceVisibility", "background", "backgroundClip",
+  "backgroundColor", "backgroundImage", "backgroundPosition", "backgroundSize",
+  "blockSize", "borderBottomColor", "borderBottomWidth", "borderBottomStyle",
   "borderLeftColor", "borderLeftWidth", "borderLeftStyle", "borderRadius",
   "borderRightColor", "borderRightWidth", "borderRightStyle",
   "borderTopColor", "borderTopWidth", "borderTopStyle", "bottom", "boxShadow",
-  "clip", "clip-path", "clipPath", "color", "content", "contentVisibility",
-  "cssFloat", "display", "filter", "float", "fontFamily", "fontSize",
+  "clip", "clip-path", "clipPath", "color", "colorScheme", "contain", "content",
+  "contentVisibility", "cssFloat", "direction", "display", "filter", "flexWrap", "float",
+  "fontFamily", "fontSize",
   "fontStyle", "fontVariant", "fontVariantCaps", "fontWeight", "height",
   "hyphens", "inlineSize", "inset", "insetBlock", "insetBlockEnd",
   "insetBlockStart", "insetInline", "insetInlineEnd", "insetInlineStart",
-  "left", "letterSpacing", "lineHeight", "marginBottom", "marginLeft",
-  "marginRight", "marginTop", "maxHeight", "maxWidth", "minHeight", "minWidth",
+  "isolation", "left", "letterSpacing", "lineHeight", "marginBottom", "marginLeft",
+  "marginRight", "marginTop", "maskImage", "maxHeight", "maxWidth", "minHeight", "minWidth",
   "mixBlendMode", "objectFit", "objectPosition", "opacity", "outline",
   "outlineColor", "outlineOffset", "outlineStyle", "outlineWidth", "overflow",
   "overflowX", "overflowY", "paddingBottom", "paddingLeft", "paddingRight",
-  "paddingTop", "pointerEvents", "position", "right", "textAlign",
+  "paddingTop", "perspective", "pointerEvents", "position", "right", "rotate",
+  "scale", "textAlign",
   "textDecoration", "textDecorationLine", "textIndent", "textOverflow",
   "textShadow", "textTransform", "top", "transform", "transitionDuration",
-  "transitionProperty", "transitionTimingFunction", "verticalAlign",
+  "transitionProperty", "transitionTimingFunction", "translate", "unicodeBidi",
+  "verticalAlign",
   "visibility", "webkitBackgroundClip", "webkitClipPath", "webkitHyphens",
-  "webkitTextFillColor", "whiteSpace", "width", "wordBreak", "zIndex",
+  "webkitLineClamp", "webkitMaskImage", "webkitTextFillColor",
+  "webkitTextStrokeColor", "webkitTextStrokeWidth", "whiteSpace", "width", "willChange", "wordBreak",
+  "zIndex",
 ];
 // `::before` / `::after` properties, recorded where `content` is set.
 const __SNAP_PSEUDO_PROPS = [
   "content", "position", "opacity", "display", "width", "height", "top",
   "right", "bottom", "left", "backgroundColor", "backgroundImage",
-  "background", "borderRadius", "transform", "visibility",
+  "background", "borderRadius", "transform", "visibility", "zIndex",
+  "translate",
 ];
 // Pseudo-class states recorded per element (`el.matches(':name')`), so the
 // snapshot selector engine can answer `:checked` / `:disabled` / ... the way
@@ -450,32 +456,77 @@ function __snapKeyframes() {
   return out;
 }
 
-// Which recorded pseudo-class states each element carries: one document
-// query per state (cheap), instead of N x states `matches` calls.
-function __snapStates(ids) {
-  const states = new Map();
-  for (const name of __SNAP_STATE_PSEUDOS) {
-    let list;
-    try { list = document.querySelectorAll(':' + name); } catch { continue; }
-    for (const el of list) {
-      const id = ids.get(el);
-      if (!id) continue;
-      let arr = states.get(id);
-      if (!arr) { arr = []; states.set(id, arr); }
-      arr.push(name);
+// The properties every running animation and transition animates, per
+// target element id: `getAnimations()` entries that are running or still
+// pending, on an element rather than a pseudo-element. The document's list
+// leaves out targets inside shadow trees, so each captured shadow root adds
+// its own. `null` when the Web Animations API is missing or throws, which the
+// core reads as unknown.
+function __snapRunningAnimations(ids, shadowRoots = []) {
+  if (typeof document.getAnimations !== 'function') return null;
+  let animations;
+  try {
+    animations = document.getAnimations();
+    for (const root of shadowRoots) {
+      if (typeof root.getAnimations === 'function') animations = animations.concat(root.getAnimations());
     }
   }
-  // Custom elements without a definition (`:defined` is the common case;
-  // record its complement).
-  try {
-    for (const el of document.querySelectorAll(':not(:defined)')) {
-      const id = ids.get(el);
-      if (!id) continue;
-      let arr = states.get(id);
-      if (!arr) { arr = []; states.set(id, arr); }
-      arr.push('undefined');
+  catch { return null; }
+  const metadata = new Set(['offset', 'computedOffset', 'easing', 'composite']);
+  const out = new Map();
+  for (const animation of animations) {
+    let effect;
+    try {
+      if (animation.playState !== 'running' && !animation.pending) continue;
+      effect = animation.effect;
+    } catch { continue; }
+    if (!effect || effect.pseudoElement) continue;
+    const id = ids.get(effect.target);
+    if (!id) continue;
+    let props = out.get(id);
+    if (!props) { props = []; out.set(id, props); }
+    const add = (property) => {
+      const name = __snapCssPropertyName(String(property));
+      if (name && !props.includes(name)) props.push(name);
+    };
+    if (typeof animation.transitionProperty === 'string') add(animation.transitionProperty);
+    let frames = [];
+    try { frames = effect.getKeyframes?.() || []; }
+    catch { frames = []; }
+    for (const frame of frames) {
+      for (const property of Object.keys(frame)) {
+        if (!metadata.has(property)) add(property);
+      }
     }
-  } catch { /* older engines */ }
+  }
+  return out;
+}
+
+// Which recorded pseudo-class states each element carries: one query per
+// state (cheap), instead of N x states `matches` calls. A document query
+// does not reach into shadow trees, so each captured shadow root is asked
+// too: a disabled or checked control inside a web component has its state.
+function __snapStates(ids, shadowRoots = []) {
+  const states = new Map();
+  const scopes = [document, ...shadowRoots];
+  const record = (selector, name) => {
+    for (const scope of scopes) {
+      let list;
+      try { list = scope.querySelectorAll(selector); } catch { return; }
+      for (const el of list) {
+        const id = ids.get(el);
+        if (!id) continue;
+        let arr = states.get(id);
+        if (!arr) { arr = []; states.set(id, arr); }
+        arr.push(name);
+      }
+    }
+  };
+  for (const name of __SNAP_STATE_PSEUDOS) record(':' + name, name);
+  // Custom elements without a definition (`:defined` is the common case;
+  // record its complement). An engine without `:defined` throws, and the
+  // state is not recorded.
+  record(':not(:defined)', 'undefined');
   return states;
 }
 
@@ -577,6 +628,41 @@ const __impeccableSnapshot = {
       for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
     }
 
+    // 1b. Open shadow trees, after every light-DOM element so light ids do
+    // not move. Their top-level nodes are nobody's child (`sh` names the
+    // host), so the core's document walks never reach them; the flat-tree
+    // walk the contrast surface reads does, through `as` and `ts`.
+    // Shadow trees are extra: a page whose light DOM fits the element budget
+    // still captures when its shadow trees do not. A tree that would cross
+    // the budget is dropped whole, and so is every tree after it.
+    const shadowHosts = new Map();
+    const shadowRoots = [];
+    shadowWalk: for (let i = 1; i < elements.length; i++) {
+      const host = elements[i];
+      let root = null;
+      try { root = host.shadowRoot; } catch { root = null; }
+      if (!root) continue;
+      const hostId = i;
+      const mark = elements.length;
+      const shadowStack = [];
+      const tops = root.children;
+      for (let k = tops.length - 1; k >= 0; k--) shadowStack.push(tops[k]);
+      while (shadowStack.length) {
+        const el = shadowStack.pop();
+        if (options.exclude && options.exclude(el)) continue;
+        if (elements.length >= maxElements) {
+          for (const dropped of elements.splice(mark)) ids.delete(dropped);
+          break shadowWalk;
+        }
+        ids.set(el, elements.length);
+        elements.push(el);
+        const kids = el.children;
+        for (let k = kids.length - 1; k >= 0; k--) shadowStack.push(kids[k]);
+      }
+      for (let k = 0; k < tops.length; k++) shadowHosts.set(tops[k], hostId);
+      shadowRoots.push(root);
+    }
+
     // 2. Intern style values.
     const strings = [];
     const stringIndex = new Map();
@@ -587,7 +673,8 @@ const __impeccableSnapshot = {
       return i;
     };
 
-    const states = __snapStates(ids);
+    const states = __snapStates(ids, shadowRoots);
+    const animated = __snapRunningAnimations(ids, shadowRoots);
     const els = new Array(elements.length - 1);
     for (let id = 1; id < elements.length; id++) {
       const el = elements[id];
@@ -598,6 +685,13 @@ const __impeccableSnapshot = {
       if (ns === undefined) { rec.n = 3; rec.nu = nsUri; } else if (ns !== 0) { rec.n = ns; }
       const parent = el.parentElement;
       if (parent) rec.p = ids.get(parent) || 0;
+      const shadowHost = shadowHosts.get(el);
+      if (shadowHost) rec.sh = shadowHost;
+      const slot = el.assignedSlot;
+      if (slot) {
+        const slotId = ids.get(slot);
+        if (slotId) rec.as = slotId;
+      }
       // childNodes: element ids, text data, CDATA as [data].
       const c = [];
       for (const n of el.childNodes) {
@@ -605,7 +699,12 @@ const __impeccableSnapshot = {
           const cid = ids.get(n);
           if (cid) c.push(cid);
         } else if (n.nodeType === 3) {
-          c.push(n.textContent || '');
+          const data = n.textContent || '';
+          c.push(data);
+          if (rec.ts === undefined && data.trim() && n.assignedSlot) {
+            const slotId = ids.get(n.assignedSlot);
+            if (slotId) rec.ts = slotId;
+          }
         } else if (n.nodeType === 4) {
           c.push([n.textContent || '']);
         }
@@ -633,6 +732,7 @@ const __impeccableSnapshot = {
         __snapNum(el.clientWidth), __snapNum(el.clientHeight), __snapNum(el.clientLeft),
         __snapNum(el.scrollWidth), __snapNum(el.scrollLeft),
         __snapNum(el.offsetWidth), __snapNum(el.offsetHeight),
+        __snapNum(el.scrollHeight),
       ];
       rec.v = typeof el.checkVisibility === 'function'
         ? (el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true }) ? 1 : 0)
@@ -654,6 +754,8 @@ const __impeccableSnapshot = {
       if (typeof el.className !== 'string') rec.k = true;
       const st = states.get(id);
       if (st) rec.st = st;
+      const an = animated && animated.get(id);
+      if (an && an.length) rec.an = an;
       if (tag === 'IMG' || tag === 'VIDEO' || tag === 'CANVAS' || tag === 'PICTURE') {
         rec.md = {
           nw: el.naturalWidth || 0, nh: el.naturalHeight || 0,
@@ -696,6 +798,8 @@ const __impeccableSnapshot = {
       bodyInnerText,
       hits: options.hits || [],
     };
+    if (animated) snapshot.anim = true;
+    snapshot.shadow = true;
     const json = JSON.stringify(snapshot);
     if (json.length > maxBytes) {
       return { error: `snapshot is ${json.length} bytes (limit ${maxBytes})` };

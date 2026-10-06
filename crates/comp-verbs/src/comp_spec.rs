@@ -1119,6 +1119,15 @@ pub fn region_source_issue(io: &Io, spec: &Value) -> Option<String> {
     Some(format!("region source {path} changed or is missing since measurement; fix it and re-run comp-spec --regions {path} before continuing"))
 }
 
+/// The comp's pixels, decoded from its own bytes first: `load_raster` may read
+/// a stale sibling PNG cache for a WebP or JPEG source, and both the spec and
+/// a crop must use (and identify) the pixels the approved-comp record and the
+/// spec's `compSha256` identify.
+fn read_comp(io: &Io, comp: &str) -> Result<Image, String> {
+    let own = std::fs::read(resolve(io, comp)).ok().and_then(|b| crate::approved_comp::decode_comp(&b));
+    own.map(Ok).unwrap_or_else(|| png_io::load_raster(&resolve(io, comp)).map(|(d, _)| d.image))
+}
+
 pub fn run(argv: &[String], io: &mut Io) -> i32 {
     let spec_path = arg_or(argv, "spec", SPEC_PATH).to_string();
     if flag(argv, "schema") {
@@ -1173,8 +1182,8 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
             io.err(&format!("comp-spec: {why}\n"));
             return 2;
         }
-        let comp = match png_io::load_raster(&resolve(io, comp_file)) {
-            Ok((d, _)) => d.image,
+        let comp = match read_comp(io, comp_file) {
+            Ok(img) => img,
             Err(e) => {
                 io.err(&format!("comp-spec: cannot read {comp_file}: {e}\n"));
                 return 1;
@@ -1226,10 +1235,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         io.err("usage: comp-spec.mjs --comp <png> (--grid | --regions <json> | --auto) [--spec out.json]\n       comp-spec.mjs --print | --crop <id> [--out file] [--scale n] | --plate-prompt <id>\n");
         return 1;
     };
-    // Decode the comp's own bytes first so the spec measures (and identifies)
-    // the same pixels as the approved-comp record.
-    let own = std::fs::read(resolve(io, comp_path)).ok().and_then(|b| crate::approved_comp::decode_comp(&b));
-    let comp = match own.map(Ok).unwrap_or_else(|| png_io::load_raster(&resolve(io, comp_path)).map(|(d, _)| d.image)) {
+    let comp = match read_comp(io, comp_path) {
         Ok(img) => img,
         Err(e) => {
             io.err(&format!("comp-spec: cannot read {comp_path}: {e}\n"));
@@ -1401,6 +1407,38 @@ mod reference_tests {
         assert_eq!(run(&["--schema".into()], &mut io),0);
     }
 
+
+    #[test]
+    fn crop_reads_the_comp_not_a_stale_png_cache() {
+        let dir = std::env::temp_dir().join(format!("impeccable-crop-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The source the spec measured: solid blue, as a GIF so load_raster
+        // would consult its sibling cache.
+        let blue = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255]));
+        let mut gif = Vec::new();
+        image::DynamicImage::ImageRgba8(blue)
+            .write_to(&mut std::io::Cursor::new(&mut gif), image::ImageFormat::Gif)
+            .unwrap();
+        std::fs::write(dir.join("comp.gif"), &gif).unwrap();
+        // A cache left from an earlier version of the comp: solid red.
+        let red = r::create_image(8, 8, [255, 0, 0, 255]);
+        std::fs::write(dir.join("comp.gif.png"), png_io::encode_png(&red, &[]).unwrap()).unwrap();
+        let mut io = Io::stdio();
+        io.cwd = dir.clone();
+        io.stdout = Box::new(Vec::<u8>::new());
+        io.stderr = Box::new(Vec::<u8>::new());
+        let hash = crate::approved_comp::file_pixel_sha256(&io, "comp.gif").unwrap();
+        let spec = json!({"comp":"comp.gif","compSha256":hash,"regions":[
+            {"id":"band","kind":"text","medium":"code","px":{"x":0,"y":0,"w":8,"h":8}}]});
+        std::fs::write(dir.join("spec.json"), spec.to_string()).unwrap();
+        let argv: Vec<String> = ["--crop", "band", "--spec", "spec.json", "--out", "crop.png"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(run(&argv, &mut io), 0);
+        let (crop, _) = png_io::load_raster(&dir.join("crop.png")).unwrap();
+        assert!(crop.image.data.chunks_exact(4).all(|px| px == [0, 0, 255, 255]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn automatic_snap_preserves_separated_navigation_and_multiline_copy() {

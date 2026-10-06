@@ -1,13 +1,13 @@
 //! Native transport evidence: read the response that was rendered, never refetch.
 use impeccable_browser::{cdp::Browser, discovery};
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
+#[path = "support/http.rs"]
+mod http;
 
 fn launch(exe: &std::path::Path) -> Option<Browser> {
     Browser::launch(exe, &[], false)
@@ -22,38 +22,22 @@ fn response_capture_reads_original_bytes_and_preserves_repeated_url_ambiguity() 
         eprintln!("skip: no browser");
         return;
     };
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let hits = Arc::new(AtomicUsize::new(0));
-    let count = hits.clone();
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let mut request = [0u8; 4096];
-            let n = stream.read(&mut request).unwrap_or(0);
-            let request = String::from_utf8_lossy(&request[..n]);
-            let (kind, body) = if request.starts_with("GET /asset.bin ") {
-                let number = count.fetch_add(1, Ordering::SeqCst);
-                (
-                    "application/octet-stream",
-                    if number == 0 {
-                        vec![0, 255, 13, 128, 42]
-                    } else {
-                        vec![99, 4, 0, 128]
-                    },
-                )
-            } else {
-                (
-                    "text/html",
-                    b"<!doctype html><title>capture</title><body>fixture</body>".to_vec(),
-                )
-            };
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(header.as_bytes());
-            let _ = stream.write_all(&body);
+    let icon_requests = Arc::new(AtomicUsize::new(0));
+    let (count, icons) = (hits.clone(), icon_requests.clone());
+    let origin = http::serve(move |path| match path {
+        "/asset.bin" => {
+            let number = count.fetch_add(1, Ordering::SeqCst);
+            Some((
+                "application/octet-stream",
+                if number == 0 { vec![0, 255, 13, 128, 42] } else { vec![99, 4, 0, 128] },
+            ))
         }
+        "/icon.png" | "/favicon.ico" => {
+            icons.fetch_add(1, Ordering::SeqCst);
+            None
+        }
+        _ => Some(("text/html", b"<!doctype html><title>capture</title><link rel=icon href=/icon.png><body>fixture</body>".to_vec())),
     });
     let Some(mut browser) = launch(&exe) else { return; };
     let mut page = browser.new_page().unwrap();
@@ -63,6 +47,19 @@ fn response_capture_reads_original_bytes_and_preserves_repeated_url_ambiguity() 
     );
     page.begin_response_capture().unwrap();
     page.goto(&origin, "load", Duration::from_secs(15)).unwrap();
+    // Chrome fetches the declared tab icon after load, on its own schedule.
+    // Wait for it so everything below covers it: it is the browser's request,
+    // not the page's, and must not read as a page dependency or a change.
+    let waited = Instant::now();
+    while icon_requests.load(Ordering::SeqCst) == 0 && waited.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(icon_requests.load(Ordering::SeqCst) > 0, "the browser never fetched the declared icon");
+    page.evaluate_value("true").unwrap();
+    assert!(
+        page.observed_response_urls().unwrap().iter().all(|u| !u.ends_with("/icon.png") && !u.ends_with("/favicon.ico")),
+        "the browser's icon fetch is not a page dependency"
+    );
     page.evaluate_value("fetch('/asset.bin').then(r=>r.arrayBuffer()).then(()=>true)")
         .unwrap();
     // Pump a browser round-trip after the fetch's completion event.
@@ -118,18 +115,15 @@ fn large_utf8_document_retains_exact_bytes_without_refetch() {
     // inspector buffer must accommodate it even though the UTF-8 body is <16MiB.
     let body = format!("<!doctype html><meta charset=utf-8><title>€</title><!--{}-->", "a".repeat(9 * 1024 * 1024)).into_bytes();
     let served = body.clone();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://127.0.0.1:{}/index.html", listener.local_addr().unwrap().port());
     let hits = Arc::new(AtomicUsize::new(0));
     let count = hits.clone();
-    let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = [0; 4096];
-        stream.read(&mut request).unwrap();
-        count.fetch_add(1, Ordering::SeqCst);
-        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", served.len()).unwrap();
-        stream.write_all(&served).unwrap();
+    let origin = http::serve(move |path| {
+        (path == "/index.html").then(|| {
+            count.fetch_add(1, Ordering::SeqCst);
+            ("text/html; charset=utf-8", served.clone())
+        })
     });
+    let url = format!("{origin}/index.html");
     let Some(mut browser) = launch(&exe) else { return; };
     let mut page = browser.new_page().unwrap();
     page.begin_response_capture().unwrap();
@@ -141,7 +135,6 @@ fn large_utf8_document_retains_exact_bytes_without_refetch() {
     assert_eq!(hits.load(Ordering::SeqCst), 1);
     page.close();
     browser.close();
-    server.join().unwrap();
 }
 
 #[test]
@@ -151,17 +144,11 @@ fn decoded_text_bodies_match_only_their_served_bytes() {
     // Blink reports these as text: the BOM dropped, the Latin-1 byte as U+FFFD.
     let html = b"\xEF\xBB\xBF<!doctype html><link rel=stylesheet href=a.css><p>x</p>".to_vec();
     let css = b"/* caf\xE9 */\r\np{color:red}".to_vec();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let (served_html, served_css) = (html.clone(), css.clone());
-    std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let mut request = [0u8; 4096];
-            let n = stream.read(&mut request).unwrap_or(0);
-            let (kind, body) = if request[..n].starts_with(b"GET /a.css ") { ("text/css", &served_css) } else { ("text/html", &served_html) };
-            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {kind}; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
-            let _ = stream.write_all(body);
-        }
+    let origin = http::serve(move |path| match path {
+        "/a.css" => Some(("text/css; charset=utf-8", served_css.clone())),
+        "/" => Some(("text/html; charset=utf-8", served_html.clone())),
+        _ => None,
     });
     let Some(mut browser) = launch(&exe) else { return; };
     let mut page = browser.new_page().unwrap();

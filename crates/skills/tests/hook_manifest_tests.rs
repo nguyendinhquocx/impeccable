@@ -273,8 +273,10 @@ fn windows_form_runs_the_shim_in_each_harness_shell() {
                     Err(e) => panic!("{at}: {e}"),
                 };
                 let _ = child.stdin.take().unwrap().write_all(b"{\"probe\":1}\n");
-                // A shell that kept stdin from the shim would leave it reading forever.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                // A shell that kept stdin from the shim would leave it reading
+                // forever. The bound only has to tell that from a slow start:
+                // Windows PowerShell has taken over 30 s to start on a cold runner.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
                 let code = loop {
                     if let Some(status) = child.try_wait().unwrap() {
                         break status.code();
