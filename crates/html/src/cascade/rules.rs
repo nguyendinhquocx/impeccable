@@ -65,7 +65,7 @@
 //!   parse in the same process).
 
 use super::csstree::{self, Important, Node};
-use super::shorthand::{expand_static_box_values, expand_static_declaration};
+use super::shorthand::{expand_static_box_values, expand_static_declaration, Expanded};
 use super::values::split_css_tokens;
 use impeccable_core::js;
 use indexmap::IndexMap;
@@ -244,6 +244,71 @@ impl<K: Hash + Eq> SpecifiedStore<K> {
     }
 }
 
+/// Layout properties the stripe-child static adapter needs that are not in
+/// the frozen `expandStaticDeclaration` allowlist. Applied here so the
+/// recorded vectors stay byte-equal.
+fn extra_specified_expansions(prop: &str, value: &str) -> Vec<Expanded> {
+    let p = js::to_lower_case(prop);
+    let v = js::trim(value);
+    if v.is_empty() {
+        return Vec::new();
+    }
+    match p.as_str() {
+        "flex-direction" => vec![("flexDirection".into(), v.to_string())],
+        "align-items" => vec![("alignItems".into(), v.to_string())],
+        "align-self" => vec![("alignSelf".into(), v.to_string())],
+        // `var()` and CSS-wide keywords resolve later, per longhand; the
+        // stripe adapter picks the keyword out of the resolved list.
+        "flex-flow" | "place-items" | "place-self"
+            if js::to_lower_case(v).contains("var(")
+                || matches!(
+                    js::to_lower_case(v).as_str(),
+                    "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+                ) =>
+        {
+            let longhand = match p.as_str() {
+                "flex-flow" => "flexDirection",
+                "place-items" => "alignItems",
+                _ => "alignSelf",
+            };
+            vec![(longhand.into(), v.to_string())]
+        }
+        // Shorthands reset what they omit: `flex-flow: wrap` is a row.
+        "flex-flow" => {
+            let direction = split_css_tokens(v)
+                .into_iter()
+                .find(|t| {
+                    matches!(
+                        js::to_lower_case(t).as_str(),
+                        "row" | "row-reverse" | "column" | "column-reverse"
+                    )
+                })
+                .unwrap_or_else(|| "row".to_string());
+            vec![("flexDirection".into(), direction)]
+        }
+        "place-items" => split_css_tokens(v)
+            .into_iter()
+            .next()
+            .map(|t| vec![("alignItems".into(), t)])
+            .unwrap_or_default(),
+        "place-self" => split_css_tokens(v)
+            .into_iter()
+            .next()
+            .map(|t| vec![("alignSelf".into(), t)])
+            .unwrap_or_default(),
+        "inset" => {
+            let vals = expand_static_box_values(&split_css_tokens(v));
+            vec![
+                ("top".into(), vals[0].clone()),
+                ("right".into(), vals[1].clone()),
+                ("bottom".into(), vals[2].clone()),
+                ("left".into(), vals[3].clone()),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// JS: css-cascade.mjs#applyStaticDeclaration(specified, node, prop, value, meta)
 pub fn apply_static_declaration<K: Hash + Eq>(
     specified: &mut SpecifiedStore<K>,
@@ -255,6 +320,7 @@ pub fn apply_static_declaration<K: Hash + Eq>(
     let map = specified.map.entry(node).or_default();
     let mut expanded = expand_static_declaration(prop, value);
     expanded.extend(internal_border_style_expansion(prop, value));
+    expanded.extend(extra_specified_expansions(prop, value));
     for (expanded_prop, expanded_value) in expanded {
         let existing = map.get(&expanded_prop).map(|d| &d.meta);
         if compare_static_priority(existing, meta) {

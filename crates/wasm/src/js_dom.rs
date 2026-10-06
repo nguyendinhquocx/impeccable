@@ -6,7 +6,7 @@
 //! catches the DOM's SyntaxError and cannot throw across the boundary.
 
 use impeccable_core::browser::dom::{
-    merge_text_rects_into_lines, Dom, ElId, KeyframeFrame, Rect, SelectorError,
+    merge_text_rects_into_lines, Dom, DomChild, ElId, KeyframeFrame, Rect, SelectorError,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -46,6 +46,7 @@ extern "C" {
     fn text_content(el: u32) -> String;
     fn inner_text(el: u32) -> Option<String>;
     fn direct_text_nodes(el: u32) -> Vec<String>;
+    fn child_node_kinds(el: u32) -> Vec<u32>;
     fn is_content_editable(el: u32) -> bool;
     fn hidden_prop(el: u32) -> bool;
     fn style(el: u32, prop: &str) -> String;
@@ -273,6 +274,22 @@ impl Dom for JsDom {
                 .or_insert_with(|| direct_text_nodes(el))
                 .clone()
         })
+    }
+    /// The probe gives the order (a handle, or 0 for a text node) and the
+    /// text nodes come from `direct_text_nodes`, which walks the same
+    /// `childNodes` list, so the n-th 0 is the n-th text node.
+    fn child_nodes(&self, el: ElId) -> Vec<DomChild> {
+        let mut texts = self.direct_text_nodes(el).into_iter();
+        child_node_kinds(el)
+            .into_iter()
+            .filter_map(|id| {
+                if id == 0 {
+                    texts.next().map(DomChild::Text)
+                } else {
+                    Some(DomChild::Element(id))
+                }
+            })
+            .collect()
     }
     fn is_content_editable(&self, el: ElId) -> bool {
         is_content_editable(el)

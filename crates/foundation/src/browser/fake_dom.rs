@@ -5,7 +5,7 @@
 //! tag name, comma lists of those). Its job is to pin thresholds and snippet
 //! formats; byte parity is proven by the A/B differential against Chrome.
 
-use super::dom::{Dom, ElId, KeyframeFrame, Rect, SelectorError};
+use super::dom::{Dom, DomChild, ElId, KeyframeFrame, Rect, SelectorError};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
@@ -467,6 +467,16 @@ impl Dom for FakeDom {
             .filter_map(|n| match n {
                 FakeNode::Text(t) => Some(t.clone()),
                 _ => None,
+            })
+            .collect()
+    }
+    fn child_nodes(&self, el: ElId) -> Vec<DomChild> {
+        self.els[el as usize]
+            .child_nodes
+            .iter()
+            .map(|n| match n {
+                FakeNode::Text(t) => DomChild::Text(t.clone()),
+                FakeNode::El(id) => DomChild::Element(*id),
             })
             .collect()
     }

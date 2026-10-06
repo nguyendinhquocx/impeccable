@@ -351,8 +351,17 @@ pub fn lightness_saturation(c: &Rgba) -> (f64, f64) {
 /// ceiling, and 0.93 as lightness, which is where the eye puts it.
 pub fn is_gray_ink(c: &Rgba) -> bool {
     let (l, s) = lightness_saturation(c);
-    s < 0.2 && l > 0.2 && l < 0.85
+    s < 0.2 && l > GRAY_INK_MIN_LIGHTNESS && l < 0.85
 }
+
+/// The lightness at and under which a neutral ink is near-black, not gray.
+///
+/// `#393939` (0.22) on a yellow fill and `#413c38` (0.24) on a green one
+/// read at 6 to 8:1 as body ink, not as a washed-out gray. 0.3 is where the
+/// Tailwind neutrals split: every `-700` and darker (`gray-700` `#374151` at
+/// 0.27, `neutral-700` `#404040` at 0.25) is under it, every `-600` and
+/// lighter (`gray-600` `#4b5563` at 0.34) is over it.
+pub const GRAY_INK_MIN_LIGHTNESS: f64 = 0.3;
 
 /// JS `getHue(c)`.
 pub fn get_hue(c: Option<&Rgba>) -> f64 {
@@ -1037,6 +1046,19 @@ pub fn is_no_paint_color_value(value: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Near-black ink on a colour is ink, not gray: `#393939` and `#413c38`
+    /// sit under the 0.3 floor, `gray-600` over it.
+    #[test]
+    fn near_black_is_not_gray_ink() {
+        let hex = |r: f64, g: f64, b: f64| Rgba::new(r, g, b, 1.0);
+        assert!(!is_gray_ink(&hex(57.0, 57.0, 57.0))); // #393939
+        assert!(!is_gray_ink(&hex(65.0, 60.0, 56.0))); // #413c38
+        assert!(!is_gray_ink(&hex(55.0, 65.0, 81.0))); // gray-700 #374151
+        assert!(is_gray_ink(&hex(75.0, 85.0, 99.0))); // gray-600 #4b5563
+        assert!(is_gray_ink(&hex(77.0, 77.0, 77.0))); // #4d4d4d
+        assert!(is_gray_ink(&hex(138.0, 143.0, 140.0))); // #8a8f8c
+    }
 
     #[test]
     fn regexes_compile() {

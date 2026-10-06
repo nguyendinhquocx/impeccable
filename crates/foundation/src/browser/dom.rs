@@ -71,6 +71,14 @@ pub struct KeyframeFrame {
     pub decls: Vec<(String, String)>,
 }
 
+/// One child of an element as [`Dom::child_nodes`] lists it: an element, or
+/// a text node's data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomChild {
+    Element(ElId),
+    Text(String),
+}
+
 /// The DOM measurement surface. Element handles are opaque `u32`s.
 pub trait Dom {
     // ── document / window ─────────────────────────────────────────────
@@ -138,6 +146,20 @@ pub trait Dom {
     /// The `textContent` of every direct child text node (`nodeType === 3`),
     /// in order. Empty text nodes are included (they matter for `join(' ')`).
     fn direct_text_nodes(&self, el: ElId) -> Vec<String>;
+    /// `el.childNodes` reduced to its element children and its text nodes
+    /// (`nodeType === 3`), in document order. Comments and other node types
+    /// are left out.
+    ///
+    /// This is the one view that says where an element's own text sits among
+    /// its children, which a caller needs to rebuild the rendered text node
+    /// by node. The default lists the direct text nodes and then the element
+    /// children, which is the right order only when the element has one kind
+    /// or the other; every DOM in this workspace overrides it.
+    fn child_nodes(&self, el: ElId) -> Vec<DomChild> {
+        let mut out: Vec<DomChild> = self.direct_text_nodes(el).into_iter().map(DomChild::Text).collect();
+        out.extend(self.children(el).into_iter().map(DomChild::Element));
+        out
+    }
     /// `el.isContentEditable`.
     fn is_content_editable(&self, el: ElId) -> bool;
     /// `el.hidden` (the boolean IDL attribute).
@@ -267,6 +289,53 @@ pub fn merge_text_rects_into_lines(rects: Vec<Rect>) -> Vec<Rect> {
 /// `el.tagName.toLowerCase()`.
 pub fn tag_lower(dom: &dyn Dom, el: ElId) -> String {
     crate::js::to_lower_case(&dom.tag_name(el))
+}
+
+/// Elements whose text is in `textContent` and never on a line.
+pub const UNRENDERED_TEXT_TAGS: [&str; 4] = ["style", "script", "noscript", "template"];
+
+/// A descendant whose text is on no line: a `<style>`, `<script>`,
+/// `<noscript>` or `<template>`, a `display: none` box, and a
+/// `content-visibility: hidden` box (the box lays out, its contents do not).
+/// `content-visibility` applies only where layout containment does, so a
+/// plain inline box, `display: contents`, and internal table and ruby boxes
+/// render their text whatever the property says
+/// ([`content_visibility_applies`]).
+///
+/// One definition for both sides of `line-length`: the characters it counts
+/// and the line rects it divides them among skip the same subtrees, so the
+/// two cannot disagree about which text rendered. A DOM that does not
+/// record `contentVisibility` answers `""` and the subtree is kept.
+pub fn renders_no_text(dom: &dyn Dom, el: ElId) -> bool {
+    UNRENDERED_TEXT_TAGS.contains(&tag_lower(dom, el).as_str())
+        || dom.style(el, "display") == "none"
+        || (crate::js::to_lower_case(&dom.style(el, "contentVisibility")) == "hidden"
+            && content_visibility_applies(&dom.style(el, "display")))
+}
+
+/// Displays whose box takes layout containment, which is the condition for
+/// `content-visibility` to have any effect (CSS Containment 2: containment
+/// does not apply to non-atomic inline boxes, internal table boxes other
+/// than table cells, or internal ruby boxes; `display: contents` makes no
+/// box at all). An unknown display (`""`) counts as applying.
+pub fn content_visibility_applies(display: &str) -> bool {
+    !matches!(
+        crate::js::to_lower_case(display).trim(),
+        "inline"
+            | "inline flow"
+            | "contents"
+            | "table-row"
+            | "table-row-group"
+            | "table-header-group"
+            | "table-footer-group"
+            | "table-column"
+            | "table-column-group"
+            | "ruby"
+            | "ruby-base"
+            | "ruby-text"
+            | "ruby-base-container"
+            | "ruby-text-container"
+    )
 }
 
 /// `el.getAttribute('class') || ''`.

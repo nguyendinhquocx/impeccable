@@ -55,15 +55,29 @@ pub fn ensure_snapshot_js(page: &mut Page<'_>) -> CdpResult<()> {
 /// stable across scrolls (the DOM is unchanged), which is why an earlier
 /// snapshot's ids keep matching the page's current `__impCap`.
 pub fn capture_snapshot(page: &mut Page<'_>) -> CdpResult<SnapshotDom> {
-    let expr = "(function(){ const s = window.__impeccableSnapshot; const c = s.capture(); if (c.error) return { error: c.error }; window.__impCap = c; window.__impIO = s.visualIO(c); return { json: c.json }; })()";
+    parse_snapshot(&capture_snapshot_json(page)?)
+}
+
+/// [`capture_snapshot`] without the parse: the capture's JSON exactly as the
+/// page produced it, which is what a replay loads.
+pub fn capture_snapshot_json(page: &mut Page<'_>) -> CdpResult<String> {
+    // The page-side default cap (48 MiB) exists for the extension's message
+    // channel. Over CDP the websocket accepts 256 MiB (`cdp.rs`), so a URL scan
+    // allows a capture up to 200 MiB: large commerce pages serialize to 70+ MiB
+    // (cvs.com, 2026-09) and used to fail the scan outright.
+    let expr = "(function(){ const s = window.__impeccableSnapshot; const c = s.capture({ maxBytes: 200 * 1024 * 1024 }); if (c.error) return { error: c.error }; window.__impCap = c; window.__impIO = s.visualIO(c); return { json: c.json }; })()";
     let out = page.evaluate_value(expr)?;
     if let Some(err) = out.get("error").and_then(Value::as_str) {
         return Err(CdpError::new(format!("snapshot capture failed: {err}")));
     }
-    let json = out
-        .get("json")
+    out.get("json")
         .and_then(Value::as_str)
-        .ok_or_else(|| CdpError::new("snapshot capture returned no json"))?;
+        .map(String::from)
+        .ok_or_else(|| CdpError::new("snapshot capture returned no json"))
+}
+
+/// Parse a capture's JSON into a [`SnapshotDom`].
+pub fn parse_snapshot(json: &str) -> CdpResult<SnapshotDom> {
     SnapshotDom::from_json(json).map_err(|e| CdpError::new(format!("snapshot parse: {e}")))
 }
 
@@ -165,12 +179,26 @@ pub fn resolve_needs<T>(
     page: &mut Page<'_>,
     f: impl Fn(&SnapshotDom) -> T,
 ) -> CdpResult<T> {
+    resolve_needs_recording(dom, page, f, None)
+}
+
+/// [`resolve_needs`], appending every answered hit test to `record` so the
+/// run can be replayed over the same capture without the page.
+pub fn resolve_needs_recording<T>(
+    dom: &SnapshotDom,
+    page: &mut Page<'_>,
+    f: impl Fn(&SnapshotDom) -> T,
+    mut record: Option<&mut Facts>,
+) -> CdpResult<T> {
     let mut out = f(dom);
     let mut rounds = 0;
     while dom.has_needs() && rounds < 12 {
         let needs = dom.take_needs();
         let facts = answer_needs(page, &needs.hit_tests)?;
         dom.add_facts(&facts);
+        if let Some(record) = record.as_deref_mut() {
+            record.hits.extend(facts.hits.iter().cloned());
+        }
         out = f(dom);
         rounds += 1;
     }

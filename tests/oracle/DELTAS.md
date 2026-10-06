@@ -314,6 +314,28 @@ New cases, recorded from the engine and reviewed by hand (no JS golden ever cove
 - `build-phase-responsive-displaced`: a sign-off line pushed 40px below the first viewport by a growing column reads `displaced, not missing` with the offset and the visible share, the `LOOK FIRST` crop list and the displaced remedy line print, and the third failed `advance` leads with the three-attempt route to the first-viewport review.
 - `build-phase-responsive-missing`: the same region absent from the capture still reads `at desktop width, region sign-off is missing`, now with its repair crop listed.
 
+## Recorded 2026-10-02: near-black ink is not gray
+
+`is_gray_ink` counted any low-saturation ink over lightness 0.2 as gray, so
+`#393939` on a yellow card and `#413c38` on a green button, which read at 6 to
+8:1, reported as gray on colour. On a corpus of real sites those findings were
+judged harmless. The floor is now `GRAY_INK_MIN_LIGHTNESS` = 0.3: every
+Tailwind neutral at `-700` and darker sits under it, every `-600` and lighter
+over it. The Tailwind class paths (the DOM class check and the source-text
+matcher) skip `text-{gray,slate,zinc,neutral,stone}-N` for N of 700 and up the
+same way. No existing fixture finding moved; the goldens below change only
+because of the new `gray-on-color.html` fixture.
+
+- New cases `detect-fixture-json-gray-on-color-html` and `detect-fixture-text-gray-on-color-html`: the fixture's five should-flag rows report (`#d1d5db` on `#1e3a8a` and on `#115e59`, `text-gray-400 on bg-blue-600`, `#4b5563` on `#fcd34d`, `text-gray-600 on bg-amber-400`); its five should-pass rows do not (`#e5e7eb` on `#1e3a8a`, `#393939` on `#ffc224`, `#413c38` on `#38e07b`, `text-gray-800` on `bg-yellow-400`, `#4b5563` on the neutral `#f3f4f6`). The released 0.1.11 engine also reports the three near-black rows (`#393939`, `#413c38` and `text-gray-800`).
+- The sweeps `detect-dir-text-all-fixtures`, `detect-dir-quiet-all-fixtures`, `detect-no-advisory-json` and `detect-no-advisory-text` gain the same five findings (437 to 442 counted). Nothing else moved. `detect-dir-json-all-fixtures` was left unrecorded: it is already an accepted delta and a fresh recording also carries unrelated drift.
+
+### Known limits
+
+1. **Near-black ink that is genuinely too dark for its fill** (`#363637` on a
+   mid blue) now reports only as `low-contrast`, which is the rule that owns
+   that failure.
+2. **The class path reads the shade number, not the colour,** so a project
+   that redefines `gray-700` lighter than 0.3 is still skipped.
 ## Recorded 2026-10-04: a native ship binds every captured input
 
 A comp-led run recorded `finish --disposition ship`, then fixed padding findings the Stop hook reported after it, and stopped: the shipped page no longer matched the final native capture. Native `finish --disposition ship` now records `finish.captureInputs`, the `{path, sha256}` rows of the manifest the final responsive capture bound, and `build-phase completion` reports `changed-after-finish` when the entry or any of those files changed, listing them in `changedSinceFinish`. The NEXT lines after review and after a recorded ship now say that a later edit, a hook finding's fix included, needs ship recorded again, and what ship does with the current files under each capture policy. No existing golden printed these lines, so none moved.
@@ -322,3 +344,61 @@ New cases, recorded from the binary and reviewed by hand:
 
 - `build-phase-shipped-then-edited`: `status` over a native ship that still covers the page prints the `Finish is recorded for the current entry. Any later edit ...` NEXT; after a font the page loads changes (entry bytes unchanged), `status` prints `A file the final check bound changed after finish (fonts/face.ttf) ...` and `completion` reports `changed-after-finish` with `changedSinceFinish: ["fonts/face.ttf"]`.
 - `build-phase-review-next-native`: the review-phase NEXT under native capture, ending `Make every fix before ship: ship re-captures the current files natively and must pass the responsive gate again, and any edit after it, a fix for a hook finding included, needs ship recorded again.`
+
+## Recorded 2026-10-04: a component treatment is clothes
+
+The challenger instruction in direction-scope concept-seed output says what counts as a challenger's clothes. It read `A donation transfers ambition and system discipline, never the challenger's clothes; one world owns the page.` and now reads `A donation transfers ambition and system discipline, never the challenger's clothes. A component treatment, such as a button's shadow or a display face, is clothes, not discipline; one world owns the page.` The lines after it rewrap; their words are unchanged. A gallery run had filed a declined challenger's hard offset shadow on the primary button as a discipline raise.
+
+- `seed-direction-local`, `-reroll`, `-unscoped`, `-count-5`, `-operate`, `seed-direction-env-key`, `seed-mode-rules-persuade`, `-experience`, `-missing-file`, `-missing-section`: that sentence only, reviewed by hand. Exit status, stderr and files are unchanged.
+
+## Recorded 2026-10-04: the approved comp is a fixed reference
+
+A comp-led run composited its generated plates into the approved comp, copied those crops in as the plates, and re-ran `comp-spec` so the spec's `compSha256` followed the edit; the plates gate then measured the work against itself. The engine now keeps a copy of the approved comp (`.impeccable/build/approved-comp.<ext>` plus `approved-comp.json`) when a comp is approved, and every entry point that measures against the comp refuses, before measuring, while its pixels differ from that record. `build-phase restore-comp` puts the copy back.
+
+- `build-phase-usage`: the usage line ends `| finish --disposition <word> | restore-comp`. Nothing else in the case moved.
+
+New case, recorded from the binary and reviewed by hand:
+
+- `build-phase-approved-comp-edited`: `start --comp` and `comp-spec --regions` keep the copy (the snapshotted `approved-comp.json` holds the same pixel hash the spec records); after `build.png` is copied over the comp, `advance` fails the spec gate with the single `the approved comp comp.png has changed since approval: expected pixel sha256 <approved>, found <current>. ...` reason, and a re-run of `comp-spec --regions` and a `comp-diff` against the spec's comp exit 2 with the same message on stderr; `restore-comp` prints `RESTORED comp.png from .impeccable/build/approved-comp.png ...` and names `.impeccable/build/edited-comp-<hash>.png`; the next `advance` measures again and fails on the spec gate's own type reading.
+
+## Recorded 2026-10-05: concept-seed prints the decision round
+
+Codex-harness runs read new-work.md through a shell that cut the middle of the file, losing exactly the decision-page and build-path paragraphs; the run then presented the direction through the structured question tool and asked the retired build-path question. Every successful `concept-seed` roll (direction or surface, full or degraded, every re-roll and both registers) now ends with a `PRESENTATION (the decision round, condensed from new-work.md; ...)` block of five lines after the restated line, in working order: how to serve the hand (`serve-question --start` on the first round; on a re-roll, `--update --key <same key>` while a page is open and `--start` when none opened yet), which cards declare comps (direction: canon included, declined excepted; degraded direction: one text-only card, except the safer register's full lineup; surface: comps or wireframes, no pick or canon; code-led: comp paths as a flip reserve), holding `--wait` (after the last comp lands, or right after serving on a code-led round or a single degraded card) and through a shell that hands back a session, the build path, and when the structured tool is the fallback. The build-path line names the recorded default and its file, resolved like `context`'s `BUILD_PATH_DEFAULT` (`.impeccable/config.local.json` over `config.json`), or says none is recorded.
+
+- Every seed golden that prints a roll (`seed-direction-local`, `-reroll`, `-reroll-bolder`, `-reroll-safer`, `-unscoped`, `-count-5`, `-operate`, `seed-direction-env-key`, `seed-mode-rules-*`, `seed-surface-local`, `-default-scope`, `-grain-flow`, `-compositions`, `-card-base`, `seed-degraded-direction`, `-surface`, `-safer`, `-bolder`): the block appended after the last line, reviewed by hand. Everything before it is byte-identical; exit status, stderr and files are unchanged. Validation errors, the PRODUCT.md gate and the telemetry pings print no block.
+
+New cases, recorded from the binary and reviewed by hand: `seed-presentation-build-path-code` (direction roll with `.impeccable/config.json` `code`: the code-led flip-reserve comp line and `recorded default code (from .impeccable/config.json)`) and `seed-presentation-build-path-local` (surface roll where `config.local.json` `code` beats `config.json` `comp`: the code-led wireframe line and `(from .impeccable/config.local.json)`).
+
+## Recorded 2026-10-05: decision comps get their render checks once per round
+
+A Gemini run wrote decision comp prompts that inventoried every region and never opened the rendered comps, so visualize.md's post-render checks never ran. `serve-question --wait` now prints `NEXT open each decision comp once and run ${visualize path}'s render checks (shipped screen, one dominant move); regenerate any that fail before the user answers.` as the last line of a WAITING return, once per hand, when a decision comp of this hand has landed with its sidecar. It records the hand's id in `<key>.render-check` so later polls of the same hand stay quiet.
+
+- `question-wait-comp-sidecar-missing`: b landed with its sidecar, so the new NEXT line follows `COMP SIDECAR MISSING`, and the files now include `.impeccable/questions/k1.render-check` with the empty id (the case has no hand file). Exit status and stderr are unchanged.
+
+New case, recorded from the binary and reviewed by hand:
+
+- `question-wait-render-check-once`: `k1.render-check` already holds the hand's id `h1`, so a poll with a landed, sidecar-carrying decision comp prints only the WAITING line and leaves the marker as it was.
+
+## Recorded 2026-10-05: the chosen decision comp is option one of the comp round
+
+The skill says the direction round's chosen decision comp enters the comp round as compositional option one and is never regenerated, but the comps gate counted only files directly in `.impeccable/mocks/`, while decision comps live in `.impeccable/mocks/decision/`. `build-phase start --direction <key> --decision-comp <png>` now records that comp as `decisionComp` in the state; the comps gate counts it first where it stands, never any other decision comp, and an approval on it closes the gate with the decision path as the approved comp (record, kept copy and `restore-comp` bind to it). `serve-question --wait` treats a pick of that recorded comp during the open comps phase as the approval (`APPROVED COMP`), and the `CHOSEN COMP` line names the flag.
+
+- `build-phase-usage`: the usage line now reads `start --comp <png> | --direction <key> [--decision-comp <png>] [--breakpoint WxH] ...`. Nothing else in the case moved.
+- `question-wait-answer-ready`, `question-wait-answer-comp-sidecar-missing`: the `CHOSEN COMP` comp-led clause reads `On a comp-led build pass it to build-phase start as --decision-comp <that path>, and the comp round adds two variations beside it where it stands;`. Exit status, stderr and files are unchanged.
+
+New cases, recorded from the binary and reviewed by hand:
+
+- `build-phase-decision-comp-option-one`: `--decision-comp` with `--comp` and with a missing file exit 1; `start --direction seed --decision-comp` prints the option-one NEXT; the first `advance` fails with `1 comp (the chosen decision comp ... as option one, the others directly under .impeccable/mocks)` and no approval, although an unrelated decision comp carries `"approved": true`; after two comps land in `.impeccable/mocks/` and the decision comp's sidecar is approved, `advance` closes on it (`3 comps, 1 approved`), and the snapshotted state and `approved-comp.json` name the decision path.
+- `question-wait-answer-decision-comp-in-round`: with a build state in the `comps` phase recording `decisionComp` and a page that also serves a comp directly in `.impeccable/mocks/`, a pick of that path prints `APPROVED COMP`, not `CHOSEN COMP`.
+
+## Recorded 2026-10-05: surface rounds owe their decision comps too
+
+`serve-question --start` and `--update` refused only comp-led direction rounds with missing decision comps, because a surface round's payload carries no canon and looks like the comp round. Every successful `concept-seed` roll now writes `.impeccable/questions/roll.json` (`scope`, `key`, `reroll`, `at`), and while the latest roll is a surface roll under an hour old that no decision page has taken, a comp-led surface hand that leaves a dealt card without a comp is refused with the same message helper (exit 1, before any state is written). The degraded roll's approval guidance said `nothing is written`; it now names the record.
+
+- `seed-degraded-direction`, `seed-degraded-surface`, `seed-degraded-bolder`: in the no-network paragraph, `and\nnothing is written.` became `and\nthe only file written is the local roll record .impeccable/questions/roll.json,\nwhich serve-question reads.`. Nothing else moved; exit status and stderr are unchanged, and the cases snapshot no files.
+
+New cases, recorded from the binary and reviewed by hand:
+
+- `question-start-surface-missing-comps`: a degraded surface roll, then `--start` of a comp-led three-card surface hand with no comps exits 1 naming `ledger, rail, field`; no hand is recorded and `roll.json` stays.
+- `question-update-surface-missing-comps`: a surface re-roll, then `--update` of the same hand with only `ledger` declared exits 1 naming `rail, field`; nothing is delivered and `roll.json` stays.
+- `question-update-surface-shape-after-direction-roll`: after a direction roll the same comp-less hand is delivered, and the page takes the roll (`roll.json` is gone).

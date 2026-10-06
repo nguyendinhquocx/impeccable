@@ -89,6 +89,39 @@ pub fn check_borders(
     findings
 }
 
+/// Pure gate for dedicated stripe-child side-tabs (empty narrow chromatic
+/// `div`/`span` at a card edge).
+pub fn check_stripe_child(
+    selector: &str,
+    width: f64,
+    edge: Option<&str>,
+    bg: Option<Rgba>,
+) -> Vec<RuleHit> {
+    let Some(edge) = edge else {
+        return Vec::new();
+    };
+    if !(width >= 2.0 && width <= 12.0) {
+        return Vec::new();
+    }
+    let Some(bg) = bg else {
+        return Vec::new();
+    };
+    if bg.alpha_or_one() <= 0.1 {
+        return Vec::new();
+    }
+    let spread = js::math_max3(bg.r, bg.g, bg.b) - js::math_min3(bg.r, bg.g, bg.b);
+    if spread < 30.0 {
+        return Vec::new();
+    }
+    vec![RuleHit::new(
+        "side-tab",
+        format!(
+            "{selector} — {}px stripe child ({edge})",
+            number_to_string(math_round(width))
+        ),
+    )]
+}
+
 re!(GRADIENT_CI, ci("gradient"));
 
 re!(
@@ -131,6 +164,19 @@ re!(
     TW_TO_PURPLE,
     format!(r"{B}to-(?:purple|violet|indigo|blue|cyan|pink|fuchsia)-{D}+{B}")
 );
+
+/// `text-gray-700` and darker: every Tailwind neutral at shade 700 and up sits
+/// under `GRAY_INK_MIN_LIGHTNESS`, so the class path skips the same
+/// near-black inks the computed-colour path does. The source-text scanner in
+/// `impeccable-detect` reads the same helper.
+pub fn is_near_black_neutral_class(class: &str) -> bool {
+    class
+        .trim()
+        .rsplit('-')
+        .next()
+        .and_then(|shade| shade.parse::<u32>().ok())
+        .is_some_and(|shade| shade >= 700)
+}
 
 fn is_heading_123(tag: &str) -> bool {
     matches!(tag, "h1" | "h2" | "h3")
@@ -184,7 +230,9 @@ pub fn check_colors(opts: &ColorOpts) -> Vec<RuleHit> {
     }
 
     if let Some(class_str) = opts.class_list.as_deref().filter(|s| !s.is_empty()) {
-        let gray_match = TW_GRAY_TEXT.find(class_str);
+        let gray_match = TW_GRAY_TEXT
+            .find_iter(class_str)
+            .find(|m| !is_near_black_neutral_class(m.as_str()));
         let color_bg_match = find_solid_chromatic_bg(class_str);
         if let (Some(g), Some(c)) = (gray_match, color_bg_match) {
             findings.push(RuleHit::new(
@@ -1125,6 +1173,59 @@ mod tests {
         assert_eq!(
             ink(138.0, 143.0, 140.0),
             vec!["gray-on-color".to_string(), "low-contrast".to_string()]
+        );
+    }
+
+    /// Near-black ink on a colour reads as body ink: `#393939` on `#ffc224`
+    /// and `#413c38` on `#38e07b` measure 6 to 8:1 and were judged harmless
+    /// on a corpus of real sites. A `-700` or darker neutral class is the
+    /// same ink.
+    #[test]
+    fn near_black_ink_on_a_colour_is_not_gray() {
+        let ids = |text: Rgba, bg: Rgba| {
+            check_colors(&ColorOpts {
+                tag: "p".to_string(),
+                font_size: 18.0,
+                font_weight: 400.0,
+                has_direct_text: true,
+                text_color: Some(text),
+                effective_bg: Some(bg),
+                ..Default::default()
+            })
+            .into_iter()
+            .map(|h| h.id)
+            .collect::<Vec<_>>()
+        };
+        let yellow = Rgba::new(255.0, 194.0, 36.0, 1.0);
+        let green = Rgba::new(56.0, 224.0, 123.0, 1.0);
+        assert!(ids(Rgba::new(57.0, 57.0, 57.0, 1.0), yellow).is_empty());
+        assert!(ids(Rgba::new(65.0, 60.0, 56.0, 1.0), green).is_empty());
+        // gray-600 on a blue panel is still gray.
+        assert_eq!(
+            ids(Rgba::new(75.0, 85.0, 99.0, 1.0), Rgba::new(37.0, 99.0, 235.0, 1.0)),
+            vec!["gray-on-color".to_string(), "low-contrast".to_string()]
+        );
+        let class_hits = |class: &str| {
+            check_colors(&ColorOpts {
+                tag: "div".to_string(),
+                class_list: Some(class.to_string()),
+                ..Default::default()
+            })
+            .into_iter()
+            .filter(|h| h.id == "gray-on-color")
+            .map(|h| h.snippet)
+            .collect::<Vec<_>>()
+        };
+        assert!(class_hits("text-gray-800 bg-yellow-400").is_empty());
+        assert!(class_hits("text-neutral-700 bg-green-400").is_empty());
+        assert_eq!(
+            class_hits("text-gray-600 bg-blue-600"),
+            vec!["text-gray-600 on bg-blue-600"]
+        );
+        // A darker class first does not hide a gray one after it.
+        assert_eq!(
+            class_hits("text-gray-900 md:text-gray-400 bg-blue-600"),
+            vec!["text-gray-400 on bg-blue-600"]
         );
     }
 

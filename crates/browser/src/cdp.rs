@@ -331,6 +331,7 @@ impl Browser {
             swapped: false,
             same_document_navigation: false,
             iframe_sessions: HashSet::new(),
+            main_document_response: None,
             response_capture: None,
             execution_contexts: HashMap::new(),
         };
@@ -608,6 +609,9 @@ pub struct Page<'a> {
     same_document_navigation: bool,
     /// Auto-attached OOPIF sessions whose Page events feed the frame map.
     iframe_sessions: HashSet<String>,
+    /// The CDP `Network.Response` of the main frame's latest document load
+    /// (the last one wins, so after redirects this is the final response).
+    main_document_response: Option<Value>,
     response_capture: Option<crate::response_capture::ResponseCapture>,
     execution_contexts: HashMap<i64, String>,
 }
@@ -943,6 +947,15 @@ impl<'a> Page<'a> {
                     self.swapped = true;
                 }
             }
+            "Network.responseReceived" => {
+                if session == self.session_id
+                    && params.get("type").and_then(Value::as_str) == Some("Document")
+                    && params.get("frameId").and_then(Value::as_str)
+                        == Some(self.main_frame_id.as_str())
+                {
+                    self.main_document_response = params.get("response").cloned();
+                }
+            }
             "Page.navigatedWithinDocument" => {
                 if params.get("frameId").and_then(Value::as_str)
                     == Some(self.main_frame_id.as_str())
@@ -1112,6 +1125,7 @@ impl<'a> Page<'a> {
             .unwrap_or_default();
         self.swapped = false;
         self.same_document_navigation = false;
+        self.main_document_response = None;
         let deadline = Instant::now() + timeout;
         let timeout_msg = format!("Navigation timeout of {} ms exceeded", timeout.as_millis());
 
@@ -1463,6 +1477,40 @@ impl<'a> Page<'a> {
                 "optimizeForSpeed": false,
                 "fromSurface": true,
                 "clip": { "x": round(x), "y": round(y), "width": round(width), "height": round(height), "scale": 1 },
+                "captureBeyondViewport": true,
+            }),
+        )?;
+        Ok(res
+            .get("data")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string())
+    }
+
+    /// The main document's latest CDP `Network.Response` since the last
+    /// [`Page::goto`], or `None` when no document response was seen (a
+    /// `file://` load can have none).
+    pub fn main_document_response(&mut self) -> Option<Value> {
+        self.pump_events();
+        self.main_document_response.clone()
+    }
+
+    /// A JPEG of the given document region (`captureBeyondViewport`), base64.
+    pub fn screenshot_jpeg(
+        &mut self,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        quality: u32,
+    ) -> CdpResult<String> {
+        let res = self.send(
+            "Page.captureScreenshot",
+            json!({
+                "format": "jpeg",
+                "quality": quality.min(100),
+                "fromSurface": true,
+                "clip": { "x": x, "y": y, "width": width.round(), "height": height.round(), "scale": 1 },
                 "captureBeyondViewport": true,
             }),
         )?;

@@ -12,6 +12,7 @@ use crate::background::{
 use crate::cascade::StyleValues;
 use crate::dom::{StaticDocument, StaticElement};
 use crate::quality::{collapse_ws, pf0, resolve_font_size_px};
+use impeccable_core::checks::css_scan::css_length_to_px;
 use impeccable_core::checks::measures::{
     self, border_colors_from_style, border_widths_from_style, check_gpt_thin_border_wide_shadow,
     check_oversized_h1, check_radial_spotlight, positioned_style_implies_escape, resolve_length_px,
@@ -20,7 +21,8 @@ use impeccable_core::checks::measures::{
 use impeccable_core::checks::rules::{
     check_borders, check_colors, check_glow, check_hero_eyebrow, check_hover_contrast,
     check_icon_tile, check_italic_serif, check_kicker_above_heading, check_motion,
-    check_placeholder_colors, is_emoji_only_text, is_heading_tag, resolve_hero_heading_size_px,
+    check_placeholder_colors, check_stripe_child, is_emoji_only_text, is_heading_tag,
+    resolve_hero_heading_size_px,
     BorderOpts, ColorOpts, GlowOpts, HeroEyebrowOpts, HoverContrastOpts, IconTileOpts,
     ItalicSerifOpts, KickerCandidate, MotionOpts, RuleHit, Sides,
 };
@@ -458,6 +460,137 @@ pub fn check_element_borders(
             badge_like: own_bg.is_some_and(|c| c.alpha_or_one() > 0.1),
         },
     )
+}
+
+const STRIPE_CHILD_SKIP: &str = "nav, blockquote, pre, table, button, a, select, progress, meter, [role=\"progressbar\"], [role=\"slider\"], [role=\"scrollbar\"], [role=\"separator\"], [role=\"tablist\"]";
+
+fn static_edge_hugs(value: &str) -> bool {
+    let n = parse_float(value);
+    n.is_finite() && n.abs() <= 2.0
+}
+
+/// A width in px for the absolute CSS units (plus rem/em at 16px). `8%` or
+/// `10vw` depends on a box the static engine does not lay out, so it is `None`.
+fn static_stripe_width_px(value: &str) -> Option<f64> {
+    if let Some(px) = css_length_to_px(value) {
+        return Some(px);
+    }
+    let v = js::to_lower_case(js::trim(value));
+    let split = v.find(|c: char| c.is_ascii_alphabetic())?;
+    let n: f64 = v[..split].parse().ok()?;
+    let per_unit = match &v[split..] {
+        "pt" => 96.0 / 72.0,
+        "pc" => 16.0,
+        "in" => 96.0,
+        "cm" => 96.0 / 2.54,
+        "mm" => 96.0 / 25.4,
+        "q" => 96.0 / 101.6,
+        _ => return None,
+    };
+    Some(n * per_unit)
+}
+
+/// The first value token of a computed longhand that a shorthand or `var()`
+/// may have filled with a whole list (`wrap column`, `center stretch`).
+fn first_keyword(value: &str, allowed: &[&str]) -> Option<String> {
+    value
+        .split_ascii_whitespace()
+        .map(js::to_lower_case)
+        .find(|t| allowed.is_empty() || allowed.contains(&t.as_str()))
+}
+
+/// JS: checks.mjs#checkElementStripeChild(el, style)
+pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -> Vec<RuleHit> {
+    let tag = el.tag_lower();
+    if tag != "div" && tag != "span" {
+        return Vec::new();
+    }
+    let Some(host) = el.parent_element() else {
+        return Vec::new();
+    };
+    if host.tag_lower() == "body" || host.tag_lower() == "html" {
+        return Vec::new();
+    }
+    if !el.children().is_empty() {
+        return Vec::new();
+    }
+    if !collapsed_text_content(el).is_empty() {
+        return Vec::new();
+    }
+    if el.closest(STRIPE_CHILD_SKIP).is_some() {
+        return Vec::new();
+    }
+    if is_tab_context_element(el) || is_status_context_element(el) {
+        return Vec::new();
+    }
+
+    let width = static_stripe_width_px(sv(style, "width")).unwrap_or(0.0);
+    let position = js::to_lower_case(sv(style, "position"));
+    let height_raw = js::to_lower_case(sv(style, "height"));
+    // Height is not inherited, so initial and unset both reset it to auto.
+    let auto_height = matches!(height_raw.as_str(), "" | "auto" | "initial" | "unset");
+    let host_style = host.style();
+    let edge = if position == "absolute" || position == "fixed" {
+        // The cascade already expands inset; a winning `auto` longhand
+        // must not be overwritten by the earlier shorthand.
+        let inset = ["top", "right", "bottom", "left"].map(|prop| sv(style, prop));
+        // Opposing insets stretch only an auto-height box. With a definite
+        // height CSS drops the bottom constraint instead of stretching it.
+        let height_stretches = height_raw == "100%"
+            || (auto_height && static_edge_hugs(&inset[0]) && static_edge_hugs(&inset[2]));
+        if !height_stretches {
+            return Vec::new();
+        }
+        if static_edge_hugs(&inset[3]) {
+            Some("left")
+        } else if static_edge_hugs(&inset[1]) {
+            Some("right")
+        } else {
+            None
+        }
+    } else {
+        let pdisplay = sv(host_style, "display");
+        if !pdisplay.contains("flex") {
+            return Vec::new();
+        }
+        let pdir = first_keyword(
+            sv(host_style, "flexDirection"),
+            &["row", "row-reverse", "column", "column-reverse"],
+        )
+        .unwrap_or_else(|| "row".to_string());
+        if pdir.starts_with("column") {
+            return Vec::new();
+        }
+        let align_self = first_keyword(sv(style, "alignSelf"), &[]).unwrap_or_default();
+        let effective_align = if !align_self.is_empty() && align_self != "auto" {
+            align_self
+        } else {
+            first_keyword(sv(host_style, "alignItems"), &[]).unwrap_or_default()
+        };
+        let is_stretch = effective_align.is_empty()
+            || effective_align == "stretch"
+            || effective_align == "normal";
+        let height_stretches = height_raw == "100%" || (auto_height && is_stretch);
+        if !height_stretches {
+            return Vec::new();
+        }
+        let siblings = host.children();
+        if siblings.len() < 2 {
+            return Vec::new();
+        }
+        let reverse = pdir.contains("reverse");
+        if siblings.first() == Some(el) {
+            Some(if reverse { "right" } else { "left" })
+        } else if siblings.last() == Some(el) {
+            Some(if reverse { "left" } else { "right" })
+        } else {
+            None
+        }
+    };
+
+    let bg_raw = sv(style, "backgroundColor");
+    let bg = parse_rgb(Some(&bg_raw)).or_else(|| parse_any_color(Some(&bg_raw)));
+    check_stripe_child(&class_selector(el), width, edge, bg)
 }
 
 /// JS: checks.mjs#checkElementColors(el, style, tag, window, customPropMap, hasAnchorInheritRule)

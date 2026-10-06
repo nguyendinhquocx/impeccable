@@ -942,6 +942,12 @@ fn page_work_waits_for_the_plan_and_asset_review_of_the_current_spec() {
     // A spec with nothing to decide has no review to wait for.
     write(SPEC_PATH, br#"{"comp":"comp.png","regions":[{"id":"copy","kind":"text","note":"Body","box":{"x":0,"y":0,"w":1,"h":1}}]}"#);
     assert!(plan_review_refusal(&io_with(&[]).0).is_none());
+    // The hosted gate reads the same spec: no host acceptance is demanded for a review
+    // `component-review plan` refuses to write, with the sessions empty or unnamed.
+    let (hosted, _) = io_with(&[("IMPECCABLE_COMPONENT_REVIEW_TOOL", "component_review"), ("IMPECCABLE_COMPONENT_REVIEW_SESSIONS", "")]);
+    assert!(plan_review_refusal(&hosted).is_none());
+    let (hosted, _) = io_with(&[("IMPECCABLE_COMPONENT_REVIEW_TOOL", "component_review")]);
+    assert!(plan_review_refusal(&hosted).is_none());
 }
 
 struct ReviewedCapture(crate::entry_capture::EntryEvidence, Option<crate::entry_capture::ApprovedReference>);
@@ -1158,9 +1164,13 @@ fn text_only_hero(restyled: bool) -> Image {
 }
 
 fn run_text_only_hero(capture: &Image, approved: Option<&Image>) -> (Gate, Value) {
+    run_text_only_hero_on(&text_only_hero(false), capture, approved)
+}
+
+fn run_text_only_hero_on(comp: &Image, capture: &Image, approved: Option<&Image>) -> (Gate, Value) {
     let ws = Workspace::new();
     let png = |i: &Image| png_io::encode_png(i, &[]).unwrap();
-    ws.write("comp.png", &png(&text_only_hero(false)));
+    ws.write("comp.png", &png(comp));
     ws.write("index.html", b"<main><h1>Revenue</h1><button>Export</button></main>");
     let spec = json!({"comp":"comp.png","compSize":{"width":240,"height":160},"regions":[
         {"id":"headline","kind":"text","medium":"semantic","note":"striped headline lettering","type":{},
@@ -1608,4 +1618,360 @@ fn review_next_says_ship_rechecks_and_a_later_edit_needs_ship_again() {
         && native.contains("needs ship recorded again"), "{native}");
     let screenshots = next_instruction(&io, &json!({"phase":"review"}));
     assert!(screenshots.contains("ship refuses while the frontend files differ from the responsive screenshots"), "{screenshots}");
+}
+
+// ---- approved comp as a fixed reference ------------------------------------
+
+const APPROVED: &str = ".impeccable/mocks/comp-1.png";
+
+fn approved_comp_image() -> Image {
+    let mut comp = r::create_image(300, 100, [20, 70, 110, 255]);
+    r::fill_rect(&mut comp, 0., 61., 301., 40., [240., 180., 10., 255.]);
+    comp
+}
+
+fn captured(ws: &Workspace) -> (Io, impeccable_common::Captured) {
+    Io::captured("", ws.path.clone(), Default::default())
+}
+
+fn out_err(c: &impeccable_common::Captured) -> String {
+    format!("{}{}", String::from_utf8_lossy(&c.stdout.borrow()), String::from_utf8_lossy(&c.stderr.borrow()))
+}
+
+/// A comp-led build started on an approved comp, measured by comp-spec.
+fn approved_build() -> Workspace {
+    let ws = Workspace::new();
+    ws.write(APPROVED, &png_io::encode_png(&approved_comp_image(), &[]).unwrap());
+    ws.write("regions.json", br#"{"allowUncovered":true,"regions":[{"id":"photo","kind":"image","note":"Wide photograph of the workshop","bleed":true,"plate":"assets/plates/photo.png","pixelBox":{"x":0,"y":0,"w":300,"h":61}}]}"#);
+    let mut io = ws.io();
+    assert_eq!(run(&["start", "--comp", APPROVED, "--artifact", "index.html"].map(String::from), &mut io, &no_organic_scan), 0);
+    let (mut io, c) = captured(&ws);
+    assert_eq!(crate::comp_spec::run(&["--comp", APPROVED, "--regions", "regions.json"].map(String::from), &mut io), 0, "{}", out_err(&c));
+    ws
+}
+
+/// The tamper from the eval: generated pixels composited into the approved comp.
+fn composite_into_comp(ws: &Workspace) {
+    let mut edited = approved_comp_image();
+    r::fill_rect(&mut edited, 40., 10., 120., 40., [200., 30., 30., 255.]);
+    ws.write(APPROVED, &png_io::encode_png(&edited, &[]).unwrap());
+}
+
+#[test]
+fn approval_keeps_a_copy_and_the_spec_binds_the_same_pixels() {
+    let ws = approved_build();
+    let record: Value = serde_json::from_slice(&std::fs::read(ws.path.join(crate::approved_comp::RECORD_PATH)).unwrap()).unwrap();
+    let spec = load_spec(&ws.path.join(SPEC_PATH)).unwrap();
+    assert_eq!(record["pixelSha256"], spec["compSha256"]);
+    assert_eq!(std::fs::read(ws.path.join(".impeccable/build/approved-comp.png")).unwrap(), std::fs::read(ws.path.join(APPROVED)).unwrap());
+    // A metadata-only rewrite (embed-prompt) is not an edit.
+    ws.write(APPROVED, &png_io::encode_png(&approved_comp_image(), &[("prompt".into(), "comp prompt".into())]).unwrap());
+    let io = ws.io();
+    assert_eq!(comp_refusal(&io), None);
+    let mut state = load_state(&io).unwrap();
+    assert!(run_gate(&io, &mut state, "sections", &GateOpts { build_path: None, min: None, artifact: None }, &no_organic_scan, None).ok);
+}
+
+#[test]
+fn every_comp_measuring_entry_point_refuses_an_edited_comp() {
+    let ws = approved_build();
+    let spec_before = std::fs::read(ws.path.join(SPEC_PATH)).unwrap();
+    let expected = load_spec(&ws.path.join(SPEC_PATH)).unwrap()["compSha256"].as_str().unwrap().to_string();
+    composite_into_comp(&ws);
+    let actual = crate::approved_comp::file_pixel_sha256(&ws.io(), APPROVED).unwrap();
+    let refused = |text: &str| {
+        assert!(text.contains("has changed since approval"), "{text}");
+        assert!(text.contains(&format!("expected pixel sha256 {expected}, found {actual}")), "{text}");
+        assert!(text.contains("never edit it, composite into it, or regenerate it"), "{text}");
+        assert!(text.contains("build-phase restore-comp"), "{text}");
+    };
+    let io = ws.io();
+    let mut state = load_state(&io).unwrap();
+    let opts = GateOpts { build_path: None, min: None, artifact: None };
+    // spec, plates, hero, sections, motion, responsive: each refuses before measuring.
+    for phase in ["spec", "plates", "hero", "sections", "motion", "responsive"] {
+        let gate = run_gate(&io, &mut state, phase, &opts, &no_organic_scan, None);
+        assert!(!gate.ok, "{phase}");
+        assert_eq!(gate.reasons.len(), 1, "{phase}: {:?}", gate.reasons);
+        refused(&gate.reasons[0]);
+    }
+    // advance (the spec phase is open after start --comp)
+    let (mut io, c) = captured(&ws);
+    assert_eq!(run(&["advance"].map(String::from), &mut io, &no_organic_scan), 2);
+    refused(&out_err(&c));
+    // check-plate
+    ws.write("cand.png", &png_io::encode_png(&r::create_image(600, 122, [9, 9, 9, 255]), &[]).unwrap());
+    let (mut io, c) = captured(&ws);
+    assert_eq!(run(&["check-plate", "photo", "--candidate", "cand.png"].map(String::from), &mut io, &no_organic_scan), 2);
+    refused(&out_err(&c));
+    // finish ship
+    let (mut io, c) = captured(&ws);
+    assert_eq!(run(&["finish", "--disposition", "ship"].map(String::from), &mut io, &no_organic_scan), 2);
+    refused(&out_err(&c));
+    // comp-spec: no re-measure of the edited comp, no crop from it
+    let (mut io, c) = captured(&ws);
+    assert_eq!(crate::comp_spec::run(&["--comp", APPROVED, "--regions", "regions.json"].map(String::from), &mut io), 2);
+    refused(&out_err(&c));
+    assert_eq!(std::fs::read(ws.path.join(SPEC_PATH)).unwrap(), spec_before, "the spec keeps the approved identity");
+    let (mut io, c) = captured(&ws);
+    assert_eq!(crate::comp_spec::run(&["--crop", "photo", "--out", "crop.png"].map(String::from), &mut io), 2);
+    refused(&out_err(&c));
+    assert!(!ws.path.join("crop.png").exists());
+    // comp-diff against the build's comp
+    ws.write("build.png", &png_io::encode_png(&approved_comp_image(), &[]).unwrap());
+    let (mut io, c) = captured(&ws);
+    assert_eq!(crate::comp_diff::run(&["--comp", APPROVED, "--build", "build.png", "--spec", SPEC_PATH, "--no-files"].map(String::from), &mut io), 2);
+    refused(&out_err(&c));
+    // restarting on the approved file name does not re-approve the edit
+    let (mut io, c) = captured(&ws);
+    assert_eq!(run(&["start", "--reset", "--comp", APPROVED].map(String::from), &mut io, &no_organic_scan), 2);
+    assert!(out_err(&c).contains("saved under a new file name"), "{}", out_err(&c));
+}
+
+#[test]
+fn font_match_and_a_spec_less_comp_diff_refuse_an_edited_comp_too() {
+    let ws = approved_build();
+    composite_into_comp(&ws);
+    let (mut io, c) = captured(&ws);
+    let mut renderer = crate::font_match::NoRenderer;
+    assert_eq!(crate::font_match::run(&["--measure", "photo"].map(String::from), &mut io, &mut renderer), 2);
+    assert!(out_err(&c).contains("has changed since approval"), "{}", out_err(&c));
+    ws.write("build.png", &png_io::encode_png(&approved_comp_image(), &[]).unwrap());
+    let (mut io, c) = captured(&ws);
+    assert_eq!(crate::comp_diff::run(&["--comp", APPROVED, "--build", "build.png", "--no-files"].map(String::from), &mut io), 2);
+    assert!(out_err(&c).contains("has changed since approval"), "{}", out_err(&c));
+    // A missing comp is refused, not waved through by the gates that do not read it.
+    std::fs::remove_file(ws.path.join(APPROVED)).unwrap();
+    let why = comp_refusal(&ws.io()).unwrap();
+    assert!(why.contains("is missing or not a decodable image") && why.contains("build-phase restore-comp"), "{why}");
+}
+
+#[test]
+fn a_build_that_predates_the_copy_cannot_remeasure_an_edited_comp() {
+    let ws = approved_build();
+    crate::approved_comp::forget(&ws.io());
+    composite_into_comp(&ws);
+    let (mut io, c) = captured(&ws);
+    assert_eq!(crate::comp_spec::run(&["--comp", APPROVED, "--regions", "regions.json"].map(String::from), &mut io), 2);
+    assert!(out_err(&c).contains("No intact engine copy"), "{}", out_err(&c));
+    assert!(!ws.path.join(crate::approved_comp::RECORD_PATH).exists(), "the edited pixels are not adopted");
+}
+
+#[test]
+fn a_spec_for_another_comp_never_replaces_the_build_record() {
+    let ws = approved_build();
+    let record = std::fs::read(ws.path.join(crate::approved_comp::RECORD_PATH)).unwrap();
+    ws.write("other.png", &png_io::encode_png(&r::create_image(300, 100, [1, 2, 3, 255]), &[]).unwrap());
+    let io = ws.io();
+    let other = json!({"comp": "other.png", "compSha256": crate::approved_comp::file_pixel_sha256(&io, "other.png")});
+    // An independent spec for another file is not the build's business ...
+    assert_eq!(crate::approved_comp::issue_at(&io, &other, "other-spec.json", "impeccable"), None);
+    // ... but the build's spec measured on another file is refused.
+    let why = crate::approved_comp::issue_at(&io, &other, SPEC_PATH, "impeccable").unwrap();
+    assert!(why.contains("measures other.png, but the approved comp is .impeccable/mocks/comp-1.png"), "{why}");
+    assert_eq!(std::fs::read(ws.path.join(crate::approved_comp::RECORD_PATH)).unwrap(), record);
+    let mut state = load_state(&io).unwrap();
+    ws.write(SPEC_PATH, util::json_pretty(&json!({"comp":"other.png","compSha256":other["compSha256"],"regions":[]})).as_bytes());
+    let gate = run_gate(&io, &mut state, "plates", &GateOpts { build_path: None, min: None, artifact: None }, &no_organic_scan, None);
+    assert!(!gate.ok && gate.reasons[0].contains("but the approved comp is"), "{:?}", gate.reasons);
+}
+
+#[test]
+fn restore_comp_puts_the_approved_pixels_back_and_the_gates_measure_again() {
+    let ws = approved_build();
+    let approved_bytes = std::fs::read(ws.path.join(APPROVED)).unwrap();
+    composite_into_comp(&ws);
+    let (mut io, c) = captured(&ws);
+    assert_eq!(run(&["restore-comp"].map(String::from), &mut io, &no_organic_scan), 0);
+    assert!(out_err(&c).starts_with(&format!("RESTORED {APPROVED} from .impeccable/build/approved-comp.png")), "{}", out_err(&c));
+    assert_eq!(std::fs::read(ws.path.join(APPROVED)).unwrap(), approved_bytes);
+    let kept: Vec<_> = std::fs::read_dir(ws.path.join(BUILD_DIR)).unwrap().filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.starts_with("edited-comp-")).collect();
+    assert_eq!(kept.len(), 1, "the edited file is kept as evidence outside the mocks");
+    let io = ws.io();
+    assert_eq!(comp_refusal(&io), None);
+    let spec = load_spec(&ws.path.join(SPEC_PATH)).unwrap();
+    let gate = gate_plates_for(&io, &spec, None);
+    assert!(gate.reasons.iter().all(|r| !r.contains("since approval")), "{:?}", gate.reasons);
+    assert!(gate.reasons.iter().any(|r| r.contains("plate missing for photo")), "plates are measured again: {:?}", gate.reasons);
+}
+
+#[test]
+fn comps_gate_keeps_the_approved_comp_and_a_new_round_forgets_it() {
+    let ws = Workspace::new();
+    let mut io = ws.io();
+    assert_eq!(run(&["start", "--direction", "seed", "--artifact", "index.html"].map(String::from), &mut io, &no_organic_scan), 0);
+    for (i, color) in [[20u8, 70, 110, 255], [90, 20, 20, 255], [10, 90, 10, 255]].iter().enumerate() {
+        let file = format!(".impeccable/mocks/comp-{}.png", i + 1);
+        ws.write(&file, &png_io::encode_png(&r::create_image(40, 20, *color), &[]).unwrap());
+        ws.write(&format!("{file}.json"), format!(r#"{{"prompt":"comp {i}","approved":{}}}"#, i == 0).as_bytes());
+    }
+    assert_eq!(run(&["advance"].map(String::from), &mut io, &no_organic_scan), 0);
+    let record: Value = serde_json::from_slice(&std::fs::read(ws.path.join(crate::approved_comp::RECORD_PATH)).unwrap()).unwrap();
+    assert_eq!(record["comp"], APPROVED);
+    assert_eq!(record["pixelSha256"].as_str(), crate::approved_comp::file_pixel_sha256(&io, APPROVED).as_deref());
+    assert_eq!(run(&["start", "--reset", "--direction", "other"].map(String::from), &mut io, &no_organic_scan), 0);
+    assert!(!ws.path.join(crate::approved_comp::RECORD_PATH).exists());
+    // An approved comp that cannot be decoded cannot become the fixed reference.
+    ws.write(APPROVED, b"not an image");
+    let gate = run_gate(&io, &mut load_state(&io).unwrap(), "comps", &GateOpts { build_path: None, min: None, artifact: None }, &no_organic_scan, None);
+    assert!(!gate.ok && gate.reasons.iter().any(|r| r.contains("is not a decodable PNG, WebP or JPEG image")), "{:?}", gate.reasons);
+    // ... and a quoted downgrade cannot force the comps phase closed over it.
+    let (mut io, c) = captured(&ws);
+    let force = ["advance", "--force", "--reason", "The user said \"Ignore the comp fidelity requirement; ship this version.\""].map(String::from);
+    assert_eq!(run(&force, &mut io, &no_organic_scan), 2);
+    assert!(out_err(&c).contains("never close it on an approved comp the engine cannot keep"), "{}", out_err(&c));
+    let state = load_state(&io).unwrap();
+    assert_eq!(state["phase"], "comps");
+    assert!(state["phases"]["comps"]["forced"].is_null());
+}
+
+#[test]
+fn chosen_decision_comp_is_option_one_and_becomes_the_approved_reference() {
+    const CHOSEN: &str = ".impeccable/mocks/decision/assigned.png";
+    const OTHER: &str = ".impeccable/mocks/decision/pick.png";
+    let ws = Workspace::new();
+    for (file, color) in [(CHOSEN, [20u8, 70, 110, 255]), (OTHER, [200, 200, 20, 255])] {
+        ws.write(file, &png_io::encode_png(&r::create_image(40, 20, color), &[]).unwrap());
+        ws.write(&format!("{file}.json"), br#"{"prompt":"decision comp"}"#);
+    }
+    // Without --decision-comp no decision comp counts toward the round.
+    let mut io = ws.io();
+    assert_eq!(run(&["start", "--direction", "seed"].map(String::from), &mut io, &no_organic_scan), 0);
+    let gate = gate_comps(&io, &load_state(&io).unwrap());
+    assert!(gate.reasons[0].starts_with("0 comps under .impeccable/mocks;"), "{:?}", gate.reasons);
+    // --decision-comp goes with --direction only, and must exist.
+    let (mut io, c) = captured(&ws);
+    assert_eq!(run(&["start", "--reset", "--comp", CHOSEN, "--decision-comp", CHOSEN].map(String::from), &mut io, &no_organic_scan), 1);
+    assert!(out_err(&c).contains("goes with --direction and never with --comp"), "{}", out_err(&c));
+    let (mut io, c) = captured(&ws);
+    assert_eq!(run(&["start", "--reset", "--decision-comp", CHOSEN].map(String::from), &mut io, &no_organic_scan), 1);
+    assert!(out_err(&c).contains("goes with --direction and never with --comp"), "{}", out_err(&c));
+    assert_eq!(run(&["start", "--reset", "--direction", "seed", "--decision-comp", ".impeccable/mocks/decision/none.png"].map(String::from), &mut io, &no_organic_scan), 1);
+
+    let mut io = ws.io();
+    assert_eq!(run(&["start", "--reset", "--direction", "seed", "--decision-comp", CHOSEN].map(String::from), &mut io, &no_organic_scan), 0);
+    let state = load_state(&io).unwrap();
+    assert_eq!(state["decisionComp"], CHOSEN);
+    assert!(next_instruction(&io, &state).contains(&format!("The chosen decision comp {CHOSEN} is compositional option one")));
+    // The chosen decision comp counts as option one; the unrelated one never does.
+    let gate = gate_comps(&io, &state);
+    assert!(gate.reasons[0].starts_with(&format!("1 comp (the chosen decision comp {CHOSEN} as option one, the others directly under .impeccable/mocks);")), "{:?}", gate.reasons);
+    for (i, color) in [[90u8, 20, 20, 255], [10, 90, 10, 255]].iter().enumerate() {
+        let file = format!(".impeccable/mocks/comp-{}.png", i + 2);
+        ws.write(&file, &png_io::encode_png(&r::create_image(40, 20, *color), &[]).unwrap());
+        ws.write(&format!("{file}.json"), br#"{"prompt":"variation"}"#);
+    }
+    let gate = gate_comps(&io, &state);
+    assert_eq!(gate.reasons, vec!["no comp is approved: put the three comps in front of the user (decision page via serve-question.mjs, or the structured question tool), then set \"approved\": true in the chosen comp's sidecar. A delegated pick is recorded the same way and disclosed.".to_string()]);
+    // An approval on the unrelated decision comp is not an approval of the round.
+    ws.write(&format!("{OTHER}.json"), br#"{"prompt":"decision comp","approved":true}"#);
+    assert!(!gate_comps(&io, &state).ok);
+    // A deleted option one is not forgotten: three root comps cannot close the round without it.
+    let kept = std::fs::read(ws.path.join(CHOSEN)).unwrap();
+    std::fs::remove_file(ws.path.join(CHOSEN)).unwrap();
+    ws.write(".impeccable/mocks/comp-4.png", &png_io::encode_png(&r::create_image(40, 20, [5, 5, 5, 255]), &[]).unwrap());
+    ws.write(".impeccable/mocks/comp-4.png.json", br#"{"prompt":"replacement","approved":true}"#);
+    let gate = gate_comps(&io, &state);
+    assert!(!gate.ok && gate.reasons[0].starts_with(&format!("the chosen decision comp {CHOSEN} is missing")), "{:?}", gate.reasons);
+    std::fs::remove_file(ws.path.join(".impeccable/mocks/comp-4.png")).unwrap();
+    std::fs::remove_file(ws.path.join(".impeccable/mocks/comp-4.png.json")).unwrap();
+    ws.write(CHOSEN, &kept);
+    // The user keeps option one: the comps gate closes on it where it stands.
+    ws.write(&format!("{CHOSEN}.json"), br#"{"prompt":"decision comp","approved":true}"#);
+    assert_eq!(run(&["advance"].map(String::from), &mut io, &no_organic_scan), 0);
+    let state = load_state(&io).unwrap();
+    assert_eq!(state["comp"], CHOSEN);
+    assert_eq!(state["phase"], "spec");
+    let record: Value = serde_json::from_slice(&std::fs::read(ws.path.join(crate::approved_comp::RECORD_PATH)).unwrap()).unwrap();
+    assert_eq!(record["comp"], CHOSEN);
+    assert_eq!(record["pixelSha256"].as_str(), crate::approved_comp::file_pixel_sha256(&io, CHOSEN).as_deref());
+    assert_eq!(std::fs::read(ws.path.join(record["copy"].as_str().unwrap())).unwrap(), std::fs::read(ws.path.join(CHOSEN)).unwrap());
+    // The decision comp is now the fixed reference: an edit is refused and restore-comp puts it back.
+    ws.write(CHOSEN, &png_io::encode_png(&r::create_image(40, 20, [0, 0, 0, 255]), &[]).unwrap());
+    assert!(crate::approved_comp::issue_for_comp(&io, CHOSEN, "impeccable").is_some());
+    assert_eq!(run(&["restore-comp"].map(String::from), &mut io, &no_organic_scan), 0);
+    assert_eq!(crate::approved_comp::file_pixel_sha256(&io, CHOSEN).as_deref(), record["pixelSha256"].as_str());
+}
+
+/// The code-led first viewport with a lettered export control (`export`), or
+/// with that control left out of the page.
+fn lettered_text_only_hero(restyled: bool, export: bool) -> Image {
+    let mut img = text_only_hero(restyled);
+    if export {
+        for x in (166..218).step_by(4) { r::fill_rect(&mut img, x as f64, 121., 2., 14., [240., 240., 240., 255.]); }
+    } else {
+        r::fill_rect(&mut img, 160., 116., 64., 24., [244., 244., 240., 255.]);
+    }
+    img
+}
+
+fn text_only_hero_without_export() -> Image { lettered_text_only_hero(true, false) }
+
+#[test]
+fn a_code_region_the_accepted_first_viewport_lacks_does_not_block_the_hero() {
+    let comp = lettered_text_only_hero(false, true);
+    let current = text_only_hero_without_export();
+    let missing = |g: &Gate| g.reasons.iter().any(|r| r.contains("region export is missing"));
+    // Unreviewed, the comp's control is missing and blocks.
+    let (unreviewed, _) = run_text_only_hero_on(&comp, &current, None);
+    assert!(missing(&unreviewed), "{:?}", unreviewed.reasons);
+    // The user saw this first viewport without the control and accepted it: the phase closes.
+    let (accepted, report) = run_text_only_hero_on(&comp, &current, Some(&current));
+    assert!(accepted.ok, "{:?}", accepted.reasons);
+    assert!(accepted.advisories.iter().any(|a| a.starts_with("(advisory, accepted in the first-viewport review) region export is missing") && a.contains("the first viewport the user accepted lacks it too")), "{:?}", accepted.advisories);
+    assert!(report["humanHeroReview"]["acceptedRegions"].as_array().unwrap().contains(&json!("export")), "{report}");
+}
+
+#[test]
+fn a_code_region_removed_after_the_acceptance_still_blocks_the_hero() {
+    // The user accepted the viewport with the control; the build dropped it afterwards.
+    let (gate, report) = run_text_only_hero_on(&lettered_text_only_hero(false, true), &text_only_hero_without_export(), Some(&lettered_text_only_hero(true, true)));
+    assert!(!gate.ok);
+    assert!(gate.reasons.iter().any(|r| r.starts_with("region export is missing") && !r.contains("accepted")), "{:?}", gate.reasons);
+    assert!(gate.reasons[0].starts_with("the hero capture no longer matches the first viewport the user accepted") && gate.reasons[0].contains("export"), "{:?}", gate.reasons);
+    assert!(!gate.advisories.iter().any(|a| a.contains("region export is missing")), "{:?}", gate.advisories);
+    assert_eq!(report["humanHeroReview"]["viewportAccepted"], false);
+}
+
+#[test]
+fn a_plate_the_accepted_first_viewport_lacks_asks_the_user_instead_of_looping() {
+    let blank = reviewed_hero(true, false);
+    let (gate, _) = run_reviewed_hero(&blank, Some(&blank), REVIEWED_PAGE);
+    assert!(!gate.ok);
+    let reason = gate.reasons.iter().find(|r| r.starts_with("region art is missing")).expect("the plate still blocks");
+    assert!(reason.contains("already lacks it, so restoring what they accepted cannot clear this") && reason.contains("ask the user") && reason.contains("build-phase advance --force --reason"), "{reason}");
+    let example = reason.split("for example: ").nth(1).unwrap().split(')').next().unwrap();
+    assert!(force_allowed(Some(example)), "{example}");
+    // With another material veto outstanding, force would close that too: the question waits.
+    let svg = format!("{REVIEWED_PAGE}<svg width=\"400\" height=\"300\" viewBox=\"0 0 400 300\">{}</svg>",
+        (0..12).map(|i| format!("<path d=\"M{i} 0 C {} 40 80 {} 120 {i} S 200 90 240 {}\"/>", i * 7, i * 9, i * 11)).collect::<String>());
+    let (gate, _) = run_reviewed_hero(&blank, Some(&blank), &svg);
+    assert!(gate.reasons.iter().any(|r| r.contains("inline SVG")), "{:?}", gate.reasons);
+    let reason = gate.reasons.iter().find(|r| r.starts_with("region art is missing")).expect("the plate still blocks");
+    assert!(reason.contains("Clear the other blocking reasons first") && !reason.contains("--force --reason"), "{reason}");
+    // Unreviewed, or removed after the acceptance, the plate blocks without the question.
+    for approved in [None, Some(reviewed_hero(true, true))] {
+        let (gate, _) = run_reviewed_hero(&blank, approved.as_ref(), REVIEWED_PAGE);
+        let reason = gate.reasons.iter().find(|r| r.starts_with("region art is missing")).expect("the plate still blocks");
+        assert!(!reason.contains("ask the user"), "{reason}");
+    }
+}
+
+#[test]
+fn a_code_region_the_accepted_first_viewport_lacks_carries_to_desktop_width() {
+    let ws = reviewed_desktop_workspace();
+    // The comp has the control; the accepted first viewport and the desktop frame do not.
+    let current = reviewed_hero(false, false);
+    let mut without = current.clone();
+    r::fill_rect(&mut without, 120., 84., 60., 24., [230., 220., 200., 255.]);
+    let (unreviewed, _) = run_reviewed_desktop(&ws, &without, None, 0.1);
+    assert!(unreviewed.reasons.iter().any(|r| r.contains("region headline is missing")), "{:?}", unreviewed.reasons);
+    let (accepted, report) = run_reviewed_desktop(&ws, &without, Some(&without), 0.1);
+    assert!(accepted.ok, "{:?}", accepted.reasons);
+    assert!(accepted.advisories.iter().any(|a| a.starts_with("(advisory, accepted in the first-viewport review) at desktop width, region headline is missing")), "{:?}", accepted.advisories);
+    assert_eq!(report["humanTextReview"]["acceptedRegions"], json!(["headline"]));
+    // Removed after the acceptance: it blocks again.
+    let (removed, _) = run_reviewed_desktop(&ws, &without, Some(&current), 0.1);
+    assert!(removed.reasons.iter().any(|r| r == "at desktop width, region headline is missing"), "{:?}", removed.reasons);
 }
