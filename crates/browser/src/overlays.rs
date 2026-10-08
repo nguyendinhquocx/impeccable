@@ -32,6 +32,13 @@
 //!   `z-index: 9999999`, a spinner and no text) never cleared on its home
 //!   page, so three of six captures were a white first screen.
 //!
+//! - **Builder badges** by the builder's own markup ([`BUILDER_BADGES`]): the
+//!   "Edit with" badge a site builder pins over pages it hosts. Corpus run 42:
+//!   Lovable's `aside#lovable-badge` (`aria-label="Edit with Lovable"`, a
+//!   fixed 148 by 24 pill at the bottom right, `z-index: 1000000`) on every
+//!   capture of mialight.app, over the copy at the foot of the first screen.
+//!   The badge is the builder's, not the site's design.
+//!
 //! Left alone on purpose: a gate the visitor has to answer (a state or
 //! region picker, an age gate, a sign-in wall) and a site's own interstitial
 //! (a welcome dialog, a newsletter modal) carry text and controls, so no
@@ -69,7 +76,17 @@ pub const TOUR_LIBRARIES: &[TourLibrary] = &[TourLibrary {
     highlight_aria_controls: Some("driver-popover-content"),
 }];
 
-/// The id of the style element the tour hide step injects.
+/// One site builder's badge: the elements to hide.
+#[derive(Debug, Clone, Copy)]
+pub struct BuilderBadge {
+    pub name: &'static str,
+    pub roots: &'static [&'static str],
+}
+
+/// Every known builder badge, in the order a report names them.
+pub const BUILDER_BADGES: &[BuilderBadge] = &[BuilderBadge { name: "Lovable", roots: &["#lovable-badge"] }];
+
+/// The id of the style element the tour and badge hide step injects.
 pub const HIDE_STYLE_ID: &str = "impeccable-overlay-hide";
 
 /// The attribute the preloader hide step puts on a layer it hid, naming it,
@@ -189,11 +206,23 @@ pub fn preloader_probe_js() -> String {
 }
 
 fn tours_json() -> Value {
+    let badges = BUILDER_BADGES.iter().map(|b| {
+        json!({
+            "kind": "badge",
+            "name": b.name,
+            "roots": b.roots,
+            "backdrops": [],
+            "bodyClasses": [],
+            "highlightClasses": [],
+            "ariaControls": null,
+        })
+    });
     Value::Array(
         TOUR_LIBRARIES
             .iter()
             .map(|t| {
                 json!({
+                    "kind": "tour",
                     "name": t.name,
                     "roots": t.roots,
                     "backdrops": t.backdrops,
@@ -202,14 +231,15 @@ fn tours_json() -> Value {
                     "ariaControls": t.highlight_aria_controls,
                 })
             })
+            .chain(badges)
             .collect(),
     )
 }
 
 /// The hide step. Idempotent, like [`crate::consent::hide_js`]. Returns
 /// `{ hidden: [{ kind, name }], matched: { name: [selector] }, unlocked:
-/// [what], changed }` for the tours and preloaders it found showing this
-/// time.
+/// [what], changed }` for the tours, builder badges and preloaders it found
+/// showing this time.
 pub fn hide_js() -> String {
     format!(
         r#"(() => {{
@@ -227,8 +257,8 @@ pub fn hide_js() -> String {
   {preloader}
   const out = {{ hidden: [], matched: {{}}, unlocked: [], changed: false }};
   const body = document.body;
-  // Tours: the library's own roots and backdrops, measured with the hide
-  // rule off so a tour already hidden is still reported.
+  // Tours and builder badges: their own roots and backdrops, measured with
+  // the hide rule off so one already hidden is still reported.
   const present = [];
   for (const t of tours) {{
     const sels = t.roots.concat(t.backdrops).filter(s => q(s).length > 0);
@@ -239,7 +269,7 @@ pub fn hide_js() -> String {
     if (style) style.disabled = true;
     for (const {{ t, sels }} of present) {{
       const on = sels.filter(s => q(s).some(boxShows));
-      if (on.length) {{ out.hidden.push({{ kind: 'tour', name: t.name }}); out.matched[t.name] = on; }}
+      if (on.length) {{ out.hidden.push({{ kind: t.kind, name: t.name }}); out.matched[t.name] = on; }}
     }}
     if (!style) {{
       style = document.createElement('style');
@@ -322,10 +352,11 @@ pub fn hide_js() -> String {
 /// One overlay the scan hid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HiddenOverlay {
-    /// `tour` or `preloader`.
+    /// `tour`, `badge` or `preloader`.
     pub kind: String,
-    /// The library (`driver.js`) for a tour; the layer's tag and the id or
-    /// class that names it (`div#preloader`) for a preloader.
+    /// The library (`driver.js`) for a tour, the builder (`Lovable`) for a
+    /// badge; the layer's tag and the id or class that names it
+    /// (`div#preloader`) for a preloader.
     pub name: String,
 }
 
@@ -338,10 +369,10 @@ impl HiddenOverlay {
 /// What the overlay hide step did over a scan.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OverlayReport {
-    /// Tours and preloaders that were showing and were hidden, tours first,
-    /// each in first-seen order.
+    /// Tours, builder badges and preloaders that were showing and were
+    /// hidden, in that order, each kind in first-seen order.
     pub hidden: Vec<HiddenOverlay>,
-    /// Per hidden tour, the selectors that matched a showing element.
+    /// Per hidden tour or badge, the selectors that matched a showing element.
     pub matched: Vec<(String, Vec<String>)>,
     /// What was undone on the page (`body.driver-active`,
     /// `highlight .driver-active-element`, `highlight aria`).
@@ -368,7 +399,7 @@ impl OverlayReport {
             if !self.hidden.contains(&item) {
                 self.hidden.push(item);
             }
-            if kind == "tour" {
+            if kind != "preloader" {
                 let sels = strs(v.get("matched").and_then(|m| m.get(name)));
                 match self.matched.iter_mut().find(|(n, _)| n == name) {
                     Some((_, have)) => {
@@ -387,8 +418,13 @@ impl OverlayReport {
                 self.unlocked.push(u);
             }
         }
-        // Tours before preloaders, a stable sort keeping first-seen order.
-        self.hidden.sort_by_key(|h| if h.kind == "tour" { 0 } else { 1 });
+        // Tours, then builder badges, then preloaders, a stable sort keeping
+        // first-seen order.
+        self.hidden.sort_by_key(|h| match h.kind.as_str() {
+            "tour" => 0,
+            "badge" => 1,
+            _ => 2,
+        });
     }
 
     /// The `overlaysHidden` value findings carry.
@@ -442,10 +478,38 @@ mod tests {
     }
 
     #[test]
+    fn badge_selectors_name_their_builder() {
+        for b in BUILDER_BADGES {
+            for s in b.roots {
+                assert!(s.to_ascii_lowercase().contains(&b.name.to_ascii_lowercase()), "{}: {s}", b.name);
+            }
+        }
+    }
+
+    #[test]
+    fn report_orders_badges_between_tours_and_preloaders() {
+        let mut r = OverlayReport::default();
+        r.merge(&json!({
+            "hidden": [{ "kind": "preloader", "name": "div#preloader" }, { "kind": "badge", "name": "Lovable" }],
+            "matched": { "Lovable": ["#lovable-badge"] },
+            "unlocked": [],
+        }));
+        r.merge(&json!({ "hidden": [{ "kind": "tour", "name": "driver.js" }], "matched": { "driver.js": [".driver-popover"] }, "unlocked": [] }));
+        let kinds: Vec<&str> = r.hidden.iter().map(|h| h.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["tour", "badge", "preloader"]);
+        assert_eq!(r.matched[0], ("Lovable".to_string(), vec!["#lovable-badge".to_string()]));
+    }
+
+    #[test]
     fn scripts_embed_every_selector_and_word() {
         let hide = hide_js();
         for t in TOUR_LIBRARIES {
             for s in t.roots.iter().chain(t.backdrops) {
+                assert!(hide.contains(&serde_json::to_string(s).unwrap()), "{s}");
+            }
+        }
+        for b in BUILDER_BADGES {
+            for s in b.roots {
                 assert!(hide.contains(&serde_json::to_string(s).unwrap()), "{s}");
             }
         }

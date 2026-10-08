@@ -2282,7 +2282,10 @@ fn closed_controlled_ids(dom: &dyn Dom) -> std::collections::HashSet<String> {
 ///   `aria-expanded="false"`, the accordion that names no `aria-controls`
 ///   (the wrapper is a heading or holds nothing but the trigger);
 /// - the box itself is a drawer parked beside the page: `position: fixed`
-///   and wholly left or right of the viewport.
+///   and wholly left or right of the viewport;
+/// - the box or an ancestor is a drawer slid off the page
+///   ([`slid_off_drawer`]): hse.de's mobile menu, `position: absolute`
+///   inside a panel translated a viewport width to the left.
 ///
 /// A tab panel (by role or by a tab class) that its tab marks selected
 /// ([`tab_panel_marked_open`]) is not closed by its own role or class: it is
@@ -2335,6 +2338,9 @@ fn closed_container(dom: &dyn Dom, el: ElId, closed_ids: &std::collections::Hash
         if tag_lower(dom, a) == "nav" || CLOSED_NAV_ROLES.contains(&role(a).as_str()) {
             return true;
         }
+        if slid_off_drawer(dom, a) {
+            return true;
+        }
         if dom.attr(a, "inert").is_some() {
             return true;
         }
@@ -2347,6 +2353,33 @@ fn closed_container(dom: &dyn Dom, el: ElId, closed_ids: &std::collections::Hash
         }
     }
     false
+}
+
+/// Whether `el` is a drawer slid off the page: positioned (`absolute` or
+/// `fixed`), moved by a `transform` other than the identity that it
+/// transitions, and with its box wholly left or right of the viewport. That
+/// is an off-canvas panel at rest in its closed position, which its trigger
+/// slides in; Tailwind's `-translate-x-full transition-transform` is the
+/// usual spelling. A box parked off the page with no transform, or one that
+/// does not animate its transform, is left to the other tests.
+fn slid_off_drawer(dom: &dyn Dom, el: ElId) -> bool {
+    let position = js::to_lower_case(&dom.style(el, "position"));
+    if position != "absolute" && position != "fixed" {
+        return false;
+    }
+    let transform = js::trim(&dom.style(el, "transform")).replace(' ', "");
+    if transform.is_empty() || transform == "none" || super::element_checks::is_identity_matrix(&transform) {
+        return false;
+    }
+    if !super::painted::declares_transition_of(dom, el, "transform") {
+        return false;
+    }
+    let rect = dom.rect(el);
+    let viewport_width = dom.inner_width();
+    rect.all_finite()
+        && rect.width > 0.0
+        && viewport_width > 0.0
+        && (rect.right <= 0.0 || rect.left >= viewport_width)
 }
 
 /// The topmost box from `el` up to, but not including, `start` that holds
@@ -2478,6 +2511,11 @@ pub fn measure_hidden_text_dom(dom: &dyn Dom) -> HiddenTextMeasure {
                         // the page sits at the top, where this is measured,
                         // and shows it to a visitor who scrolls: its text is
                         // content they read.
+                        HiddenState::Visible
+                    } else if !by_visibility && super::painted::opacity_animation_shows(dom, el) {
+                        // A timed animation running on the box fades it in,
+                        // or loops it through a visible phase: the capture
+                        // caught a frame at 0, and a visitor reads the text.
                         HiddenState::Visible
                     } else if unstarted_slider(dom, el, sliders) {
                         HiddenState::Unstarted
@@ -3109,6 +3147,122 @@ fn glyph_ink_band(dom: &dyn Dom, el: ElId, rect: &Rect) -> Option<Rect> {
     Some(Rect::from_xywh(rect.left, rect.top + top_inset, rect.width, height))
 }
 
+/// Whether `top`, a hit-test answer over `victim`, is a scroller's paging
+/// control: a button or link (itself or within two levels above it) lifted
+/// out of the flow (`position: absolute | fixed`) that spans the height of a
+/// sideways scroller holding the victim, which it does not sit in, at one of
+/// that scroller's ends. lance.com.br lays its "next" arrow over the right
+/// end of a strip of match cards, and the card peeking under it is the
+/// scroller's next item, not text the page hides.
+fn is_scroller_arrow(dom: &dyn Dom, top: ElId, victim: ElId) -> bool {
+    let mut control = None;
+    let mut cur = Some(top);
+    for _ in 0..3 {
+        let Some(c) = cur else { break };
+        let tag = tag_lower(dom, c);
+        if tag == "button"
+            || tag == "a"
+            || dom.attr(c, "role").is_some_and(|r| js::to_lower_case(js::trim(&r)) == "button")
+        {
+            control = Some(c);
+            break;
+        }
+        cur = dom.parent(c);
+    }
+    let Some(control) = control else { return false };
+    let pos = dom.style(control, "position");
+    if pos != "absolute" && pos != "fixed" {
+        return false;
+    }
+    let scrolls_x = |n: ElId| {
+        let x = dom.style(n, "overflowX");
+        let x = if x.is_empty() {
+            dom.style(n, "overflow").split_whitespace().next().unwrap_or("").to_string()
+        } else {
+            x
+        };
+        x == "auto" || x == "scroll"
+    };
+    let mut cur = dom.parent(victim);
+    while let Some(sc) = cur {
+        if dom.contains(sc, control) {
+            return false;
+        }
+        if scrolls_x(sc) {
+            let sr = dom.rect(sc);
+            let cr = dom.rect(control);
+            // A strip that has something to page to, and a control the size
+            // of an arrow at its end, not a panel over it.
+            let overflows = dom.scroll_width(sc) > dom.client_width(sc) + 1.0;
+            if !(sr.height > 0.0 && cr.width > 0.0) || !overflows || cr.width > 0.25 * sr.width {
+                return false;
+            }
+            let spans = cr.top <= sr.top + 0.1 * sr.height && cr.bottom >= sr.bottom - 0.1 * sr.height;
+            let at_end = (cr.right - sr.right).abs() <= 2.0
+                || (cr.left - sr.left).abs() <= 2.0
+                || (cr.right >= sr.right - 2.0 && cr.left < sr.right)
+                || (cr.left <= sr.left + 2.0 && cr.right > sr.left);
+            return spans && at_end;
+        }
+        cur = dom.parent(sc);
+    }
+    false
+}
+
+/// Whether `el` or a box above it is drawn rotated or skewed: a computed
+/// `transform` whose matrix turns the axes (`matrix(a, b, c, d, ..)` with `b`
+/// or `c` off zero), or a 3D matrix, which this does not read.
+fn drawn_tilted(dom: &dyn Dom, el: ElId) -> bool {
+    let mut cur = Some(el);
+    while let Some(c) = cur {
+        let t = dom.style(c, "transform");
+        let t = js::trim(&t);
+        if t.starts_with("matrix3d(") {
+            return true;
+        }
+        if let Some(args) = t.strip_prefix("matrix(").and_then(|r| r.strip_suffix(')')) {
+            let v: Vec<f64> = args.split(',').map(|a| parse_float(js::trim(a))).collect();
+            if v.len() == 6 && (v[1].abs() > 1e-3 || v[2].abs() > 1e-3) {
+                return true;
+            }
+        }
+        if dom.style(c, "rotate").split_whitespace().any(|t| t != "none" && t != "0deg") {
+            return true;
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+
+/// The opaque layer an occluding answer belongs to: the nearest box above
+/// `occ` (and not holding the victim) that paints an opaque fill over at
+/// least half of the victim's box. suitemigration.com's hero stacks product
+/// cards, and what a probe answers with is the front card's own text or a
+/// bordered row in it; the card is what covers the text, so the finding
+/// names it. `None` when `occ` is such a box itself or none is found.
+fn covering_layer(dom: &dyn Dom, occ: ElId, victim: ElId, victim_rect: &Rect) -> Option<ElId> {
+    let area = victim_rect.width * victim_rect.height;
+    if !(area > 0.0) || paints_opaque_fill(dom, occ) {
+        return None;
+    }
+    let mut cur = dom.parent(occ);
+    while let Some(c) = cur {
+        if dom.contains(c, victim) || Some(c) == dom.body() {
+            return None;
+        }
+        if paints_opaque_fill(dom, c) {
+            let r = dom.rect(c);
+            let ix = math_max(0.0, math_min(r.right, victim_rect.right) - math_max(r.left, victim_rect.left));
+            let iy = math_max(0.0, math_min(r.bottom, victim_rect.bottom) - math_max(r.top, victim_rect.top));
+            if ix * iy >= 0.5 * area {
+                return Some(c);
+            }
+        }
+        cur = dom.parent(c);
+    }
+    None
+}
+
 /// Whether the hit-test stack at a point shows `victim` buried, with the
 /// element that answered (`stack[0]`) lying on what buries it rather than on
 /// the victim. Between the answer and the victim in paint order sits either
@@ -3139,6 +3293,9 @@ const MARQUEE_TRACK_MAX_DEPTH: usize = 4;
 pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
     let mut findings = Vec::new();
     let mut seen_victims: Vec<ElId> = Vec::new();
+    // The inline boxes reported for a fill that leaks: there the element is
+    // what covers, not what is covered.
+    let mut leak_hosts: Vec<ElId> = Vec::new();
     let (vw, vh) = occlusion_viewport(dom);
     let body = dom.body();
 
@@ -3327,13 +3484,44 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
         let mut occluded = 0usize;
         let mut occluder_el: Option<ElId> = None;
         let mut occluder_kind = "";
-        for (x, y) in occlusion_probe_points(rect, vw, vh) {
+        // Where the capture recorded the lines, a point off every line (the
+        // empty end of a wrapped paragraph's last line, its box past the
+        // words) has no text under it to cover, and the share is taken over
+        // the points on the lines. Under a rotation or skew a line's rect is
+        // the bounds of a tilted line, not the line, so the grid stands.
+        let points = occlusion_probe_points(rect, vw, vh);
+        let lines = if drawn_tilted(dom, el) {
+            None
+        } else {
+            // The lines of the victim's own text: a child's line on a row of
+            // its own is the child's text, which the probe already skips.
+            let own = dom.direct_text_rect(el).filter(|r| r.all_finite());
+            dom.text_line_rects(el)
+                .map(|l| {
+                    l.into_iter()
+                        .filter(|r| {
+                            own.as_ref().map_or(true, |o| {
+                                r.top < o.bottom && r.bottom > o.top && r.left < o.right && r.right > o.left
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .filter(|l| !l.is_empty() && l.iter().all(|r| r.all_finite()))
+        }
+        // A grid none of whose points lands on a line (one centred line in a
+        // tall box, between two grid rows) says nothing either way; the
+        // whole grid stands.
+        .filter(|l| points.iter().any(|&(x, y)| l.iter().any(|r| rect_holds_point(r, x, y))));
+        for (x, y) in points {
+            if lines.as_ref().is_some_and(|l| !l.iter().any(|r| rect_holds_point(r, x, y))) {
+                continue;
+            }
             total += 1;
             let Some(top) = dom.element_from_point(x, y) else { continue };
             if top == el || dom.contains(el, top) || dom.contains(top, el) {
                 continue;
             }
-            if is_floated(top) || is_marqueeish(top) || is_pinned_overlay(top) {
+            if is_floated(top) || is_marqueeish(top) || is_pinned_overlay(top) || is_scroller_arrow(dom, top, el) {
                 continue;
             }
             if effective_opacity_dom(dom, top) <= 0.02 || ignores_pointer_events(dom, top) {
@@ -3418,12 +3606,15 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
             }
         }
         seen_victims.push(el);
+        let layer = covering_layer(dom, occ, el, rect)
+            .map(|l| format!(" on an opaque layer ({})", class_selector(dom, l)))
+            .unwrap_or_default();
         findings.push(ElFinding {
             el: Some(el),
             finding: BrowserFinding::new(
                 "text-occlusion",
                 format!(
-                    "{} \"{}\" is {}% covered by {} ({})",
+                    "{} \"{}\" is {}% covered by {} ({}){}",
                     class_selector(dom, el),
                     slice_utf16_prefix(text, 24),
                     number_to_string(math_round(occ_frac * 100.0)),
@@ -3433,7 +3624,8 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
                         "border" => "a bordered element",
                         _ => "an opaque element",
                     },
-                    class_selector(dom, occ)
+                    class_selector(dom, occ),
+                    layer
                 ),
             ),
         });
@@ -3601,24 +3793,65 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
                 break;
             }
         }
+        // The fill leaks onto something or it covers nothing: a padded
+        // inline button alone in its line box (nemonix.app's "Share your
+        // feedback") hangs past the line with nothing there to cover.
+        let Some(onto) = overlaps else { continue };
+        // How far the fill runs past the line boxes its text sits in: the
+        // box's height less one line height per line it spans.
+        // Runs far apart on one row (labels set apart by wide margins) come
+        // back as separate rects and are still one line: a rect starts a new
+        // line only where it begins below the middle of the one before.
+        let line_count = dom
+            .text_line_rects(el)
+            .map(|mut l| {
+                l.retain(|r| r.all_finite());
+                l.sort_by(|a, b| a.top.partial_cmp(&b.top).unwrap_or(std::cmp::Ordering::Equal));
+                let mut rows = 0usize;
+                let mut row_middle = f64::NEG_INFINITY;
+                for r in &l {
+                    if r.top >= row_middle {
+                        rows += 1;
+                        row_middle = r.top + r.height / 2.0;
+                    }
+                }
+                rows
+            })
+            .filter(|n| *n > 0)
+            .unwrap_or(1) as f64;
+        let overhang = rect.height - line_count * line_height;
+        if !(overhang > 0.0) {
+            continue;
+        }
+        leak_hosts.push(el);
         seen_victims.push(el);
         findings.push(ElFinding {
             el: Some(el),
             finding: BrowserFinding::new(
                 "text-occlusion",
                 format!(
-                    "{} is an inline element whose opaque fill leaks {}px past its line{}",
+                    "{} is an inline element whose opaque fill leaks {}px past its line onto {}",
                     class_selector(dom, el),
-                    number_to_string(math_round(rect.height)),
-                    match overlaps {
-                        Some(o) => format!(" onto {}", class_selector(dom, o)),
-                        None => String::new(),
-                    }
+                    number_to_string(math_round(overhang)),
+                    class_selector(dom, onto)
                 ),
             ),
         });
     }
 
+    // Text covered inside a drawn product mockup is covered on purpose:
+    // suitemigration.com fans five app screens into a deck, and nobody is
+    // meant to read the card behind. Advisory there (decision
+    // r8-t2-occlusion-stacked-mockup). Covered page text, a control in the
+    // mockup, and the box whose fill leaks onto a neighbour keep the
+    // registry's severity.
+    for f in &mut findings {
+        if f.el.is_some_and(|el| {
+            !leak_hosts.contains(&el) && super::decorative_text::covered_text_in_mockup_dom(dom, el)
+        }) {
+            f.finding.severity = Some(crate::checks::rules::ADVISORY_SEVERITY.to_string());
+        }
+    }
     findings
 }
 
@@ -3648,6 +3881,63 @@ fn column_visible_bottom(dom: &dyn Dom, d: ElId, dr: &Rect, row: ElId) -> f64 {
         cur = dom.parent(p);
     }
     bottom
+}
+
+/// Whether `d` is the content of a closed `<details>` at or below `within`:
+/// inside one without `open`, and not in its `<summary>`. A closed
+/// disclosure shows its summary alone, whatever rects the rest still reports
+/// (freddiemac.com's FAQ accordion lays its answers out at full height).
+fn in_closed_details(dom: &dyn Dom, d: ElId, within: ElId) -> bool {
+    let mut cur = Some(d);
+    let mut in_summary = false;
+    while let Some(c) = cur {
+        let tag = tag_lower(dom, c);
+        if tag == "summary" {
+            in_summary = true;
+        } else if tag == "details" {
+            if c != d && dom.attr(c, "open").is_none() && !in_summary {
+                return true;
+            }
+            in_summary = false;
+        }
+        if c == within {
+            break;
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+
+/// The longest link text, on average, a column of links can hold and still
+/// read as navigation: menu entries, not linked cards or paragraphs.
+const LINK_RAIL_MEAN_CHARS: f64 = 40.0;
+
+/// Whether a column is a list of links: three or more links holding nine
+/// tenths of its text, short on average. A section menu set in a sidebar
+/// without a `nav` or a role (fanniemae.com's "About Us" side menu) is short
+/// by design, like the navigation rails the fold test already leaves out.
+fn is_link_list_rail(dom: &dyn Dom, column: ElId) -> bool {
+    let chars = |n: ElId| dom.text_content(n).split_whitespace().map(utf16_len).sum::<usize>() as f64;
+    let total = chars(column);
+    if !(total > 0.0) {
+        return false;
+    }
+    let links = dom.query_all(Some(column), "a").unwrap_or_default();
+    // A link inside another counts once.
+    let outer: Vec<ElId> = links
+        .iter()
+        .copied()
+        .filter(|&a| !links.iter().any(|&o| o != a && dom.contains(o, a)))
+        .collect();
+    // A link a reader cannot see (a closed mega-menu) is no menu entry, and
+    // its text is not the column's.
+    let (shown, hidden): (Vec<ElId>, Vec<ElId>) = outer.into_iter().partition(|&a| painted_at_capture(dom, a));
+    if shown.len() < 3 {
+        return false;
+    }
+    let total = total - hidden.iter().map(|&a| chars(a)).sum::<f64>();
+    let link_chars: f64 = shown.iter().map(|&a| chars(a)).sum();
+    total > 0.0 && link_chars >= 0.9 * total && link_chars / shown.len() as f64 <= LINK_RAIL_MEAN_CHARS
 }
 
 /// JS: checks.mjs#checkFirstViewportColumnOverflowDOM()
@@ -3715,6 +4005,7 @@ pub fn check_first_viewport_column_overflow_dom(dom: &dyn Dom) -> Vec<ElFinding>
                     r.split_ascii_whitespace()
                         .any(|t| matches!(js::to_lower_case(t).as_str(), "navigation" | "tablist"))
                 })
+                || is_link_list_rail(dom, child)
             {
                 continue;
             }
@@ -3741,6 +4032,9 @@ pub fn check_first_viewport_column_overflow_dom(dom: &dyn Dom) -> Vec<ElFinding>
                     continue;
                 }
                 if dom.style(d, "display") == "none" || dom.style(d, "visibility") == "hidden" {
+                    continue;
+                }
+                if in_closed_details(dom, d, child) {
                     continue;
                 }
                 let dr = dom.rect(d);
@@ -4977,11 +5271,122 @@ mod tests {
         assert_eq!(
             f[0].finding.detail,
             format!(
-                "{} is an inline element whose opaque fill leaks 60px past its line onto {}",
+                "{} is an inline element whose opaque fill leaks 40px past its line onto {}",
                 class_selector(&d, leak),
                 class_selector(&d, sib)
             )
         );
+    }
+
+    /// Decision r8-t2-occlusion-stacked-mockup (advisory): covered text in a
+    /// recognised mockup reports as advisory; covered page text, and a
+    /// control in the mockup, keep the registry's severity.
+    #[test]
+    fn text_occlusion_in_a_mockup_is_advisory() {
+        let build = |tag: &str, frame: &dyn Fn(&mut FakeDom, ElId)| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let base = &[("display", "block"), ("visibility", "visible"), ("opacity", "1"), ("contentVisibility", "visible"), ("position", "static"), ("cssFloat", "none"), ("animationName", "none")][..];
+            let deck = d.add(Some(body), "div");
+            d.set_styles(deck, base);
+            d.set_rect(deck, 0.0, 0.0, 600.0, 400.0);
+            let card = d.add(Some(deck), "div");
+            d.set_styles(card, base);
+            d.set_rect(card, 50.0, 50.0, 400.0, 300.0);
+            frame(&mut d, card);
+            let txt = d.add(Some(card), tag);
+            d.add_text(txt, "Needs attention");
+            d.set_styles(txt, base);
+            d.set_styles(txt, &[("fontSize", "16px"), ("overflow", "visible"), ("overflowX", "visible"), ("overflowY", "visible"), ("clip", "auto"), ("clipPath", "none")]);
+            d.set_rect(txt, 100.0, 100.0, 240.0, 28.0);
+            let front = d.add(Some(deck), "div");
+            d.set_styles(front, base);
+            d.set_styles(front, &[("position", "absolute"), ("backgroundColor", "rgb(20, 20, 20)")]);
+            d.set_rect(front, 100.0, 100.0, 240.0, 28.0);
+            mark_body_descendants(&mut d);
+            let f = check_text_occlusion_dom(&d);
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert_eq!(f[0].el, Some(txt));
+            f[0].finding.severity.clone()
+        };
+        let tilted = |d: &mut FakeDom, card: ElId| {
+            d.set_style(card, "transform", "perspective(900px) rotateX(8deg)");
+        };
+        let advisory = Some(crate::checks::rules::ADVISORY_SEVERITY.to_string());
+        assert_eq!(build("p", &|_, _| {}), None, "covered page text");
+        assert_eq!(build("p", &tilted), advisory, "covered in a tilted device frame");
+        assert_eq!(build("button", &tilted), None, "a control in the mockup");
+        // The picture path has no control guard of its own.
+        let picture = |d: &mut FakeDom, card: ElId| { d.set_attr(card, "role", "img"); };
+        assert_eq!(build("p", &picture), advisory, "covered in a subtree marked as a picture");
+        assert_eq!(build("button", &picture), None, "a control in a picture");
+
+        // An inline box whose fill leaks onto its neighbour is what covers,
+        // not what is covered: in a mockup it keeps its severity.
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let base = &[("display", "block"), ("visibility", "visible"), ("opacity", "1"), ("contentVisibility", "visible"), ("position", "static"), ("cssFloat", "none"), ("animationName", "none")][..];
+        let wrap = d.add(Some(body), "div");
+        d.set_styles(wrap, base);
+        d.set_style(wrap, "transform", "perspective(900px) rotateX(8deg)");
+        d.set_rect(wrap, 0.0, 0.0, 400.0, 200.0);
+        let leak = d.add(Some(wrap), "span");
+        d.set_styles(leak, base);
+        d.set_styles(leak, &[("display", "inline"), ("backgroundColor", "rgb(255, 0, 0)"), ("paddingTop", "20px"), ("paddingBottom", "20px"), ("fontSize", "16px"), ("lineHeight", "20px")]);
+        d.set_rect(leak, 10.0, 10.0, 40.0, 60.0);
+        let sib = d.add(Some(wrap), "p");
+        d.add_text(sib, "neighbour");
+        d.set_styles(sib, base);
+        d.set_rect(sib, 0.0, 40.0, 400.0, 20.0);
+        mark_body_descendants(&mut d);
+        let f = check_text_occlusion_dom(&d);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].el, Some(leak));
+        assert_eq!(f[0].finding.severity, None);
+    }
+
+    /// Three labels in one padded inline link, set apart by wide margins,
+    /// come back as three runs on one row. They are one line: the fill
+    /// still hangs 30px past it onto the paragraph below.
+    #[test]
+    fn text_occlusion_inline_leak_counts_rows_not_runs() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let wrap = d.add(Some(body), "div");
+        d.set_styles(wrap, PROBE_BASE);
+        d.set_rect(wrap, 0.0, 100.0, 1056.0, 80.0);
+        let btn = d.add(Some(wrap), "a");
+        d.add_text(btn, "Plans   Pricing   Support");
+        d.set_attr(btn, "class", "btn-lg");
+        d.set_styles(btn, PROBE_BASE);
+        d.set_styles(
+            btn,
+            &[
+                ("display", "inline"),
+                ("backgroundColor", "rgb(19, 21, 28)"),
+                ("paddingTop", "15px"),
+                ("paddingBottom", "15px"),
+                ("fontSize", "14px"),
+                ("lineHeight", "20px"),
+            ],
+        );
+        d.set_rect(btn, 100.0, 88.0, 600.0, 50.0);
+        d.set_text_lines(btn, &[(110.0, 105.0, 40.0, 16.0), (330.0, 105.0, 50.0, 16.0), (560.0, 105.0, 55.0, 16.0)]);
+        let sib = d.add(Some(wrap), "p");
+        d.add_text(sib, "The paragraph under the link's line.");
+        d.set_attr(sib, "class", "next");
+        d.set_styles(sib, PROBE_BASE);
+        d.set_rect(sib, 0.0, 125.6, 1056.0, 24.0);
+        mark_body_descendants(&mut d);
+        let f = check_text_occlusion_dom(&d);
+        let leak: Vec<_> = f.iter().filter(|f| f.el == Some(btn)).collect();
+        assert_eq!(leak.len(), 1, "{f:?}");
+        assert!(leak[0].finding.detail.contains("leaks 30px past its line onto"), "{:?}", leak[0].finding.detail);
+        // Two rows of runs are two lines: 50 less 40 leaves 10px.
+        d.set_text_lines(btn, &[(110.0, 95.0, 40.0, 16.0), (330.0, 95.0, 50.0, 16.0), (110.0, 115.0, 55.0, 16.0)]);
+        let f = check_text_occlusion_dom(&d);
+        let leak: Vec<_> = f.iter().filter(|f| f.el == Some(btn)).collect();
+        assert!(leak[0].finding.detail.contains("leaks 10px past its line onto"), "{:?}", leak[0].finding.detail);
     }
 
     const PROBE_BASE: &[(&str, &str)] = &[
@@ -5697,6 +6102,238 @@ mod tests {
         assert_eq!(build(None, false, true), 0);
     }
 
+    /// observations-42 row 6: freddiemac.com's FAQ column of closed
+    /// `<details>` still reports its answers at full height, and
+    /// fanniemae.com's section menu is a sidebar of links with no `nav`.
+    #[test]
+    fn first_viewport_column_overflow_reads_closed_details_and_link_rails() {
+        fn build(tall: &str, short: &str) -> usize {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let grid = d.add(Some(body), "section");
+            d.set_styles(grid, &[("display", "grid")]);
+            d.set_rect(grid, 0.0, 0.0, 1280.0, 1400.0);
+            let col = |d: &mut FakeDom, x: f64| {
+                let c = d.add(Some(grid), "div");
+                d.set_styles(c, &[("display", "block"), ("position", "static")]);
+                d.set_rect(c, x, 0.0, 640.0, 1400.0);
+                c
+            };
+            let block = |d: &mut FakeDom, parent: ElId, tag: &str, rect: (f64, f64, f64, f64), text: &str| {
+                let e = d.add(Some(parent), tag);
+                d.set_styles(e, &[("display", "block"), ("position", "static"), ("visibility", "visible")]);
+                d.set_rect(e, rect.0, rect.1, rect.2, rect.3);
+                if !text.is_empty() {
+                    d.add_text(e, text);
+                }
+                e
+            };
+            let a = col(&mut d, 0.0);
+            match tall {
+                "details" | "open" => {
+                    let det = block(&mut d, a, "details", (0.0, 0.0, 600.0, 44.0), "");
+                    if tall == "open" {
+                        d.set_attr(det, "open", "");
+                    }
+                    block(&mut d, det, "summary", (0.0, 0.0, 600.0, 43.0), "How do I contact investor relations?");
+                    let answer = block(&mut d, det, "div", (0.0, 44.0, 600.0, 1250.0), "");
+                    block(&mut d, answer, "p", (0.0, 44.0, 600.0, 1250.0), "If you are an investor, write to us.");
+                }
+                _ => {
+                    block(&mut d, a, "p", (0.0, 0.0, 600.0, 1300.0), "A long column of copy.");
+                }
+            }
+            let b = col(&mut d, 640.0);
+            match short {
+                "hidden-menu" => {
+                    // Copy, and a closed menu of links nobody sees.
+                    block(&mut d, b, "p", (640.0, 0.0, 600.0, 200.0), "A short column of copy that a reader reads.");
+                    let menu = block(&mut d, b, "ul", (640.0, 200.0, 600.0, 100.0), "");
+                    for label in ["Who We Are", "Leadership", "Careers", "Newsroom", "Investors", "Contact"] {
+                        let a = block(&mut d, menu, "a", (640.0, 200.0, 200.0, 24.0), label);
+                        d.el_mut(a).check_visibility = Some(false);
+                    }
+                }
+                "links" | "prose" => {
+                    let ul = block(&mut d, b, "ul", (640.0, 0.0, 600.0, 300.0), "");
+                    for (i, label) in ["Who We Are", "Leadership", "Careers", "News"].iter().enumerate() {
+                        let li = block(&mut d, ul, "li", (640.0, i as f64 * 40.0, 600.0, 40.0), "");
+                        if short == "links" {
+                            block(&mut d, li, "a", (640.0, i as f64 * 40.0, 200.0, 24.0), label);
+                        } else {
+                            d.add_text(li, label);
+                        }
+                    }
+                }
+                _ => {
+                    block(&mut d, b, "p", (640.0, 0.0, 600.0, 300.0), "A short column.");
+                }
+            }
+            mark_body_descendants(&mut d);
+            check_first_viewport_column_overflow_dom(&d).len()
+        }
+        assert_eq!(build("open", "prose"), 1, "an open disclosure shows its answer");
+        assert_eq!(build("details", "prose"), 0, "a closed one shows its summary");
+        assert_eq!(build("copy", "prose"), 1, "a short list of items");
+        assert_eq!(build("copy", "links"), 0, "a list of links is a menu");
+        assert_eq!(build("copy", "hidden-menu"), 1, "copy beside a hidden menu");
+    }
+
+    /// observations-42 row 13. nemonix.app: a padded inline button alone in
+    /// its line hangs past the line onto nothing. The fill's overhang, not
+    /// its whole height, is what the finding prints.
+    #[test]
+    fn text_occlusion_inline_leak_needs_something_to_cover() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let wrap = d.add(Some(body), "div");
+        d.set_styles(wrap, PROBE_BASE);
+        d.set_rect(wrap, 0.0, 100.0, 1056.0, 25.6);
+        let btn = d.add(Some(wrap), "a");
+        d.add_text(btn, "Share your feedback");
+        d.set_attr(btn, "class", "btn-lg");
+        d.set_styles(btn, PROBE_BASE);
+        d.set_styles(
+            btn,
+            &[
+                ("display", "inline"),
+                ("backgroundColor", "rgb(19, 21, 28)"),
+                ("paddingTop", "15px"),
+                ("paddingBottom", "15px"),
+                ("fontSize", "14px"),
+                ("lineHeight", "22.4px"),
+            ],
+        );
+        d.set_rect(btn, 427.0, 88.0, 201.0, 50.0);
+        mark_body_descendants(&mut d);
+        assert!(check_text_occlusion_dom(&d).iter().all(|f| f.el != Some(btn)), "nothing beside it");
+    }
+
+    /// observations-42 row 13, verizon.com: a sticker overlaps the empty end
+    /// of a wrapped paragraph's box, past the words. Points off every line
+    /// are not probed.
+    #[test]
+    fn text_occlusion_probes_only_where_the_lines_are() {
+        let run = |lines: bool| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let p = d.add(Some(body), "p");
+            d.add_text(p, "After AutoPay and $15/mo switch discount");
+            d.set_attr(p, "class", "micro");
+            d.set_styles(p, PROBE_BASE);
+            d.set_styles(p, &[("fontSize", "11px"), ("lineHeight", "16px")]);
+            d.set_rect(p, 36.0, 533.0, 338.0, 48.0);
+            if lines {
+                d.set_text_lines(p, &[(36.0, 534.0, 102.0, 13.0), (36.0, 550.0, 136.5, 13.0), (36.0, 566.0, 112.7, 13.0)]);
+            }
+            let sticker = d.add(Some(body), "div");
+            d.set_attr(sticker, "class", "circle");
+            d.set_styles(sticker, PROBE_BASE);
+            d.set_styles(sticker, &[("position", "absolute"), ("backgroundColor", "rgb(248, 255, 60)")]);
+            d.set_rect(sticker, 183.0, 503.0, 195.0, 195.0);
+            mark_body_descendants(&mut d);
+            check_text_occlusion_dom(&d).into_iter().filter(|f| f.el == Some(p)).count()
+        };
+        assert_eq!(run(false), 1, "the box, as before");
+        assert_eq!(run(true), 0, "the lines end before the sticker");
+
+        // One centred line in a tall box, between the grid's rows: no point
+        // lands on it, and the whole grid stands.
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let label = d.add(Some(body), "div");
+        d.add_text(label, "Covered label");
+        d.set_styles(label, PROBE_BASE);
+        d.set_rect(label, 40.0, 100.0, 200.0, 120.0);
+        d.set_text_lines(label, &[(40.0, 151.0, 200.0, 18.0)]);
+        let cover = d.add(Some(body), "div");
+        d.set_styles(cover, PROBE_BASE);
+        d.set_styles(cover, &[("position", "absolute"), ("backgroundColor", "rgb(20, 20, 20)")]);
+        d.set_rect(cover, 40.0, 100.0, 200.0, 120.0);
+        mark_body_descendants(&mut d);
+        assert_eq!(check_text_occlusion_dom(&d).iter().filter(|f| f.el == Some(label)).count(), 1);
+    }
+
+    /// observations-42 row 13, lance.com.br: a strip that scrolls sideways
+    /// carries a "next" arrow at its right end, the height of the strip,
+    /// over the card that peeks out under it.
+    #[test]
+    fn text_occlusion_skips_a_scrollers_paging_arrow() {
+        let run = |position: &str, height: f64, scroll_width: f64| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let section = d.add(Some(body), "section");
+            d.set_styles(section, PROBE_BASE);
+            d.set_rect(section, 0.0, 54.0, 1280.0, 154.0);
+            let strip = d.add(Some(section), "div");
+            d.set_styles(strip, PROBE_BASE);
+            d.set_styles(strip, &[("overflowX", "scroll")]);
+            d.set_rect(strip, 208.0, 54.0, 1072.0, 154.0);
+            d.el_mut(strip).client_width = 1072.0;
+            d.el_mut(strip).scroll_width = scroll_width;
+            let card = d.add(Some(strip), "span");
+            d.add_text(card, "UEFA Nations League");
+            d.set_styles(card, PROBE_BASE);
+            d.set_rect(card, 1200.0, 70.0, 160.0, 20.0);
+            let arrow = d.add(Some(section), "button");
+            d.set_attr(arrow, "class", "next");
+            d.set_styles(arrow, PROBE_BASE);
+            d.set_styles(arrow, &[("position", position), ("backgroundColor", "rgb(245, 245, 245)")]);
+            d.set_rect(arrow, 1240.0, 54.0, 40.0, height);
+            mark_body_descendants(&mut d);
+            check_text_occlusion_dom(&d).into_iter().filter(|f| f.el == Some(card)).count()
+        };
+        assert_eq!(run("absolute", 154.0, 1400.0), 0, "the strip's own arrow");
+        assert_eq!(run("absolute", 40.0, 1400.0), 1, "a small box over the card");
+        assert_eq!(run("absolute", 154.0, 1072.0), 1, "a strip with nothing to page to");
+    }
+
+    /// observations-42 row 17, suitemigration.com: a probe over a stacked
+    /// card answers with the front card's own text; the finding names the
+    /// card that covers the victim as well.
+    #[test]
+    fn text_occlusion_names_the_layer_that_covers_the_text() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let deck = d.add(Some(body), "div");
+        d.set_styles(deck, PROBE_BASE);
+        d.set_styles(deck, &[("position", "relative")]);
+        d.set_rect(deck, 0.0, 100.0, 600.0, 400.0);
+        let back = d.add(Some(deck), "div");
+        d.set_styles(back, PROBE_BASE);
+        d.set_styles(back, &[("position", "absolute"), ("backgroundColor", "rgb(255, 255, 255)")]);
+        d.set_rect(back, 0.0, 100.0, 400.0, 300.0);
+        let victim = d.add(Some(back), "span");
+        d.add_text(victim, "Needs attention");
+        d.set_attr(victim, "class", "status");
+        d.set_styles(victim, PROBE_BASE);
+        d.set_rect(victim, 200.0, 200.0, 120.0, 20.0);
+        let front = d.add(Some(deck), "div");
+        d.set_attr(front, "class", "front-card");
+        d.set_styles(front, PROBE_BASE);
+        d.set_styles(front, &[("position", "absolute"), ("transform", "rotate(4deg)"), ("backgroundColor", "rgb(255, 255, 255)")]);
+        d.set_rect(front, 150.0, 150.0, 400.0, 300.0);
+        let row = d.add(Some(front), "span");
+        d.add_text(row, "Trial Balance");
+        d.set_attr(row, "class", "row-label");
+        d.set_styles(row, PROBE_BASE);
+        d.set_styles(row, &[("position", "relative")]);
+        d.set_rect(row, 190.0, 195.0, 160.0, 30.0);
+        d.set_text_rect(row, 190.0, 195.0, 160.0, 30.0);
+        mark_body_descendants(&mut d);
+        let f = check_text_occlusion_dom(&d);
+        let hit = f.iter().find(|f| f.el == Some(victim)).expect("victim reported");
+        assert_eq!(
+            hit.finding.detail,
+            format!(
+                "{} \"Needs attention\" is 100% covered by overlapping text ({}) on an opaque layer ({})",
+                class_selector(&d, victim),
+                class_selector(&d, row),
+                class_selector(&d, front)
+            )
+        );
+    }
+
     fn outlined(d: &mut FakeDom, el: ElId, radius: &str) {
         let mut styles = vec![
             ("borderRadius", radius),
@@ -6143,5 +6780,112 @@ mod tests {
         let f = check_cream_palette(&d);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].snippet, "cream/beige page background (Tailwind bg-amber-50)");
+    }
+
+    /// hse.de (287847, 287911): the mobile menu at opacity 0, `position:
+    /// absolute` inside a panel translated a viewport width to the left with
+    /// `transition: transform 0.3s`.
+    #[test]
+    fn hidden_text_measure_leaves_out_a_drawer_slid_off_the_page() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        d.inner_width = 1280.0;
+        hidden_box(&mut d, body, "p", &[], "visible text");
+        let panel = hidden_box(
+            &mut d,
+            body,
+            "div",
+            &[
+                ("position", "absolute"),
+                ("transform", "matrix(1, 0, 0, 1, -1280, 0)"),
+                ("transitionProperty", "transform"),
+                ("transitionDuration", "0.3s"),
+            ],
+            "",
+        );
+        d.set_rect(panel, -1280.0, 0.0, 1280.0, 800.0);
+        let menu = hidden_box(&mut d, panel, "div", &[("opacity", "0"), ("position", "absolute")], "Mode Schmuck");
+        d.set_rect(menu, -1280.0, 0.0, 1280.0, 0.0);
+        mark_body_descendants(&mut d);
+        let m = measure_hidden_text_dom(&d);
+        assert_eq!((m.total_chars, m.hidden_chars), (12.0, 0.0));
+
+        // Each of these leaves the panel content that never showed.
+        for (prop, value) in [
+            ("transitionDuration", "0s"),
+            ("transform", "none"),
+            ("transform", "matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)"),
+            ("position", "static"),
+        ] {
+            d.set_style(panel, prop, value);
+            let m = measure_hidden_text_dom(&d);
+            assert_eq!(m.hidden_chars, 12.0, "{prop}: {value}");
+            d.set_styles(
+                panel,
+                &[
+                    ("position", "absolute"),
+                    ("transform", "matrix(1, 0, 0, 1, -1280, 0)"),
+                    ("transitionDuration", "0.3s"),
+                ],
+            );
+        }
+        // On the page, translated by a little: content.
+        d.set_rect(panel, -40.0, 0.0, 1280.0, 800.0);
+        assert_eq!(measure_hidden_text_dom(&d).hidden_chars, 12.0);
+    }
+
+    /// A box at 0 that a timed animation running on it shows counts as
+    /// shown: a loop through a visible phase, or a fade-in that holds its
+    /// end. A recording without the fill mode sees only the loops.
+    #[test]
+    fn hidden_text_measure_counts_a_running_fade_in_as_shown() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        d.keyframes.insert(
+            "sent".to_string(),
+            vec![
+                crate::browser::dom::KeyframeFrame { decls: vec![("opacity".into(), "0".into())] },
+                crate::browser::dom::KeyframeFrame { decls: vec![("opacity".into(), "1".into())] },
+            ],
+        );
+        d.keyframe_keys.insert("sent".to_string(), vec!["0%, 25%".to_string(), "27%, 100%".to_string()]);
+        hidden_box(&mut d, body, "p", &[], "visible text");
+        let bubble = hidden_box(
+            &mut d,
+            body,
+            "div",
+            &[
+                ("opacity", "0"),
+                ("animationName", "sent"),
+                ("animationIterationCount", "1"),
+                ("animationFillMode", "forwards"),
+                ("animationDirection", "normal"),
+                ("animationDuration", "10s"),
+                ("animationDelay", "0s"),
+                ("animationPlayState", "running"),
+                ("animationComposition", "replace"),
+            ],
+            "ok, moving to 10am",
+        );
+        d.set_running_animations(bubble, &["opacity", "transform"]);
+        mark_body_descendants(&mut d);
+        assert_eq!(measure_hidden_text_dom(&d).hidden_chars, 0.0);
+
+        // Fill mode none hands the box back to its own opacity 0.
+        d.set_style(bubble, "animationFillMode", "none");
+        assert_eq!(measure_hidden_text_dom(&d).hidden_chars, 18.0);
+        // An older recording: no fill mode read, base behaviour...
+        d.set_style(bubble, "animationFillMode", "");
+        assert_eq!(measure_hidden_text_dom(&d).hidden_chars, 18.0);
+        // ...except for a loop, which shows every cycle.
+        d.set_style(bubble, "animationIterationCount", "infinite");
+        assert_eq!(measure_hidden_text_dom(&d).hidden_chars, 0.0);
+        // Not seen running: hidden.
+        d.el_mut(bubble).running_animations = Some(Vec::new());
+        assert_eq!(measure_hidden_text_dom(&d).hidden_chars, 18.0);
+        // A fade that ends at 0 is not shown either.
+        d.set_running_animations(bubble, &["opacity"]);
+        d.set_styles(bubble, &[("animationIterationCount", "1"), ("animationFillMode", "forwards"), ("animationDirection", "reverse")]);
+        assert_eq!(measure_hidden_text_dom(&d).hidden_chars, 18.0);
     }
 }

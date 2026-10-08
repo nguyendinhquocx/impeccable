@@ -29,6 +29,7 @@ extern "C" {
     fn elements_from_point(x: f64, y: f64) -> Vec<u32>;
     fn css_escape(s: &str) -> String;
     fn keyframes(name: &str) -> Option<String>;
+    fn keyframe_keys(name: &str) -> Option<String>;
     fn document_html_for_patterns() -> String;
     fn linked_stylesheet_text() -> String;
     fn tag_name(el: u32) -> String;
@@ -62,6 +63,9 @@ extern "C" {
     fn offset_width(el: u32) -> f64;
     fn offset_height(el: u32) -> f64;
     fn check_visibility(el: u32) -> i32;
+    fn image_natural_size(el: u32) -> Vec<f64>;
+    fn image_complete(el: u32) -> i32;
+    fn image_current_src(el: u32) -> Option<String>;
     fn direct_text_rect(el: u32) -> Vec<f64>;
     fn running_animation_properties(el: u32) -> Option<String>;
     fn text_rects(el: u32) -> Vec<f64>;
@@ -184,6 +188,9 @@ impl Dom for JsDom {
                 .map(|decls| KeyframeFrame { decls })
                 .collect(),
         )
+    }
+    fn keyframe_keys(&self, name: &str) -> Option<Vec<String>> {
+        serde_json::from_str(&keyframe_keys(name)?).ok()
     }
     fn linked_stylesheet_text(&self) -> String {
         linked_stylesheet_text()
@@ -378,6 +385,22 @@ impl Dom for JsDom {
             1 => Some(true),
             _ => None,
         }
+    }
+    fn image_natural_size(&self, el: ElId) -> Option<(f64, f64)> {
+        match image_natural_size(el)[..] {
+            [w, h] => Some((w, h)),
+            _ => None,
+        }
+    }
+    fn image_complete(&self, el: ElId) -> Option<bool> {
+        match image_complete(el) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+    fn image_current_src(&self, el: ElId) -> Option<String> {
+        image_current_src(el)
     }
     fn direct_text_rect(&self, el: ElId) -> Option<Rect> {
         let v = direct_text_rect(el);

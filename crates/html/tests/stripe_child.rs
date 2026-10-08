@@ -1,7 +1,7 @@
 use impeccable_html::{detect_html_source, DetectHtmlOptions};
 use std::path::Path;
 
-fn side_tab_snippets(html: &str) -> Vec<String> {
+fn raw_side_tab_snippets(html: &str) -> Vec<String> {
     detect_html_source(
         html,
         Path::new("/app/stripe.html"),
@@ -11,6 +11,38 @@ fn side_tab_snippets(html: &str) -> Vec<String> {
     .filter(|f| f.antipattern == "side-tab")
     .map(|f| f.snippet)
     .collect()
+}
+
+/// The geometry cases below read a stripe on a rounded card: a stripe child
+/// reports only on a host rounded away from it (r6-t2), so every box gets a
+/// radius unless a case says otherwise.
+fn side_tab_snippets(html: &str) -> Vec<String> {
+    raw_side_tab_snippets(&html.replacen("<body>", "<body><style>body * { border-radius: 12px; }</style>", 1))
+}
+
+#[test]
+fn a_square_host_or_a_heading_host_is_not_a_card() {
+    let card = r#"<!DOCTYPE html><html><head><style>
+.card { display: flex; flex-direction: row; width: 320px; height: 100px; RADIUS }
+.stripe { width: 4px; background: #f59e0b; }
+.body { flex: 1; }
+</style></head><body>
+<div class="card"><div class="stripe"></div><div class="body">Content</div></div>
+</body></html>"#;
+    assert_eq!(raw_side_tab_snippets(&card.replace("RADIUS", "border-radius: 12px;")).len(), 1);
+    assert!(raw_side_tab_snippets(&card.replace("RADIUS", "")).is_empty());
+    // Rounded only along the stripe: the far side is square.
+    assert!(raw_side_tab_snippets(&card.replace("RADIUS", "border-radius: 12px 0 0 12px;")).is_empty());
+
+    // lance.com.br: a green bar inside an `h2`, beside its text.
+    let heading = r#"<!DOCTYPE html><html><head><style>
+h2 { display: inline-flex; width: 320px; height: 28px; border-radius: 12px; }
+.bar { width: 4px; margin-right: 8px; background: #16a34a; }
+</style></head><body>
+<h2><span class="bar"></span><span>Olho no lance</span></h2>
+</body></html>"#;
+    assert!(raw_side_tab_snippets(heading).is_empty());
+    assert_eq!(raw_side_tab_snippets(&heading.replace("<h2>", "<div>").replace("</h2>", "</div>").replace("h2 {", "div {")).len(), 1);
 }
 
 #[test]

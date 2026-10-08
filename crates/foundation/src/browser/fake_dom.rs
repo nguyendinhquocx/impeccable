@@ -53,6 +53,12 @@ pub struct FakeEl {
     pub running_animations: Option<Vec<String>>,
     /// [`Dom::shown_when_scrolled_to`].
     pub shown_on_scroll: Option<bool>,
+    /// [`Dom::image_natural_size`].
+    pub image_natural_size: Option<(f64, f64)>,
+    /// [`Dom::image_complete`].
+    pub image_complete: Option<bool>,
+    /// [`Dom::image_current_src`].
+    pub image_current_src: Option<String>,
     /// The shadow host of a shadow tree's top-level node.
     pub shadow_host: Option<ElId>,
     /// `assignedSlot`.
@@ -77,6 +83,8 @@ pub struct FakeDom {
     /// `(x, y)` → element stack, topmost first.
     pub points: Vec<((f64, f64), Vec<ElId>)>,
     pub keyframes: HashMap<String, Vec<KeyframeFrame>>,
+    /// The selector of each frame in `keyframes`, where a test records them.
+    pub keyframe_keys: HashMap<String, Vec<String>>,
     pub html_for_patterns: String,
 }
 
@@ -419,6 +427,9 @@ impl Dom for FakeDom {
     fn keyframes(&self, name: &str) -> Option<Vec<KeyframeFrame>> {
         self.keyframes.get(name).cloned()
     }
+    fn keyframe_keys(&self, name: &str) -> Option<Vec<String>> {
+        self.keyframe_keys.get(name).cloned()
+    }
     fn document_html_for_patterns(&self) -> String {
         self.html_for_patterns.clone()
     }
@@ -623,6 +634,15 @@ impl Dom for FakeDom {
     }
     fn check_visibility(&self, el: ElId) -> Option<bool> {
         self.els[el as usize].check_visibility
+    }
+    fn image_natural_size(&self, el: ElId) -> Option<(f64, f64)> {
+        self.els[el as usize].image_natural_size
+    }
+    fn image_complete(&self, el: ElId) -> Option<bool> {
+        self.els[el as usize].image_complete
+    }
+    fn image_current_src(&self, el: ElId) -> Option<String> {
+        self.els[el as usize].image_current_src.clone()
     }
     fn direct_text_rect(&self, el: ElId) -> Option<Rect> {
         self.els[el as usize].direct_text_rect

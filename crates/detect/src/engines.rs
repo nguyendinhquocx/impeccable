@@ -31,10 +31,10 @@ pub struct ScanOptions {
     /// (`--no-consent-hiding`). By default the browser engine hides them
     /// before the rule pass.
     pub keep_consent_banners: bool,
-    /// URL scans only: leave product tours and preloaders on the page
-    /// (`--no-overlay-hiding`). By default the browser engine waits briefly
-    /// for a preloader and hides what is left, and hides known tours, before
-    /// the rule pass.
+    /// URL scans only: leave product tours, site-builder badges and
+    /// preloaders on the page (`--no-overlay-hiding`). By default the browser
+    /// engine waits briefly for a preloader and hides what is left, and hides
+    /// known tours and badges, before the rule pass.
     pub keep_overlays: bool,
 }
 

@@ -367,7 +367,7 @@ pub fn detect_html_source(
             || {
                 check_html_patterns(html, Some(&corpora))
                     .into_iter()
-                    .filter(|item| item.id != "bounce-easing" && item.id != "layout-transition")
+                    .filter(|item| item.id != "bounce-easing")
                     .collect()
             },
         );

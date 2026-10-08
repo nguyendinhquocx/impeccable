@@ -226,7 +226,7 @@ fn run_28_widget_vendors_are_named() {
     assert_eq!(tagged("low-contrast", "#flag-slick-dot").as_deref(), Some("Slick"), "{f:#?}");
     assert!(on(&f, "clipped-overflow-container", "#pass-superslide-wrap").is_empty(), "{f:#?}");
     assert_eq!(tagged("low-contrast", "#flag-marquee-quote").as_deref(), Some("react-fast-marquee"), "{f:#?}");
-    assert_eq!(tagged("layout-transition", "#flag-kaltura-area").as_deref(), Some("Kaltura"), "{f:#?}");
+    assert_eq!(tagged("bounce-easing", "#flag-kaltura-area").as_deref(), Some("Kaltura"), "{f:#?}");
     let own = on(&f, "low-contrast", "#flag-own-button");
     assert_eq!(own.len(), 1, "{f:#?}");
     assert_eq!(third_party(own[0]), None);

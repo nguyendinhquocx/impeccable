@@ -909,12 +909,19 @@ fn overflow_visible(dom: &dyn Dom, node: ElId) -> bool {
 /// `display: contents`) and so says nothing about where its children lie.
 /// A slide parked beside the viewport, or a card elsewhere on the page, is
 /// skipped without spending the budget.
+///
+/// An inline box with element children says nothing either: its rect is the
+/// line its contents sit on, and a replaced child (the `<img>` in a
+/// `<picture>`) is laid out at its own size. telekom.de's teaser photo is a
+/// 366 x 480 image in a `<picture>` whose rect is a 21px line at the bottom
+/// of the card.
 fn may_reach_text(dom: &dyn Dom, child: ElId, text: &Rect) -> bool {
     let rect = dom.rect(child);
     rect_covers(&rect, text)
         || rect.width <= 0.0
         || rect.height <= 0.0
         || dom.style(child, "display") == "contents"
+        || (dom.style(child, "display") == "inline" && dom.first_element_child(child).is_some())
 }
 
 /// The paint a sibling box, or something inside it, puts under the text,
@@ -2475,6 +2482,29 @@ pub fn raster_no_context_sample() -> Value {
 
 // ─── the background stack walk (sampleVisualBackgroundAtPoint) ─────────────
 
+/// Whether a box above `el` that clips its overflow (`overflow` other than
+/// `visible`, on either axis) leaves the point `(x, y)` outside its rect.
+fn point_clipped_by_ancestor(dom: &dyn Dom, el: ElId, x: f64, y: f64) -> bool {
+    let mut cur = dom.parent(el);
+    while let Some(p) = cur {
+        let clips = ["overflow", "overflowX", "overflowY"].iter().any(|k| {
+            let v = dom.style(p, k);
+            v.split_whitespace().any(|t| matches!(t, "hidden" | "clip" | "auto" | "scroll"))
+        });
+        if clips && dom.style(p, "display") != "contents" {
+            let r = dom.rect(p);
+            if r.width > 0.0
+                && r.height > 0.0
+                && (x < r.left - 1.0 || x > r.right + 1.0 || y < r.top - 1.0 || y > r.bottom + 1.0)
+            {
+                return true;
+            }
+        }
+        cur = dom.parent(p);
+    }
+    false
+}
+
 /// JS: index.mjs#sampleVisualBackgroundAtPoint — the depth cap and the node
 /// list (`elementsFromPoint` stack from the element down, overlay chrome
 /// skipped). `Err` carries the early-unresolved sample.
@@ -2484,6 +2514,18 @@ pub fn stack_nodes(dom: &dyn Dom, el: ElId, x: f64, y: f64, depth: f64) -> Resul
     }
     let stack = dom.elements_from_point(x, y);
     let self_index = stack.iter().position(|&n| n == el || dom.contains(el, n));
+    // Text the hit test does not find at the point, where a box between it
+    // and the page clips the point away, is not on screen there: what the
+    // stack holds is whatever lies under the clipped-off part (telekom.de's
+    // consent notice scrolls its list inside a 414px box, and the page's 50%
+    // backdrop answers below it). Text that ignores pointer events is never
+    // in the stack and keeps the walk from the element down.
+    if self_index.is_none()
+        && dom.style(el, "pointerEvents") != "none"
+        && point_clipped_by_ancestor(dom, el, x, y)
+    {
+        return Err(json!({ "status": "unresolved", "reason": "text clipped at point" }));
+    }
     let nodes: Vec<ElId> = match self_index {
         Some(i) => stack[i..].to_vec(),
         None => {
@@ -4561,6 +4603,75 @@ mod tests {
         d.set_style(bare, "background", "rgba(0, 0, 0, 0) url(\"x.svg\") no-repeat scroll 50% 50% / contain padding-box border-box");
         let no_size = css_url_source_point(&d, bare, count, 0.0, 0.0, "contain", "50% 50%", 216.0, 114.0);
         assert!(no_size.map_or_else(|s| !sample_ends_walk(&s), |_| true));
+    }
+
+    /// observations-42 row 12, telekom.de: the teaser's photo is an `<img>`
+    /// in an inline `<picture>` whose own rect is the 21px line at the foot
+    /// of the card. The climb looks inside it and finds the photo under the
+    /// overline, where it used to pass it by and reach the white page.
+    #[test]
+    fn the_climb_looks_inside_an_inline_picture() {
+        let build = |picture_display: &str| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            d.set_style(body, "backgroundColor", "rgb(255, 255, 255)");
+            let frame = d.add(Some(body), "div");
+            d.set_styles(frame, &[("position", "relative"), ("display", "flex")]);
+            d.set_rect(frame, 2.0, 100.0, 386.0, 500.0);
+            let layer = d.add(Some(frame), "div");
+            d.set_styles(layer, &[("position", "absolute"), ("display", "block")]);
+            d.set_rect(layer, 12.0, 110.0, 366.0, 480.0);
+            let picture = d.add(Some(layer), "picture");
+            d.set_style(picture, "display", picture_display);
+            d.set_rect(picture, 12.0, 574.0, 366.0, 21.0);
+            let img = d.add(Some(picture), "img");
+            d.set_styles(img, &[("display", "inline"), ("objectFit", "cover")]);
+            d.set_rect(img, 12.0, 110.0, 366.0, 480.0);
+            let content = d.add(Some(frame), "div");
+            d.set_styles(content, &[("position", "relative"), ("display", "flex")]);
+            d.set_rect(content, 12.0, 100.0, 366.0, 500.0);
+            let overline = d.add(Some(content), "span");
+            d.add_text(overline, "Young Unlimited");
+            d.set_styles(overline, &[("display", "block"), ("color", "rgb(132, 245, 128)"), ("fontSize", "16px")]);
+            d.set_rect(overline, 71.0, 380.0, 200.0, 20.0);
+            d.set_text_rect(overline, 71.0, 380.0, 120.0, 20.0);
+            (d, overline, img)
+        };
+        let (d, overline, img) = build("inline");
+        assert_eq!(layer_under_text_found(&d, overline), (LayerUnder::Picture, Some(img)));
+        // A block wrapper whose box misses the text is still passed by: the
+        // climb reaches the page, and only the hit test is left to answer.
+        let (d, overline, img) = build("block");
+        assert_ne!(layer_under_text_found(&d, overline).1, Some(img));
+    }
+
+    /// observations-42 row 12, telekom.de: a consent notice scrolls its list
+    /// inside a box, and the text below the box's edge is not on screen. The
+    /// hit test there answers with the page's backdrop, which is not what
+    /// the text sits on.
+    #[test]
+    fn text_clipped_away_at_a_point_is_unresolved_there() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let scroller = d.add(Some(body), "div");
+        d.set_styles(scroller, &[("overflow", "hidden auto"), ("display", "block")]);
+        d.set_rect(scroller, 250.0, 160.0, 780.0, 414.0);
+        let item = d.add(Some(scroller), "strong");
+        d.add_text(item, "broadband connection");
+        d.set_rect(item, 312.0, 788.0, 167.0, 21.0);
+        let backdrop = d.add(Some(body), "div");
+        d.set_styles(backdrop, &[("position", "fixed"), ("backgroundColor", "rgba(0, 0, 0, 0.5)")]);
+        d.set_rect(backdrop, 0.0, 0.0, 1280.0, 800.0);
+        d.set_point(395.0, 798.0, vec![backdrop, body]);
+        let err = stack_nodes(&d, item, 395.0, 798.0, 0.0).unwrap_err();
+        assert_eq!(err["reason"], "text clipped at point");
+        // Text that ignores pointer events is never in the stack and keeps
+        // the walk from the element down, as does text no box clips there.
+        d.set_style(item, "pointerEvents", "none");
+        assert_eq!(stack_nodes(&d, item, 395.0, 798.0, 0.0).unwrap()[0].el, item);
+        d.set_style(item, "pointerEvents", "auto");
+        d.set_style(scroller, "overflow", "visible");
+        assert_eq!(stack_nodes(&d, item, 395.0, 798.0, 0.0).unwrap()[0].el, item);
     }
 
     #[test]

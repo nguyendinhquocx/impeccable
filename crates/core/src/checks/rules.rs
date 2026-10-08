@@ -6,7 +6,7 @@
 use crate::checks::text_rules::NON_RENDERED_TAGS;
 use crate::color::{
     color_to_hex, composite_color_over, contrast_ratio, get_hue, has_chroma, is_gray_ink,
-    is_neutral_color, relative_luminance, Rgba,
+    is_neutral_color, lightness_saturation, relative_luminance, Rgba, GRAY_INK_MAX_LIGHTNESS,
 };
 use crate::constants::{
     BORDER_SAFE_TAGS, GENERIC_FONTS, KNOWN_SERIF_FONTS, SAFE_TAGS, WCAG_LARGE_BOLD_TEXT_PX,
@@ -842,7 +842,20 @@ pub fn check_colors(opts: &ColorOpts) -> Vec<RuleHit> {
     if let Some(class_str) = opts.class_list.as_deref().filter(|s| !s.is_empty()) {
         let gray_match = find_resting_gray_text(class_str);
         let color_bg_match = find_solid_chromatic_bg(class_str);
-        if let (Some(g), Some(c)) = (gray_match, color_bg_match) {
+        // A gray utility names the ink only when it wins the cascade, and a
+        // custom scale may spell white with a gray name (hse.de's
+        // `text-neutral-0`, rgb(255, 255, 255)). The browser computes the
+        // colour the glyphs take, and a near-white ink (the light end
+        // [`is_gray_ink`] leaves out) or a plainly chromatic one says the
+        // class does not paint gray. A cool gray (`slate-400`) keeps the
+        // class reading, and so does a dark ink: a utility the page never
+        // compiled leaves the inherited body colour. A file engine keeps
+        // reading the class.
+        let ink_contradicts_gray = opts.detector_is_browser
+            && opts.text_color.as_ref().is_some_and(|ink| {
+                lightness_saturation(ink).0 >= GRAY_INK_MAX_LIGHTNESS || has_chroma(Some(ink), Some(50.0))
+            });
+        if let (Some(g), Some(c), false) = (gray_match, color_bg_match, ink_contradicts_gray) {
             findings.push(RuleHit::new(
                 "gray-on-color",
                 format!("{} on {}", g.as_str(), c),
@@ -1646,26 +1659,6 @@ pub fn check_kicker_above_heading(candidates: &[KickerCandidate]) -> Vec<RuleHit
 
 // ─── checkMotion ────────────────────────────────────────────────────────────
 
-/// JS `LAYOUT_TRANSITION_PROPS`.
-pub const LAYOUT_TRANSITION_PROPS: &[&str] = &[
-    "width",
-    "height",
-    "padding",
-    "margin",
-    "max-height",
-    "max-width",
-    "min-height",
-    "min-width",
-    "padding-top",
-    "padding-right",
-    "padding-bottom",
-    "padding-left",
-    "margin-top",
-    "margin-right",
-    "margin-bottom",
-    "margin-left",
-];
-
 re!(
     BOUNCE_NAME,
     format!(
@@ -1717,21 +1710,6 @@ pub fn check_motion(opts: &MotionOpts) -> Vec<RuleHit> {
                     ));
                     break;
                 }
-            }
-        }
-    }
-    if let Some(tp) = opts.transition_property.as_deref() {
-        if !tp.is_empty() && tp != "all" && tp != "none" {
-            let layout_found: Vec<String> = tp
-                .split(',')
-                .map(|p| js::to_lower_case(js::trim(p)))
-                .filter(|p| set_has(LAYOUT_TRANSITION_PROPS, p))
-                .collect();
-            if !layout_found.is_empty() {
-                findings.push(RuleHit::new(
-                    "layout-transition",
-                    format!("transition: {}", layout_found.join(", ")),
-                ));
             }
         }
     }
@@ -2301,6 +2279,40 @@ mod tests {
             find_resting_gray_text("text-gray-400 bg-blue-600").map(|m| m.as_str()),
             Some("text-gray-400")
         );
+    }
+
+    /// hse.de: a custom scale's `text-neutral-0` is white, and white on red
+    /// is not gray on colour. The browser reads the computed ink when it is
+    /// light or coloured; a file engine keeps the class.
+    #[test]
+    fn gray_on_color_class_reads_the_computed_ink_in_a_browser() {
+        let opts = |browser: bool, ink: Option<Rgba>| ColorOpts {
+            tag: "span".to_string(),
+            text_color: ink,
+            class_list: Some("text-neutral-0 bg-red-700".to_string()),
+            bg_color: Some(Rgba::new(185.0, 28.0, 28.0, 1.0)),
+            has_direct_text: true,
+            detector_is_browser: browser,
+            font_size: 12.0,
+            font_weight: 700.0,
+            ..Default::default()
+        };
+        let gray_class = |o: ColorOpts| {
+            check_colors(&o)
+                .iter()
+                .any(|h| h.id == "gray-on-color" && h.snippet == "text-neutral-0 on bg-red-700")
+        };
+        let white = Some(Rgba::new(255.0, 255.0, 255.0, 1.0));
+        let gray = Some(Rgba::new(115.0, 115.0, 115.0, 1.0));
+        assert!(!gray_class(opts(true, white)));
+        assert!(!gray_class(opts(true, Some(Rgba::new(220.0, 38.0, 38.0, 1.0)))));
+        assert!(gray_class(opts(true, gray)));
+        // A cool gray keeps the class: slate-400 grazes the saturation bar.
+        assert!(gray_class(opts(true, Some(Rgba::new(148.0, 163.0, 184.0, 1.0)))));
+        // Near-black is what an uncompiled utility inherits: no contradiction.
+        assert!(gray_class(opts(true, Some(Rgba::new(17.0, 24.0, 39.0, 1.0)))));
+        assert!(gray_class(opts(true, None)));
+        assert!(gray_class(opts(false, white)));
     }
 
     /// ai-pact.com and podprime.ai: Tailwind's `bg-primary/10` computes to an

@@ -3,7 +3,7 @@
 
 use impeccable_core::checks::css_scan::{
     has_interpolation, is_unseen_declaration_source, names_same_element, scan_css_text_for_glow,
-    scan_css_text_for_marquee, scan_css_text_for_radial_halo, starts_css_property_token,
+    scan_css_text_for_marquee, scan_css_text_for_radial_halo,
     CssHostIndex,
 };
 use impeccable_core::checks::rules::{
@@ -1631,35 +1631,6 @@ re!(
     format!("cubic-bezier\\({WS}*([0-9.-]+){WS}*,{WS}*([0-9.-]+){WS}*,{WS}*([0-9.-]+){WS}*,{WS}*([0-9.-]+){WS}*\\)")
 );
 re!(
-    TRANSITION_PREFIX_RE,
-    format!("{}{WS}*:{WS}*", ci("transition"))
-);
-re!(
-    TRANSITION_PROPERTY_PREFIX_RE,
-    format!("{}{WS}*:{WS}*", ci("transition-property"))
-);
-re!(ALL_WORD_RE, format!("{B}all{B}"));
-re!(
-    LAYOUT_PROP_RE,
-    format!("{B}(?:(?:max|min)-)?(?:width|height){B}|{B}padding{B}|{B}margin{B}")
-);
-re!(
-    LAYOUT_PROP_FMT_RE,
-    format!(
-        "{B}(?:(?:{max}|{min})-)?(?:{width}|{height}){B}|{B}{padding}(?:-(?:{top}|{right}|{bottom}|{left}))?{B}|{B}{margin}(?:-(?:{top}|{right}|{bottom}|{left}))?{B}",
-        max = ci("max"),
-        min = ci("min"),
-        width = ci("width"),
-        height = ci("height"),
-        padding = ci("padding"),
-        top = ci("top"),
-        right = ci("right"),
-        bottom = ci("bottom"),
-        left = ci("left"),
-        margin = ci("margin")
-    )
-);
-re!(
     BROKEN_IMG_SRC_RE,
     format!(
         "<{img}{B}[^>]*?{B}{src}{WS}*={WS}*(?:\"\"|''|\"{WS}+\"|'{WS}+'|\"#\"|'#')",
@@ -1669,133 +1640,6 @@ re!(
 );
 re!(IMG_OPEN_RE, format!("<{}{B}", ci("img")));
 re!(SRC_ATTR_RE, format!("{B}{}{WS}*=", ci("src")));
-
-fn is_line_terminator(c: char) -> bool {
-    matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
-}
-
-/// Hand-written port of
-/// `/PREFIX(?:(['"])((?:(?!\1)[^\\]|\\.)*)\1|([^;{}]+))/gi` (backreference):
-/// groups are `[whole, quote?, quoted?, bare?]`.
-fn find_transition_matches(prefix: &Regex, line: &str) -> Vec<MatchCtx> {
-    let mut out = Vec::new();
-    let mut pos = 0;
-    while pos <= line.len() {
-        let Some(m) = prefix.find_at(line, pos) else {
-            break;
-        };
-        let value_start = m.end();
-        let rest = &line[value_start..];
-        let mut matched: Option<(usize, Vec<Option<String>>)> = None;
-        if let Some(q) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') {
-            // Scan for the closing unescaped quote.
-            let mut iter = rest.char_indices().skip(1).peekable();
-            let mut end: Option<usize> = None;
-            while let Some((i, c)) = iter.next() {
-                if c == q {
-                    end = Some(i);
-                    break;
-                }
-                if c == '\\' {
-                    match iter.peek() {
-                        Some((_, n)) if !is_line_terminator(*n) => {
-                            iter.next();
-                        }
-                        _ => break,
-                    }
-                }
-            }
-            if let Some(end) = end {
-                let inner = &rest[q.len_utf8()..end];
-                let whole_end = value_start + end + q.len_utf8();
-                matched = Some((
-                    whole_end,
-                    vec![
-                        Some(line[m.start()..whole_end].to_string()),
-                        Some(q.to_string()),
-                        Some(inner.to_string()),
-                        None,
-                    ],
-                ));
-            }
-        }
-        if matched.is_none() {
-            let bare_len: usize = rest
-                .char_indices()
-                .find(|(_, c)| matches!(c, ';' | '{' | '}'))
-                .map(|(i, _)| i)
-                .unwrap_or(rest.len());
-            if bare_len > 0 {
-                let whole_end = value_start + bare_len;
-                matched = Some((
-                    whole_end,
-                    vec![
-                        Some(line[m.start()..whole_end].to_string()),
-                        None,
-                        None,
-                        Some(rest[..bare_len].to_string()),
-                    ],
-                ));
-            }
-        }
-        match matched {
-            Some((end, groups)) => {
-                out.push(MatchCtx {
-                    groups,
-                    index: m.start(),
-                });
-                pos = end;
-            }
-            None => {
-                // The value part failed at this prefix; the engine moves on.
-                pos = m.start() + 1;
-                if pos > line.len() {
-                    break;
-                }
-                // Advance to a char boundary.
-                while pos < line.len() && !line.is_char_boundary(pos) {
-                    pos += 1;
-                }
-            }
-        }
-    }
-    out
-}
-
-fn transition_val(m: &MatchCtx) -> String {
-    let raw = m
-        .groups
-        .get(2)
-        .and_then(|g| g.clone())
-        .or_else(|| m.groups.get(3).and_then(|g| g.clone()))
-        .unwrap_or_default();
-    raw
-}
-
-fn transition_test(m: &MatchCtx, _line: &str) -> bool {
-    let val = js::to_lower_case(&transition_val(m));
-    if ALL_WORD_RE.is_match(&val) {
-        return false;
-    }
-    // `border-width` and `line-height` are not `width` and `height`.
-    LAYOUT_PROP_RE
-        .find_iter(&val)
-        .any(|x| starts_css_property_token(&val, x.start()))
-}
-
-fn transition_fmt(prefix: &str, m: &MatchCtx) -> String {
-    let raw = transition_val(m);
-    let found: Vec<&str> = LAYOUT_PROP_FMT_RE
-        .find_iter(&raw)
-        .filter(|x| starts_css_property_token(&raw, x.start()))
-        .map(|x| x.as_str())
-        .collect();
-    if found.is_empty() {
-        format!("{prefix}: {}", js::trim(&raw))
-    } else {
-        format!("{prefix}: {}", found.join(", "))
-    }
-}
 
 /// Hand-written port of `/<img\b(?:(?!\bsrc\s*=)[^>])*>/gi`.
 fn find_img_without_src(line: &str) -> Vec<MatchCtx> {
@@ -2020,18 +1864,6 @@ pub static REGEX_MATCHERS: Lazy<Vec<Matcher>> = Lazy::new(|| {
                     m.g(4)
                 )
             },
-        },
-        Matcher {
-            id: "layout-transition",
-            find_all: |l| find_transition_matches(&TRANSITION_PREFIX_RE, l),
-            test: transition_test,
-            fmt: |m, _| transition_fmt("transition", m),
-        },
-        Matcher {
-            id: "layout-transition",
-            find_all: |l| find_transition_matches(&TRANSITION_PROPERTY_PREFIX_RE, l),
-            test: transition_test,
-            fmt: |m, _| transition_fmt("transition-property", m),
         },
         Matcher {
             id: "broken-image",
@@ -2890,21 +2722,6 @@ mod tests {
             vec!["border-left: 4px solid #6366f1"]
         );
         assert!(run("side-tab", ".c { border-left: 4px solid #000; }").is_empty());
-        assert_eq!(
-            run("layout-transition", "transition: width 0.3s"),
-            vec!["transition: width"]
-        );
-        assert_eq!(
-            run("layout-transition", "transition: 'height 1s'"),
-            vec!["transition: height"]
-        );
-        assert!(run("layout-transition", "transition: all 1s").is_empty());
-        // `border-width` and `line-height` are not `width` and `height`.
-        assert!(run("layout-transition", "transition: border-width 0.2s").is_empty());
-        assert_eq!(
-            run("layout-transition", "transition: line-height 0.2s, width 0.3s"),
-            vec!["transition: width"]
-        );
         assert_eq!(run("broken-image", "<img alt=x>"), vec!["<img alt=x>"]);
         assert!(run("broken-image", "<img src=\"a.png\">").is_empty());
         assert_eq!(

@@ -438,7 +438,6 @@ pub struct KickerCandidate {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MotionOpts {
     pub tag: String,
-    pub transition_property: Option<String>,
     pub animation_name: Option<String>,
     pub timing_functions: Option<String>,
     pub class_list: Option<String>,

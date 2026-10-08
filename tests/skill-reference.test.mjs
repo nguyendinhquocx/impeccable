@@ -111,6 +111,22 @@ describe('skill reference authoring contracts', () => {
     assert.match(edgeCases, /clear the dragging state and release capture/);
     assert.match(verifyHardening, /\*\*Interrupted gestures\*\*/);
   });
+
+  it('keeps audit score-table dimensions aligned with their numbered sections', () => {
+    for (const filename of ['audit.md', 'audit.native.md']) {
+      const audit = readFileSync(join(ROOT, `skill/reference/${filename}`), 'utf-8').replace(/\r\n?/g, '\n');
+      const sections = [...audit.matchAll(/^### ([1-5])\. (.+?)(?: \([^\n]+\))?$/gm)].map((match) => [
+        match[1],
+        match[2],
+      ]);
+      const scores = [...audit.matchAll(/^\| ([1-5]) \| ([^|]+?) \|/gm)].map((match) => [
+        match[1],
+        match[2].trim(),
+      ]);
+
+      assert.deepEqual(scores, sections, filename);
+    }
+  });
 });
 
 describe('mode rule files', () => {

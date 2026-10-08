@@ -222,12 +222,6 @@
     "description": "Text does not meet WCAG AA contrast requirements (4.5:1 for body, 3:1 for large text). Increase the contrast between text and background."
   },
   {
-    "id": "layout-transition",
-    "name": "Layout property animation",
-    "category": "quality",
-    "description": "Animating width, height, padding, or margin causes layout thrash and janky performance. Use transform and opacity instead, or grid-template-rows for height animations."
-  },
-  {
     "id": "line-length",
     "name": "Line length too long",
     "category": "quality",

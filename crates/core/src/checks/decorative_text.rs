@@ -32,7 +32,8 @@
 //!   utility classes says so by its structure or not at all (taste call
 //!   r5-p26, [`crate::checks::text_context::in_framed_demo`]): a window with
 //!   three title-bar dots, a framed box under a preview caption, a device
-//!   frame that is scaled or tilted in 3D. Sentence-length copy inside is
+//!   frame that is scaled or tilted in 3D, a frame box with a sample
+//!   caption on it or beside it (r8-t1). Sentence-length copy inside is
 //!   still copy. `undersized-ui-text` and `tiny-text` report text in a
 //!   mockup as advisory too.
 //!
@@ -100,8 +101,10 @@ pub struct DecorativeTextFacts {
     pub picture_ancestor: bool,
     /// An ancestor is a framed HTML demo by its structure: a window with
     /// three title-bar dots, a framed box under a preview caption, a device
-    /// frame that is scaled or tilted in 3D
-    /// ([`crate::checks::text_context::in_framed_demo`], taste call r5-p26).
+    /// frame that is scaled or tilted in 3D, or a frame box with a sample
+    /// caption on it or beside it
+    /// ([`crate::checks::text_context::in_framed_demo`], taste calls r5-p26
+    /// and r8-t1).
     pub framed_demo: bool,
 }
 

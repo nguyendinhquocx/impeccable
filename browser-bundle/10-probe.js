@@ -92,6 +92,11 @@ function __collectTextRects(node, deep, out) {
 }
 
 // The element's own direct text, unmerged: what the union rect is built from.
+// An HTML <img>, by name rather than `instanceof`, which is false for a
+// node adopted from another realm.
+function __isImg(node) {
+  return !!node && node.localName === 'img' && node.namespaceURI === 'http://www.w3.org/1999/xhtml';
+}
 function __directTextRects(el) {
   return __collectTextRects(__el(el), false, []);
 }
@@ -147,6 +152,30 @@ const __impeccableDom = {
           frames.push(decls);
         }
         return JSON.stringify(frames);
+      }
+    }
+    return undefined;
+  },
+  // JSON `["0%, 35%", "to", ...]`: the selector of each frame keyframes(name)
+  // returns, in the same order (the same walk, the same frames skipped);
+  // undefined when no rule has that name.
+  keyframe_keys(name) {
+    if (!name) return undefined;
+    for (const sheet of document.styleSheets) {
+      let rules;
+      try { rules = sheet.cssRules || sheet.rules; } catch { continue; }
+      if (!rules) continue;
+      const stack = [...rules];
+      while (stack.length) {
+        const rule = stack.shift();
+        if (rule.cssRules && rule.type !== 7) { stack.push(...rule.cssRules); continue; }
+        if (rule.type !== 7 || rule.name !== name) continue;
+        const keys = [];
+        for (const frame of rule.cssRules || []) {
+          if (!frame.style) continue;
+          keys.push(String(frame.keyText || ''));
+        }
+        return JSON.stringify(keys);
       }
     }
     return undefined;
@@ -246,6 +275,23 @@ const __impeccableDom = {
     const node = __el(el);
     if (typeof node.checkVisibility !== 'function') return -1;
     return node.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true }) ? 1 : 0;
+  },
+  // Image load state, for an HTMLImageElement only: [] / -1 / undefined
+  // are "not an image", which the Rust side reads as None.
+  image_natural_size(el) {
+    const node = __el(el);
+    if (!__isImg(node)) return [];
+    return [node.naturalWidth || 0, node.naturalHeight || 0];
+  },
+  image_complete(el) {
+    const node = __el(el);
+    if (!__isImg(node) || typeof node.complete !== 'boolean') return -1;
+    return node.complete ? 1 : 0;
+  },
+  image_current_src(el) {
+    const node = __el(el);
+    if (!__isImg(node)) return undefined;
+    return typeof node.currentSrc === 'string' ? node.currentSrc : '';
   },
   // getDirectTextRect(el) from the JS driver: union of the client rects of
   // the element's non-blank direct text nodes.

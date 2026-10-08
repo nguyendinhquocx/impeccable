@@ -38,6 +38,20 @@
 //! `#BorlabsDialogBackdrop` (it stopped the reveal sweep from scrolling), and
 //! `aria-hidden="true"` on the page wrapper (`#td-outer-wrap`) and its
 //! siblings, each marked `data-borlabs-cookie-aria-hidden`.
+//!
+//! Runs 42 and 43 added two more. Tealium's consent prompt on telekom.de:
+//! `div#__tealiumGDPRecModal`, a fixed full-screen layer (`z-index`
+//! 2147483645) holding a 50% black `div.cl-outer` and the
+//! `dialog#promptLayerContent` that also carries the Utiq notice
+//! (`#utiqMessage`); Tealium's own script names that id and its preference
+//! center's, `#__tealiumGDPRcpPrefs`. On the home page it arrived after the
+//! capture and before the screenshot, so it covered nearly every crop. And
+//! Transcend on verizon.com: `div#transcend-consent-manager`, a zero-size
+//! fixed host on `<html>` whose open shadow root renders the banner
+//! (`div#consentManagerMainDialog`, a fixed 90px bar at the foot of the first
+//! screen). A site's own banner with generic classes (moe.gov.sa's
+//! `div.cookie-consent`, an Alpine.js dialog) stays: nothing in its markup
+//! tells it apart from any other dialog the site wrote.
 
 use serde_json::{json, Value};
 
@@ -212,6 +226,25 @@ pub const CONSENT_MANAGERS: &[ConsentManager] = &[
         // `#cmpwrapper`, out of reach of a document selector, so the host is
         // what is hidden; `#cmpbox` covers builds that render it in the page.
         roots: &["#cmpwrapper", "#cmpbox"],
+        backdrops: &[],
+        html_lock_classes: &[],
+        body_lock_classes: &[],
+        aria_hidden_marks: &[],
+    },
+    ConsentManager {
+        name: "Tealium",
+        // The consent prompt and the preference center, as Tealium's
+        // `utag.gdpr` script names them.
+        roots: &["#__tealiumGDPRecModal", "#__tealiumGDPRcpPrefs"],
+        backdrops: &[],
+        html_lock_classes: &[],
+        body_lock_classes: &[],
+        aria_hidden_marks: &[],
+    },
+    ConsentManager {
+        name: "Transcend",
+        // The banner renders in the open shadow root of this zero-size host.
+        roots: &["#transcend-consent-manager"],
         backdrops: &[],
         html_lock_classes: &[],
         body_lock_classes: &[],
@@ -695,7 +728,7 @@ mod tests {
         for name in [
             "OneTrust", "Cookiebot", "Usercentrics", "TrustArc", "Didomi", "Quantcast Choice", "Sourcepoint",
             "Osano", "CookieYes", "Complianz", "iubenda", "Termly", "Axeptio", "Borlabs Cookie", "Klaro",
-            "Cookie Notice", "Shopify", "consentmanager",
+            "Cookie Notice", "Shopify", "consentmanager", "Tealium", "Transcend",
         ] {
             assert!(CONSENT_MANAGERS.iter().any(|m| m.name == name), "{name}");
         }

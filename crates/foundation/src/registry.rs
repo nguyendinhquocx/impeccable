@@ -401,16 +401,6 @@ pub static ANTIPATTERNS: &[Antipattern] = &[
         skill_guideline: None,
     },
     Antipattern {
-        id: "layout-transition",
-        category: "quality",
-        scopes: None,
-        severity: Some("advisory"),
-        name: "Layout property animation",
-        description: "Animating width, height, padding, or margin causes layout thrash and janky performance. Use transform and opacity instead, or grid-template-rows for height animations.",
-        skill_section: Some("Motion"),
-        skill_guideline: Some("Animate layout properties"),
-    },
-    Antipattern {
         id: "line-length",
         category: "quality",
         scopes: Some(&["type", "layout"]),
@@ -829,7 +819,7 @@ mod tests {
 
     #[test]
     fn registry_shape() {
-        assert_eq!(ANTIPATTERNS.len(), 60);
+        assert_eq!(ANTIPATTERNS.len(), 59);
         assert_eq!(ANTIPATTERNS[0].id, "side-tab");
         assert_eq!(rule_scopes(), vec!["type", "layout"]);
         assert!(is_advisory_rule("em-dash-overuse"));
@@ -840,9 +830,8 @@ mod tests {
             get_antipattern("blinking-cursor").unwrap().severity,
             Some("advisory")
         );
-        // The corpus review moved these two out of the failure count: the
+        // The corpus review moved this one out of the failure count: the
         // measurement is right, the finding is almost never harmful.
-        assert!(is_advisory_rule("layout-transition"));
         assert!(is_advisory_rule("bounce-easing"));
         // A live recapture judged the fixed rule's new findings 0.08 pattern
         // precision and 0.04 harm: the clip is almost always intended. An
@@ -853,6 +842,11 @@ mod tests {
         // resolves to `None` rather than panicking, so a config or an inline
         // ignore naming it still parses.
         assert!(get_antipattern("image-hover-transform").is_none());
+        // `layout-transition` went advisory in that review and was retired
+        // on 2026-10-07 (decision r8-t5-layout-transition-retire): two
+        // judged cohorts later, not one of its findings had been harmful.
+        assert!(get_antipattern("layout-transition").is_none());
+        assert!(!is_advisory_rule("layout-transition"));
         assert_eq!(
             get_rule_engine_support("browser"),
             &["element", "page", "layout"]

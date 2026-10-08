@@ -306,8 +306,9 @@ fn missing_comps_message(round: CompRound, missing: &[String], rerun: &str, outc
 const ROLL_WINDOW_MS: f64 = 60.0 * 60.0 * 1000.0;
 
 /// `.impeccable/questions/roll.json`: concept-seed's latest roll in this
-/// project, `{"scope", "key", "reroll", "at"}` (`at` in epoch ms). Every
-/// roll replaces it; a decision page (a payload carrying `buildPath`) that
+/// project, `{"scope", "key", "reroll", "at"}` (`at` in epoch ms) plus
+/// `"worlds"`, the catalog worlds it printed as challengers, when it printed
+/// any. Every roll replaces it; a decision page (a payload carrying `buildPath`) that
 /// `--start` serves or `--update` delivers removes it, so a roll binds to
 /// the one page that presents it.
 fn roll_file(qdir: &str) -> String {
@@ -316,9 +317,12 @@ fn roll_file(qdir: &str) -> String {
 
 /// Records a concept-seed roll for the next decision page. Best effort: a
 /// roll never fails because its record could not be written.
-pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize) {
+pub fn record_roll(cwd: &str, scope: &str, key: &str, reroll: usize, worlds: &[Value]) {
     let qdir = jsp::join(&[cwd, ".impeccable", "questions"]);
-    let record = json!({ "scope": scope, "key": key, "reroll": reroll, "at": now_ms() as u64 });
+    let mut record = json!({ "scope": scope, "key": key, "reroll": reroll, "at": now_ms() as u64 });
+    if !worlds.is_empty() {
+        record["worlds"] = Value::Array(worlds.to_vec());
+    }
     let _ = std::fs::create_dir_all(&qdir).and_then(|_| write_atomic(&roll_file(&qdir), &json_compact(&record)));
 }
 
@@ -339,6 +343,133 @@ fn surface_roll_pending(roll: Option<&str>) -> bool {
     fresh && record.get("scope").and_then(Value::as_str) == Some("surface")
 }
 
+/// One dealt catalog world as the NEXT line names it. The record is a local
+/// file an API response fed, and the id becomes a file name, so an entry is
+/// kept only when its id is a plain slug (`[A-Za-z0-9._-]`, no leading dot)
+/// and both URLs are http(s) single tokens of sane length: nothing else can
+/// ride an engine-printed line or name a path.
+fn world_card(w: &Value) -> Option<Value> {
+    let text = |k: &str, max: usize| w.get(k).and_then(Value::as_str).filter(|s| !s.is_empty() && s.len() <= max);
+    let id = text("id", 120).filter(|s| !s.starts_with('.') && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))?;
+    let url = |k: &str| text(k, 500).filter(|s| crate::generate_image::is_url(s) && !s.chars().any(|c| c.is_whitespace() || c.is_control() || c == '|' || c == '`'));
+    Some(json!({ "id": id, "board": url("board")?, "hero": url("hero")? }))
+}
+
+/// Where a dealt world's card images are kept in the workspace, relative to
+/// the project: reference images a harness image tool can take as files.
+const WORLD_CARDS_DIR: &str = ".impeccable/mocks/worlds";
+
+/// One card download may take this long, so a slow or blocked network never
+/// holds `--start` for more than a few seconds (they run in parallel).
+const WORLD_CARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// The extensions a kept card image may carry, in the order they are looked for.
+const WORLD_CARD_EXTS: [&str; 4] = ["webp", "png", "jpg", "jpeg"];
+
+/// The workspace-relative path of a world's card image when one is already
+/// kept: `<WORLD_CARDS_DIR>/<id>-<board|hero>.<ext>`.
+fn kept_world_card(cwd: &str, id: &str, kind: &str) -> Option<String> {
+    WORLD_CARD_EXTS.iter().map(|ext| format!("{}/{}-{}.{}", WORLD_CARDS_DIR, id, kind, ext)).find(|rel| exists(&jsp::resolve(cwd, &[rel.as_str()])))
+}
+
+/// Whether the engine may request a card URL on its own. The URLs come from
+/// the roll record, a project file an API response fed, and `--start` fetches
+/// them unasked, so a crafted record must not turn it into a probe of
+/// loopback, link-local, or private services: a URL is fetched only when it
+/// sits under the configured card base (`IMPECCABLE_CARD_BASE`, else
+/// impeccable.style's), or is `https` to a named public-looking host (no IP
+/// address in any spelling, no userinfo, no single-label, `localhost`,
+/// `.local` or `.internal` name). Card fetches follow no redirect either. A URL that
+/// fails this is still listed, by URL, for the agent to judge.
+fn card_fetch_allowed(env: &Env, url: &str) -> bool {
+    let base = crate::concept_seed::card_base(env);
+    if url.starts_with(&format!("{}/", base.trim_end_matches('/'))) {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains('@') || authority.starts_with('[') {
+        return false;
+    }
+    let host = authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority).trim_end_matches('.').to_ascii_lowercase();
+    let private_name = host == "localhost" || [".localhost", ".local", ".internal", ".lan", ".home.arpa"].iter().any(|s| host.ends_with(s));
+    // A numeric host is an address however it is spelled (`127.1`,
+    // `0177.0.0.1`, `0x7f.1` all resolve to loopback), so the last label
+    // must be a name: letters only, or punycode.
+    let tld = host.rsplit('.').next().unwrap_or("");
+    let named = !tld.is_empty() && (tld.bytes().all(|b| b.is_ascii_alphabetic()) || (tld.starts_with("xn--") && tld.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')));
+    host.contains('.') && named && host.parse::<std::net::IpAddr>().is_err() && !private_name
+}
+
+/// Puts every dealt world's board and hero in the workspace and returns, per
+/// world, `(id, board, hero)` where each image is its workspace-relative path
+/// when the file is there and its URL when it could not be fetched. A file
+/// already there is kept, not fetched again. Downloads run in parallel, each
+/// under `WORLD_CARD_TIMEOUT`, and are best effort: a failure only leaves
+/// that image named by URL. A fetched file takes its extension from the
+/// image's own type, so a later `--ref` of the path sends the right one.
+/// `IMPECCABLE_IMAGE_GEN_FAKE` makes no request.
+fn fetch_world_cards(env: &Env, cwd: &str, worlds: &[Value]) -> Vec<(String, String, String)> {
+    let s = |w: &Value, k: &str| w.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    let offline = env_set(env, "IMPECCABLE_IMAGE_GEN_FAKE");
+    // (id, kind, url) per image, board then hero per world.
+    let images: Vec<(String, &str, String)> = worlds.iter().flat_map(|w| ["board", "hero"].map(|kind| (s(w, "id"), kind, s(w, kind)))).collect();
+    let fetch = |id: &str, kind: &str, url: &str| -> Option<String> {
+        if let Some(kept) = kept_world_card(cwd, id, kind) {
+            return Some(kept);
+        }
+        if offline || !card_fetch_allowed(env, url) {
+            return None;
+        }
+        let (bytes, ty) = crate::generate_image::fetch_image(url, WORLD_CARD_TIMEOUT, 0).ok()?;
+        let ext = match ty {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            _ => "webp",
+        };
+        let rel = format!("{}/{}-{}.{}", WORLD_CARDS_DIR, id, kind, ext);
+        let abs = jsp::resolve(cwd, &[rel.as_str()]);
+        // Temp file then rename: a parallel session never reads half an image.
+        let temp = format!("{}.tmp-{}", abs, std::process::id());
+        let written = std::fs::create_dir_all(jsp::resolve(cwd, &[WORLD_CARDS_DIR])).and_then(|_| std::fs::write(&temp, &bytes)).and_then(|_| std::fs::rename(&temp, &abs));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        written.is_ok().then_some(rel)
+    };
+    let have: Vec<Option<String>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = images.iter().map(|(id, kind, url)| scope.spawn(|| fetch(id, kind, url))).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(None)).collect()
+    });
+    let named = |i: usize| have[i].clone().unwrap_or_else(|| images[i].2.clone());
+    worlds.iter().enumerate().map(|(i, w)| (s(w, "id"), named(i * 2), named(i * 2 + 1))).collect()
+}
+
+/// The catalog worlds a decision page's hand was dealt: the roll record's
+/// `worlds` (as `read_roll` returned it) when the page takes that roll (a
+/// payload carrying `buildPath`, as in `take_roll`), the roll is a direction
+/// roll, and it is younger than `ROLL_WINDOW_MS`. A surface roll's
+/// challengers change topology under an identity already committed, so their
+/// cards are never style references. Empty in every other case.
+fn dealt_worlds(roll: Option<&str>, payload: &Value) -> Vec<Value> {
+    if !payload.get("buildPath").is_some_and(|b| !b.is_null()) {
+        return vec![];
+    }
+    let Some(record) = roll.and_then(|t| serde_json::from_str::<Value>(t).ok()) else {
+        return vec![];
+    };
+    let fresh = record.get("at").and_then(Value::as_f64).is_some_and(|at| now_ms() - at < ROLL_WINDOW_MS);
+    if !fresh || record.get("scope").and_then(Value::as_str) != Some("direction") {
+        return vec![];
+    }
+    record.get("worlds").and_then(Value::as_array).map(|a| a.iter().filter_map(world_card).collect()).unwrap_or_default()
+}
+
+/// The worlds recorded in a hand (`dealt_worlds` at the time it was dealt).
+fn hand_worlds(hand: Option<&Map<String, Value>>) -> Vec<Value> {
+    hand.and_then(|h| h.get("worlds")).and_then(Value::as_array).map(|a| a.iter().filter_map(world_card).collect()).unwrap_or_default()
+}
+
 /// A decision page took the roll it was gated against: the payload carries
 /// `buildPath`, which only direction and surface rounds do. Removes the
 /// record only while it still holds that roll (`read` is the text read
@@ -355,7 +486,8 @@ fn take_roll(qdir: &str, read: Option<&str>, payload: &Value) {
 /// `--start` and `--update` only, never by the server (whose heartbeat and
 /// claim writes rewrite `<key>.state.json` and would race a shared field).
 /// Shape: `{"digest": <hand_digest>, "comps": [<declared slots>], "pre":
-/// {<slot>: <sha256 of the file that sat there when the hand began>}}`.
+/// {<slot>: <sha256 of the file that sat there when the hand began>}}`, plus
+/// `"worlds"` (`dealt_worlds`) when the hand took a roll that dealt any.
 /// `--update` always starts a new hand; `--start` keeps the recorded hand when
 /// its digest matches (a restart) and starts a new one otherwise.
 fn hand_file(qdir: &str, key: &str) -> String {
@@ -507,7 +639,15 @@ pub fn record_generated(cwd: &str, out: &str) -> Result<Vec<String>, String> {
 
 /// A new hand: its digest, its slots, and the fingerprint of every slot that
 /// already holds a file, so that file never passes for this hand's comp.
+#[cfg(test)]
 fn new_hand(cwd: &str, payload: &Value) -> Map<String, Value> {
+    new_hand_dealt(cwd, payload, &[])
+}
+
+/// `new_hand` for a page that takes a roll: `worlds` (`dealt_worlds`) ride in
+/// the hand, because the roll record is gone once the page has taken it and
+/// the NEXT line is printed after that, and again by a later `--wait` flip.
+fn new_hand_dealt(cwd: &str, payload: &Value, worlds: &[Value]) -> Map<String, Value> {
     let comps = declared_comps(payload);
     let mut pre = Map::new();
     for c in &comps {
@@ -523,6 +663,9 @@ fn new_hand(cwd: &str, payload: &Value) -> Map<String, Value> {
     m.insert("digest".into(), Value::String(hand_digest(payload)));
     m.insert("comps".into(), json!(comps));
     m.insert("pre".into(), Value::Object(pre));
+    if !worlds.is_empty() {
+        m.insert("worlds".into(), Value::Array(worlds.to_vec()));
+    }
     m
 }
 
@@ -563,13 +706,14 @@ fn hand_marker_id(hand: &Map<String, Value>) -> String {
 
 /// The hand a `--start` serves: the recorded one when the key's hand file
 /// carries this payload's digest (a restart keeps its fingerprints), else a
-/// new one, written before the server spawns.
-fn start_hand(qdir: &str, key: &str, cwd: &str, payload: &Value) -> Result<Map<String, Value>, String> {
+/// new one, written before the server spawns. `worlds` (`dealt_worlds`) go
+/// into a new hand only: a restart keeps the worlds its hand was dealt.
+fn start_hand(qdir: &str, key: &str, cwd: &str, payload: &Value, worlds: &[Value]) -> Result<Map<String, Value>, String> {
     let digest = hand_digest(payload);
     if let Some(h) = read_hand(qdir, key).filter(|h| h.get("digest").and_then(Value::as_str) == Some(digest.as_str())) {
         return Ok(h);
     }
-    let h = new_hand(cwd, payload);
+    let h = new_hand_dealt(cwd, payload, worlds);
     write_hand(qdir, key, &h)?;
     Ok(h)
 }
@@ -632,11 +776,35 @@ fn visualize_ref(env: &Env, cwd: &str) -> String {
 }
 
 /// The directive that puts visualize.md in front of the agent at the moment
-/// the decision round's comps are about to be written.
-fn visualize_next_line(env: &Env, cwd: &str) -> String {
+/// the decision round's comps are about to be written. When the hand was
+/// dealt catalog worlds (`hand_worlds`), the same line hands over their card
+/// images, fetched into the workspace first (`fetch_world_cards`): a model
+/// follows an engine line where it skips the prose rule that says to open
+/// them, and a harness image tool takes reference images only as files.
+fn visualize_next_line(env: &Env, cwd: &str, hand: Option<&Map<String, Value>>) -> String {
+    let cards = fetch_world_cards(env, cwd, &hand_worlds(hand));
     format!(
-        "NEXT read {} now, before writing any decision comp prompt; it and the MODE RULES block concept-seed printed for this surface govern every card's image. Then generate each declared comp into its slot, lead first, and record the exact prompt in its sidecar, the image's full file name plus .json (a.png gets a.png.json).\n",
-        visualize_ref(env, cwd)
+        "NEXT read {} now, before writing any decision comp prompt; it and the MODE RULES block concept-seed printed for this surface govern every card's image. Then generate each declared comp into its slot, lead first, and record the exact prompt in its sidecar, the image's full file name plus .json (a.png gets a.png.json).{}\n",
+        visualize_ref(env, cwd),
+        world_cards_clause(env, cwd, &cards)
+    )
+}
+
+/// The NEXT line's tail naming each dealt world's card images (`cards` as
+/// `fetch_world_cards` returned them); empty when none was dealt. The list
+/// closes the line, `|` between worlds, so no path or URL ever touches
+/// sentence punctuation.
+fn world_cards_clause(env: &Env, cwd: &str, cards: &[(String, String, String)]) -> String {
+    if cards.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = cards.iter().map(|(id, board, hero)| format!("{} board {} hero {}", id, board, hero)).collect();
+    let unfetched = cards.iter().any(|(_, board, hero)| crate::generate_image::is_url(board) || crate::generate_image::is_url(hero));
+    format!(
+        " The catalog worlds dealt in this roll have card images, listed at the end of this line: when a card's direction builds on one of these worlds, attach that world's board and hero as reference images to that card's comp (the harness image tool's input images, or `{} --ref <board> --ref <hero>`{}), as style inspiration only, never to copy layout or content; a card for a direction you invented yourself has no card images and gets none. WORLD CARDS: {}",
+        crate::provider::detect(env, cwd).verb_cmd("generate-image"),
+        if unfetched { "; any image listed as a URL could not be fetched, so download it into the workspace first when the tool takes files" } else { "" },
+        list.join(" | ")
     )
 }
 
@@ -802,7 +970,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
                 let hand = read_hand(&qdir, &key);
                 let comps = round_comps(hand.as_ref(), read_state(&qdir, &key).as_ref());
                 if comps.is_empty() || any_comp_pending(&cwd, &comps, hand.as_ref()) {
-                    io.out(&visualize_next_line(&env, &cwd));
+                    io.out(&visualize_next_line(&env, &cwd, hand.as_ref()));
                 }
                 return 0;
             }
@@ -918,7 +1086,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         // A delivered round is always a new hand. Recorded before delivery:
         // on failure the page keeps the previous round, whose hand file is
         // untouched, so nothing is served without its provenance.
-        let hand = new_hand(&cwd, &next_round);
+        let hand = new_hand_dealt(&cwd, &next_round, &dealt_worlds(roll.as_deref(), &next_round));
         if let Err(e) = write_hand(&qdir, &key, &hand) {
             io.err(&format!("serve-question: could not record the hand ({}); nothing was delivered. Make .impeccable/questions/ writable and rerun --update on the same key.\n", e));
             return 1;
@@ -929,7 +1097,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         touch_now(&delivered);
         io.out("next round delivered; the page reloads itself\n");
         if comps_expected(&next_round, &cwd, Some(&hand)) {
-            io.out(&visualize_next_line(&env, &cwd));
+            io.out(&visualize_next_line(&env, &cwd, Some(&hand)));
         }
         return 0;
     }
@@ -953,7 +1121,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         }
         let _ = std::fs::create_dir_all(&qdir);
         let key = a.arg("key").unwrap_or_else(random_key);
-        let hand = match start_hand(&qdir, &key, &cwd, &start_payload) {
+        let hand = match start_hand(&qdir, &key, &cwd, &start_payload, &dealt_worlds(roll.as_deref(), &start_payload)) {
             Ok(h) => h,
             Err(e) => {
                 io.err(&format!("serve-question: could not record the hand ({}); the page was not served. Make .impeccable/questions/ writable and rerun --start.\n", e));
@@ -1027,7 +1195,7 @@ pub fn run(argv: &[String], io: &mut Io) -> i32 {
         io.out(&format!("QUESTION KEY: {}\n", key));
         io.out("Open the URL for the user now: in-app browser when the harness has one, otherwise the system opener (macOS `open`, Linux `xdg-open`), otherwise show the URL.\n");
         if comps_expected(&start_payload, &cwd, Some(&hand)) {
-            io.out(&visualize_next_line(&env, &cwd));
+            io.out(&visualize_next_line(&env, &cwd, Some(&hand)));
         }
         io.out(&format!("Then collect the answer with: {} --wait --key {}\n", crate::provider::detect(&env, &cwd).verb_cmd("serve-question"), key));
         return 0;
@@ -2043,19 +2211,19 @@ mod tests {
 
         // Fresh start, a file an earlier session left at the slot: NEXT.
         write_file(&dir.join(slot), b"earlier session");
-        let fresh = start_hand(&qdir, "k1", &cwd, &hand1).unwrap();
+        let fresh = start_hand(&qdir, "k1", &cwd, &hand1, &[]).unwrap();
         assert!(comps_expected(&hand1, &cwd, Some(&fresh)));
         assert_eq!(read_hand(&qdir, "k1").as_ref(), Some(&fresh));
 
         // The comp lands; the server dies; a restart of the same payload on the
         // same key keeps the recorded fingerprints: no NEXT.
         write_file(&dir.join(slot), b"this hand");
-        let restart = start_hand(&qdir, "k1", &cwd, &hand1).unwrap();
+        let restart = start_hand(&qdir, "k1", &cwd, &hand1, &[]).unwrap();
         assert_eq!(restart, fresh);
         assert!(!comps_expected(&hand1, &cwd, Some(&restart)));
 
         // A different payload on that key is a new hand: the landed file is stale.
-        let other = start_hand(&qdir, "k1", &cwd, &hand2).unwrap();
+        let other = start_hand(&qdir, "k1", &cwd, &hand2, &[]).unwrap();
         assert_ne!(other, fresh);
         assert!(comps_expected(&hand2, &cwd, Some(&other)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2081,7 +2249,7 @@ mod tests {
 
         // The server dies before the new comp lands; a restart of the re-roll
         // payload keeps the re-roll's hand, so the old file still does not count.
-        let restart = start_hand(&qdir, "k1", &cwd, &reroll).unwrap();
+        let restart = start_hand(&qdir, "k1", &cwd, &reroll, &[]).unwrap();
         assert_eq!(restart, hand);
         assert!(comps_expected(&reroll, &cwd, Some(&restart)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2402,7 +2570,7 @@ mod tests {
         let qdir = jsp::join(&[&dir.to_string_lossy(), ".impeccable", "questions"]);
         let roll = dir.join(".impeccable/questions/roll.json");
         // Recorded the way concept-seed records a roll.
-        record_roll(&dir.to_string_lossy(), "surface", "seed-1", 0);
+        record_roll(&dir.to_string_lossy(), "surface", "seed-1", 0, &[]);
         assert!(surface_roll_pending(read_roll(&qdir).as_deref()));
         std::fs::write(dir.join("p.json"), surface_round(false).to_string()).unwrap();
         let run_err = |args: &[&str]| {
@@ -2655,10 +2823,264 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    /// A roll record as concept-seed writes it for a roll that dealt worlds.
+    fn write_dealt_roll(dir: &std::path::Path, scope: &str, at: f64, worlds: &Value) {
+        std::fs::write(dir.join(".impeccable/questions/roll.json"), json!({ "scope": scope, "key": "k", "reroll": 0, "at": at as u64, "worlds": worlds }).to_string()).unwrap();
+    }
+
+    fn two_worlds(base: &str) -> Value {
+        json!([
+            { "id": "print-fillmore-handbill", "board": format!("{base}/cards/print-fillmore-handbill.webp"), "hero": format!("{base}/cards/print-fillmore-handbill-hero.webp") },
+            { "id": "broadcast-teletext", "board": format!("{base}/cards/broadcast-teletext.png?v=3"), "hero": format!("{base}/cards/broadcast-teletext-hero.webp") }
+        ])
+    }
+
+    const NEXT_TODAY: &str = "NEXT read /skill/reference/visualize.md now, before writing any decision comp prompt; it and the MODE RULES block concept-seed printed for this surface govern every card's image. Then generate each declared comp into its slot, lead first, and record the exact prompt in its sidecar, the image's full file name plus .json (a.png gets a.png.json).\n";
+
+    fn run_env(dir: &std::path::Path, extra: &[(&str, &str)], args: &[&str]) -> (i32, String) {
+        let mut env = Env::from([("IMPECCABLE_SKILL_DIR".into(), "/skill".into()), ("IMPECCABLE_SELF".into(), "impeccable".into())]);
+        for (k, v) in extra {
+            env.insert(k.to_string(), v.to_string());
+        }
+        let (mut io, cap) = Io::captured("", dir.to_path_buf(), env);
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let code = run(&argv, &mut io);
+        let out = String::from_utf8(cap.stdout.borrow().clone()).unwrap().replace('\\', "/");
+        (code, out)
+    }
+
+    /// The NEXT visualize line of `out`, the skill path without the drive
+    /// letter Windows resolves `/skill` under.
+    fn next_line(out: &str) -> String {
+        let Some(line) = out.lines().find(|l| l.starts_with("NEXT read ")) else { return String::new() };
+        let rest = &line["NEXT read ".len()..];
+        let rest = if rest.as_bytes().get(1) == Some(&b':') { &rest[2..] } else { rest };
+        format!("NEXT read {rest}\n")
+    }
+
+    /// Answers card image requests until `stop` is set; returns the paths asked for.
+    fn card_server(server: tiny_http::Server, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<Vec<String>> {
+        std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let Ok(Some(request)) = server.recv_timeout(std::time::Duration::from_millis(50)) else { continue };
+                let path = request.url().to_string();
+                seen.push(path.clone());
+                if path.contains("missing") {
+                    let _ = request.respond(tiny_http::Response::from_string("gone").with_status_code(404));
+                } else if path.contains("wall") {
+                    // A 200 sign-in page behind an image URL and Content-Type.
+                    let _ = request.respond(tiny_http::Response::from_string("<html>sign in</html>").with_header(tiny_http::Header::from_bytes("content-type", "image/webp").unwrap()));
+                } else if path.contains("teletext.png") {
+                    // A PNG served as webp: the bytes decide.
+                    let body = [&b"\x89PNG\r\n\x1a\n"[..], path.as_bytes()].concat();
+                    let _ = request.respond(tiny_http::Response::from_data(body).with_header(tiny_http::Header::from_bytes("content-type", "image/webp").unwrap()));
+                } else {
+                    let body = format!("RIFF\x10\0\0\0WEBPVP8 {path}");
+                    let _ = request.respond(tiny_http::Response::from_data(body.into_bytes()).with_header(tiny_http::Header::from_bytes("content-type", "image/webp").unwrap()));
+                }
+            }
+            seen
+        })
+    }
+
+    #[test]
+    fn dealt_worlds_come_from_a_fresh_direction_roll_a_decision_page_takes() {
+        let page = direction_round(true);
+        let worlds = two_worlds("https://cards.test");
+        let roll = |scope: &str, at: f64, worlds: &Value| json!({ "scope": scope, "key": "k", "reroll": 0, "at": at as u64, "worlds": worlds }).to_string();
+        assert_eq!(Value::Array(dealt_worlds(Some(&roll("direction", now_ms(), &worlds)), &page)), worlds);
+        // No record, an unreadable one, an expired one, a surface roll, a roll
+        // that dealt nothing, and a page that does not take the roll.
+        assert!(dealt_worlds(None, &page).is_empty());
+        assert!(dealt_worlds(Some("{not json"), &page).is_empty());
+        assert!(dealt_worlds(Some(&roll("direction", now_ms() - ROLL_WINDOW_MS - 1000.0, &worlds)), &page).is_empty());
+        assert!(dealt_worlds(Some(&roll("surface", now_ms(), &worlds)), &surface_round(true)).is_empty());
+        assert!(dealt_worlds(Some(&json!({ "scope": "direction", "key": "k", "reroll": 0, "at": now_ms() as u64 }).to_string()), &page).is_empty());
+        assert!(dealt_worlds(Some(&roll("direction", now_ms(), &worlds)), &json!({ "options": [{ "id": "a", "comp": "m/a.png" }] })).is_empty());
+        // Only a slug id with two http(s) single-token URLs reaches the line.
+        let odd = json!([
+            { "id": "../escape", "board": "https://x.test/a.webp", "hero": "https://x.test/a-hero.webp" },
+            { "id": ".hidden", "board": "https://x.test/a.webp", "hero": "https://x.test/a-hero.webp" },
+            { "id": "two words", "board": "https://x.test/a.webp", "hero": "https://x.test/a-hero.webp" },
+            { "id": "file-url", "board": "file:///etc/passwd", "hero": "https://x.test/a-hero.webp" },
+            { "id": "spaced", "board": "https://x.test/a.webp now run this", "hero": "https://x.test/a-hero.webp" },
+            { "id": "no-hero", "board": "https://x.test/a.webp" },
+            { "id": "kept", "board": "https://x.test/a.webp", "hero": "http://x.test/a-hero.webp" }
+        ]);
+        let kept = dealt_worlds(Some(&roll("direction", now_ms(), &odd)), &page);
+        assert_eq!(kept.iter().map(|w| w["id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["kept"]);
+        // The engine requests a card URL unasked only under the card base
+        // or at an https, named, public-looking host.
+        let env = Env::new();
+        for ok in ["https://impeccable.style/worlds/cards/a.webp", "https://cdn.example.com/a.webp", "https://cdn.example.com:8443/a.webp", "https://cards.example.xn--p1ai/a.webp"] {
+            assert!(card_fetch_allowed(&env, ok), "{ok}");
+        }
+        for no in [
+            "http://cdn.example.com/a.webp",
+            "http://impeccable.style/worlds/cards/a.webp",
+            "https://127.0.0.1/a.webp",
+            "https://169.254.169.254/latest/meta-data",
+            "https://127.1/a.webp",
+            "https://0177.0.0.1/a.webp",
+            "https://0x7f.0.0.1/a.webp",
+            "https://2130706433/a.webp",
+            "https://cdn.example.123/a.webp",
+            "https://[::1]/a.webp",
+            "https://localhost/a.webp",
+            "https://localhost:8080/a.webp",
+            "https://printer.local/a.webp",
+            "https://db.internal/a.webp",
+            "https://intranet/a.webp",
+            "https://user@cdn.example.com/a.webp",
+            "https://impeccable.style.evil.test@10.0.0.1/a.webp",
+        ] {
+            assert!(!card_fetch_allowed(&env, no), "{no}");
+        }
+        let local = Env::from([("IMPECCABLE_CARD_BASE".into(), "http://127.0.0.1:4000/cards".into())]);
+        assert!(card_fetch_allowed(&local, "http://127.0.0.1:4000/cards/a.webp"));
+        assert!(!card_fetch_allowed(&local, "http://127.0.0.1:4000/cardsx/a.webp") && !card_fetch_allowed(&local, "http://127.0.0.1:4001/cards/a.webp"));
+    }
+
+    #[test]
+    fn next_line_fetches_and_names_the_dealt_worlds_card_images() {
+        let _proxy_lock = crate::http::PROXY_ENV_LOCK.lock().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = card_server(server, stop.clone());
+        let dir = temp_project("world-cards");
+        let qdir = jsp::join(&[&dir.to_string_lossy(), ".impeccable", "questions"]);
+        write_state(&dir, &json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" }));
+        std::fs::write(dir.join("p.json"), direction_round(true).to_string()).unwrap();
+        let card_base = format!("{base}/cards");
+        let update = |extra: &[(&str, &str)]| run_env(&dir, &[extra, &[("IMPECCABLE_CARD_BASE", card_base.as_str())]].concat(), &["--update", "--key", "k1", "--payload", "p.json"]);
+        const SENTENCE: &str = " The catalog worlds dealt in this roll have card images, listed at the end of this line: when a card's direction builds on one of these worlds, attach that world's board and hero as reference images to that card's comp (the harness image tool's input images, or `impeccable generate-image --ref <board> --ref <hero>`), as style inspiration only, never to copy layout or content; a card for a direction you invented yourself has no card images and gets none. WORLD CARDS: ";
+        const FILES: &str = "print-fillmore-handbill board .impeccable/mocks/worlds/print-fillmore-handbill-board.webp hero .impeccable/mocks/worlds/print-fillmore-handbill-hero.webp | broadcast-teletext board .impeccable/mocks/worlds/broadcast-teletext-board.png hero .impeccable/mocks/worlds/broadcast-teletext-hero.webp\n";
+
+        // Two dealt worlds: four files land in the workspace and the line
+        // names them, after the page took the roll (the record is gone).
+        write_dealt_roll(&dir, "direction", now_ms(), &two_worlds(&base));
+        let (code, out) = update(&[]);
+        assert_eq!(code, 0);
+        assert_eq!(next_line(&out), format!("{}{}{}", NEXT_TODAY.trim_end(), SENTENCE, FILES));
+        assert!(read_roll(&qdir).is_none());
+        let card = |name: &str| String::from_utf8_lossy(&std::fs::read(dir.join(".impeccable/mocks/worlds").join(name)).unwrap_or_default()).into_owned();
+        assert!(card("print-fillmore-handbill-board.webp").ends_with("/cards/print-fillmore-handbill.webp"));
+        assert!(card("broadcast-teletext-board.png").ends_with("/cards/broadcast-teletext.png?v=3"));
+        assert!(card("broadcast-teletext-hero.webp").ends_with("/cards/broadcast-teletext-hero.webp"));
+        // The hand keeps the worlds, so a --wait flip names them too.
+        assert_eq!(Value::Array(hand_worlds(read_hand(&qdir, "k1").as_ref())), two_worlds(&base));
+
+        // The same worlds dealt again: every file is there, nothing is fetched.
+        write_dealt_roll(&dir, "direction", now_ms(), &two_worlds(&base));
+        let (_, out) = update(&[]);
+        assert_eq!(next_line(&out), format!("{}{}{}", NEXT_TODAY.trim_end(), SENTENCE, FILES));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut seen = handle.join().unwrap();
+        seen.sort();
+        assert_eq!(seen, vec!["/cards/broadcast-teletext-hero.webp", "/cards/broadcast-teletext.png?v=3", "/cards/print-fillmore-handbill-hero.webp", "/cards/print-fillmore-handbill.webp"]);
+
+        // An expired record, a surface roll, and no record print today's line.
+        write_dealt_roll(&dir, "direction", now_ms() - ROLL_WINDOW_MS - 1000.0, &two_worlds(&base));
+        assert_eq!(next_line(&update(&[]).1), NEXT_TODAY);
+        std::fs::write(dir.join("s.json"), surface_round(true).to_string()).unwrap();
+        write_dealt_roll(&dir, "surface", now_ms(), &two_worlds(&base));
+        assert_eq!(next_line(&run_env(&dir, &[("IMPECCABLE_CARD_BASE", card_base.as_str())], &["--update", "--key", "k1", "--payload", "s.json"]).1), NEXT_TODAY);
+        assert!(read_roll(&qdir).is_none());
+        assert_eq!(next_line(&update(&[]).1), NEXT_TODAY);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_card_that_cannot_be_fetched_is_named_by_url_and_fails_nothing() {
+        let _proxy_lock = crate::http::PROXY_ENV_LOCK.lock().unwrap();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr());
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = card_server(server, stop.clone());
+        let dir = temp_project("world-cards-fail");
+        write_state(&dir, &json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" }));
+        std::fs::write(dir.join("p.json"), direction_round(true).to_string()).unwrap();
+        // One image 404s, one URL sits outside the card base on a loopback
+        // host (never requested), one answers 200 with a sign-in page, an
+        // extensionless one is a webp, and one is served.
+        let worlds = json!([
+            { "id": "a", "board": format!("{base}/cards/a.webp"), "hero": format!("{base}/cards/missing-hero.webp") },
+            { "id": "b", "board": format!("{base}/elsewhere/b.webp"), "hero": format!("{base}/cards/b-hero") },
+            { "id": "c", "board": format!("{base}/cards/wall.webp"), "hero": format!("{base}/cards/c-hero.webp") }
+        ]);
+        write_dealt_roll(&dir, "direction", now_ms(), &worlds);
+        let card_base = format!("{base}/cards");
+        let (code, out) = run_env(&dir, &[("IMPECCABLE_CARD_BASE", card_base.as_str())], &["--update", "--key", "k1", "--payload", "p.json"]);
+        assert_eq!(code, 0);
+        assert!(out.starts_with("next round delivered; the page reloads itself\n"), "{out}");
+        let line = next_line(&out);
+        assert!(line.contains("`impeccable generate-image --ref <board> --ref <hero>`; any image listed as a URL could not be fetched, so download it into the workspace first when the tool takes files), as style inspiration only"), "{line}");
+        assert!(line.ends_with(&format!("WORLD CARDS: a board .impeccable/mocks/worlds/a-board.webp hero {base}/cards/missing-hero.webp | b board {base}/elsewhere/b.webp hero .impeccable/mocks/worlds/b-hero.webp | c board {base}/cards/wall.webp hero .impeccable/mocks/worlds/c-hero.webp\n")), "{line}");
+        // Nothing but the three real images is kept: no page saved as a card.
+        let cards = dir.join(".impeccable/mocks/worlds");
+        let mut kept: Vec<String> = std::fs::read_dir(&cards).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        kept.sort();
+        assert_eq!(kept, vec!["a-board.webp", "b-hero.webp", "c-hero.webp"]);
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let seen = handle.join().unwrap();
+        assert!(!seen.iter().any(|p| p.contains("elsewhere")), "{seen:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fake_image_mode_fetches_no_card_and_names_what_is_there() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.server_addr());
+        let dir = temp_project("world-cards-fake");
+        write_state(&dir, &json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" }));
+        std::fs::write(dir.join("p.json"), direction_round(true).to_string()).unwrap();
+        // One card image an earlier round already fetched.
+        std::fs::create_dir_all(dir.join(".impeccable/mocks/worlds")).unwrap();
+        write_file(&dir.join(".impeccable/mocks/worlds/broadcast-teletext-hero.webp"), b"kept");
+        write_dealt_roll(&dir, "direction", now_ms(), &two_worlds(&base));
+        let (code, out) = run_env(&dir, &[("IMPECCABLE_IMAGE_GEN_FAKE", "1")], &["--update", "--key", "k1", "--payload", "p.json"]);
+        assert_eq!(code, 0);
+        assert!(next_line(&out).ends_with(&format!("WORLD CARDS: print-fillmore-handbill board {base}/cards/print-fillmore-handbill.webp hero {base}/cards/print-fillmore-handbill-hero.webp | broadcast-teletext board {base}/cards/broadcast-teletext.png?v=3 hero .impeccable/mocks/worlds/broadcast-teletext-hero.webp\n")), "{out}");
+        assert!(server.recv_timeout(std::time::Duration::from_millis(300)).unwrap().is_none());
+        assert_eq!(std::fs::read(dir.join(".impeccable/mocks/worlds/broadcast-teletext-hero.webp")).unwrap(), b"kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_and_a_flip_keep_the_worlds_the_hand_was_dealt() {
+        let dir = temp_project("world-cards-hand");
+        let cwd = dir.to_string_lossy().into_owned();
+        let qdir = jsp::join(&[&cwd, ".impeccable", "questions"]);
+        let fake = [("IMPECCABLE_IMAGE_GEN_FAKE", "1")];
+        let worlds = two_worlds("https://cards.test");
+        let mut code_led = direction_round(true);
+        code_led["buildPath"]["value"] = json!("code");
+        // --start records the worlds in a new hand; the roll record is then
+        // gone, and a restart of the same payload keeps the hand's worlds.
+        let dealt = dealt_worlds(Some(&json!({ "scope": "direction", "key": "k", "reroll": 0, "at": now_ms() as u64, "worlds": worlds }).to_string()), &code_led);
+        let hand = start_hand(&qdir, "k1", &cwd, &code_led, &dealt).unwrap();
+        let restart = start_hand(&qdir, "k1", &cwd, &code_led, &[]).unwrap();
+        assert_eq!(restart, hand);
+        assert_eq!(Value::Array(hand_worlds(Some(&restart))), worlds);
+        // The code-led round flips to comp: its NEXT line names the cards.
+        write_state(&dir, &json!({ "pid": std::process::id(), "port": 1, "url": "http://127.0.0.1:1/" }));
+        std::fs::write(flip_file(&qdir, "k1"), "1").unwrap();
+        let (code, out) = run_env(&dir, &fake, &["--wait", "--key", "k1", "--poll", "2"]);
+        assert_eq!(code, 0);
+        assert!(out.starts_with("BUILD PATH FLIPPED: comp"), "{out}");
+        assert!(next_line(&out).ends_with("WORLD CARDS: print-fillmore-handbill board https://cards.test/cards/print-fillmore-handbill.webp hero https://cards.test/cards/print-fillmore-handbill-hero.webp | broadcast-teletext board https://cards.test/cards/broadcast-teletext.png?v=3 hero https://cards.test/cards/broadcast-teletext-hero.webp\n"), "{out}");
+        // A hand dealt no world records no `worlds` key.
+        assert!(new_hand(&cwd, &code_led).get("worlds").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn visualize_next_line_names_the_skill_reference() {
         let env = Env::from([("IMPECCABLE_SKILL_DIR".into(), "/skill".into())]);
-        let line = visualize_next_line(&env, "/proj").replace('\\', "/");
+        let line = visualize_next_line(&env, "/proj", None).replace('\\', "/");
         assert!(line.starts_with("NEXT read /skill/reference/visualize.md now, before writing any decision comp prompt; it and the MODE RULES block concept-seed printed for this surface govern every card's image."), "{line}");
         assert!(line.ends_with("the image's full file name plus .json (a.png gets a.png.json).\n"));
     }

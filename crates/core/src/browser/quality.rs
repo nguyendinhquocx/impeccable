@@ -142,6 +142,9 @@ pub fn has_visible_background_boundary(dom: &dyn Dom, el: ElId) -> bool {
     }
     let mut parent = dom.parent(el);
     while let Some(p) = parent {
+        if gradient_paints_only(dom, p, el, &bg) {
+            return false;
+        }
         let parent_bg = dom.style(p, "backgroundColor");
         if !css_color_is_transparent(Some(&parent_bg)) {
             return !colors_nearly_match(Some(&bg), Some(&parent_bg));
@@ -154,6 +157,137 @@ pub fn has_visible_background_boundary(dom: &dyn Dom, el: ElId) -> bool {
         return true;
     }
     !colors_nearly_match(Some(&bg), Some(CANVAS_BACKGROUND))
+}
+
+/// Whether `node`'s `background-image` is gradients alone, and every colour
+/// they paint that shows (alpha over 0.05) nearly matches `fill`: the box
+/// paints `fill` itself, so a box of that fill laid on it draws no edge.
+/// freddiemac.com paints its grey cards with `linear-gradient(to right,
+/// transparent 50px, #f3f3f3 50px)` on the row, and the grey text panel in
+/// the row is the same grey. A picture (`url(...)`), a gradient this cannot
+/// read, or one drawn at a `background-size` that does not fill the box says
+/// nothing, and the walk goes on as before.
+///
+/// A gradient with transparent stops paints the fill only where those stops
+/// are not: it is read only in the one shape freddiemac.com uses, a single
+/// `linear-gradient` running to one side that is transparent up to a length
+/// and the fill after it, and only when `el` lies wholly in the filled part.
+fn gradient_paints_only(dom: &dyn Dom, node: ElId, el: ElId, fill: &str) -> bool {
+    let image = dom.style(node, "backgroundImage");
+    if image.is_empty() || image == "none" || !image.contains("gradient(") || image.contains("url(") {
+        return false;
+    }
+    // A gradient drawn at a size of its own (a 2px rule along one edge:
+    // `background-size: 100% 2px`) paints only that strip, and where is not
+    // read here, so it says nothing about what lies under `el`.
+    let size = dom.style(node, "backgroundSize");
+    let fills_the_box = size.split(',').all(|layer| {
+        matches!(
+            js::trim(layer),
+            "" | "auto" | "auto auto" | "cover" | "contain" | "100%" | "100% auto" | "auto 100%" | "100% 100%"
+        )
+    });
+    if !fills_the_box {
+        return false;
+    }
+    let colors = crate::color::parse_gradient_colors(Some(&image));
+    let shown: Vec<_> = colors.iter().filter(|c| c.alpha_or_one() > 0.05).collect();
+    let matches = !shown.is_empty()
+        && shown.iter().all(|c| {
+            colors_nearly_match(
+                Some(fill),
+                Some(&format!("rgba({}, {}, {}, {})", c.r, c.g, c.b, c.alpha_or_one())),
+            )
+        });
+    if !matches {
+        return false;
+    }
+    if shown.len() == colors.len() {
+        return true;
+    }
+    match transparent_lead(&image) {
+        Some((side, len)) => {
+            let host = dom.rect(node);
+            let r = dom.rect(el);
+            // A length stop is in layout pixels; the rects are drawn at the
+            // host's scale, which need not be the same on both axes
+            // (`scaleX(0.5)` moves no vertical stop): a stop along x takes
+            // the width's scale, one along y the height's.
+            let start = |l: f64, scale: f64| if len.1 { l * len.0 / 100.0 } else { len.0 * scale };
+            let across = || start(host.width, drawn_scale(dom, node, &host));
+            let down = || start(host.height, drawn_scale_y(dom, node, &host));
+            match side {
+                "right" => r.left >= host.left + across() - 0.5,
+                "left" => r.right <= host.right - across() + 0.5,
+                "bottom" => r.top >= host.top + down() - 0.5,
+                _ => r.bottom <= host.bottom - down() + 0.5,
+            }
+        }
+        None => false,
+    }
+}
+
+static TRANSPARENT_LEAD_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"^linear-gradient\(to (right|left|bottom|top), (?:transparent|rgba\(0, 0, 0, 0\)) ([0-9.]+)(px|%), (rgba?\([^)]*\)|#[0-9a-fA-F]+) ([0-9.]+)(px|%)\)$",
+    )
+    .unwrap()
+});
+
+/// `(side, (length, is_percent))` of a `linear-gradient(to <side>,
+/// transparent <len>, <colour> <same len>)`: a hard edge where the fill
+/// starts.
+fn transparent_lead(image: &str) -> Option<(&'static str, (f64, bool))> {
+    let m = TRANSPARENT_LEAD_RE.captures(js::trim(image))?;
+    if m[2] != m[5] || m[3] != m[6] {
+        return None;
+    }
+    let side = match &m[1] {
+        "right" => "right",
+        "left" => "left",
+        "bottom" => "bottom",
+        _ => "top",
+    };
+    Some((side, (parse_float(&m[2]), &m[3] == "%")))
+}
+
+/// Whether a box laid under `el`'s rect paints a photo there: an `img` or
+/// `video`, itself or inside it, whose own rect covers `r`. The photo's rect,
+/// not its wrapper's: an inline `<picture>` reports the line box its image
+/// sits on, not the image. A `canvas` is drawn content (a map, a chart), and
+/// a panel laid on it keeps its edge.
+fn raster_covers(dom: &dyn Dom, layer: ElId, r: &Rect) -> bool {
+    let covers = |n: ElId| {
+        let nr = dom.rect(n);
+        nr.left <= r.left + 1.0 && nr.right >= r.right - 1.0 && nr.top <= r.top + 1.0 && nr.bottom >= r.bottom - 1.0
+    };
+    let is_raster = |n: ElId| matches!(tag_lower(dom, n).as_str(), "img" | "video");
+    // The photo has to paint: shown, and not faded out by itself or a box
+    // between it and the layer.
+    let paints = |n: ElId| {
+        if dom.style(n, "display") == "none" || dom.style(n, "visibility") == "hidden" {
+            return false;
+        }
+        let mut cur = Some(n);
+        while let Some(c) = cur {
+            let o = parse_float(&dom.style(c, "opacity"));
+            if o.is_finite() && o <= 0.05 {
+                return false;
+            }
+            if c == layer {
+                break;
+            }
+            cur = dom.parent(c);
+        }
+        true
+    };
+    if is_raster(layer) {
+        return paints(layer) && covers(layer);
+    }
+    dom.query_all(Some(layer), "img, video")
+        .unwrap_or_default()
+        .into_iter()
+        .any(|n| paints(n) && covers(n))
 }
 
 /// Whether the fill `el` paints lies on a layer painting the same colour: a
@@ -185,6 +319,13 @@ fn backdrop_layer_matches(dom: &dyn Dom, el: ElId) -> bool {
             let fill = dom.style(s, "backgroundColor");
             if covers && !css_color_is_transparent(Some(&fill)) {
                 return colors_nearly_match(Some(&bg), Some(&fill));
+            }
+            // A photo laid under the fill (telekom.de's magenta card on a
+            // magenta photo) is what the reader sees around it, and its
+            // colours are not read here: the edge the fill draws against
+            // the page behind the photo is not one a reader sees.
+            if raster_covers(dom, s, &r) {
+                return true;
             }
         }
         let Some(parent) = dom.parent(node) else { return false };
@@ -253,11 +394,44 @@ fn clamp_to(inner: &Rect, outer: &Rect) -> Option<Rect> {
 /// text nodes, so this is the room a reader sees rather than the room the
 /// stylesheet declares: a fixed-height flex or grid box centres its label
 /// with no padding at all, and half-leading adds space of its own.
+///
+/// Where the capture recorded the lines, only the lines that cross the box
+/// are measured: a line that wraps out of a fixed-height box (nexttv.com.tw's
+/// copyright, a 66px line box whose second line lands below it) is not text
+/// the box holds, and the union with it put the text on the bottom border.
+/// A box none of whose lines cross it holds none of its text.
 fn direct_text_insets(dom: &dyn Dom, el: ElId, rect: &Rect, border: &[f64; 4]) -> Option<[f64; 4]> {
     let t = dom.direct_text_rect(el)?;
     if t.width <= 0.0 || t.height <= 0.0 {
         return None;
     }
+    let t = match dom.text_line_rects(el) {
+        Some(lines) if !lines.is_empty() => {
+            let crosses = |l: &Rect, b: &Rect| {
+                l.top < b.bottom && l.bottom > b.top && l.left < b.right && l.right > b.left
+            };
+            let kept = lines
+                .iter()
+                .filter(|l| l.all_finite() && crosses(l, &t) && crosses(l, rect))
+                .fold(None::<Rect>, |acc, l| {
+                    Some(match acc {
+                        None => *l,
+                        Some(a) => {
+                            let left = js::math_min(a.left, l.left);
+                            let top = js::math_min(a.top, l.top);
+                            Rect::from_xywh(
+                                left,
+                                top,
+                                js::math_max(a.right, l.right) - left,
+                                js::math_max(a.bottom, l.bottom) - top,
+                            )
+                        }
+                    })
+                })?;
+            clamp_to(&kept, &t)?
+        }
+        _ => t,
+    };
     // Text that overruns its own box still reads as cramped: the clamped rect
     // lands on the border, an inset of zero.
     let t = clamp_to(&t, rect)?;
@@ -308,6 +482,10 @@ pub fn has_meaningful_direct_text(dom: &dyn Dom, el: ElId) -> bool {
 /// 27.6px, keeps the content-area measure. yungching.com.tw's 24px step chip
 /// is inside it; haraj.com.sa's 28px price chip is not.
 pub const SMALL_CHIP_HEIGHT_UNDER_PX: f64 = 27.5;
+
+/// The air a small chip's glyphs need from its edges, in ems of their font
+/// size, before they read as flush (capped at the 4px a full-size box needs).
+pub const SMALL_CHIP_AIR_EM: f64 = 0.25;
 
 /// The band of `t`, a text rect of `node`, that its glyphs occupy: each line's
 /// em box, one font size tall and centred on the line's content area. A Range
@@ -411,6 +589,21 @@ fn drawn_scale(dom: &dyn Dom, el: ElId, rect: &Rect) -> f64 {
         return 1.0;
     }
     let scale = rect.width / layout;
+    if scale > 0.05 && scale < 0.95 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+/// [`drawn_scale`] on the y axis: `el`'s on-screen height over its layout
+/// height, under the same bounds.
+fn drawn_scale_y(dom: &dyn Dom, el: ElId, rect: &Rect) -> f64 {
+    let layout = dom.offset_height(el);
+    if !(layout.is_finite() && layout > 0.0 && rect.height > 0.0) {
+        return 1.0;
+    }
+    let scale = rect.height / layout;
     if scale > 0.05 && scale < 0.95 {
         scale
     } else {
@@ -715,6 +908,20 @@ pub fn text_descendants_flush_sides(dom: &dyn Dom, el: ElId, rect: &Rect) -> [bo
     let scale = drawn_scale(dom, el, rect);
     let edge_threshold = 4.0 * scale;
     let small_chip = rect.height > 0.0 && rect.height / scale < SMALL_CHIP_HEIGHT_UNDER_PX;
+    // In a small chip the glyphs are measured, and the air they need scales
+    // with them: a quarter of the font size, which is the 4px above for 16px
+    // text and less for smaller labels. maritime.sh's mock URL bar holds 10px
+    // text 3px off its edges.
+    let land_threshold = |node: ElId| -> f64 {
+        if !small_chip {
+            return edge_threshold;
+        }
+        let font_size = parse_float(&dom.style(node, "fontSize"));
+        if !(font_size.is_finite() && font_size > 0.0) {
+            return edge_threshold;
+        }
+        js::math_min(4.0, font_size * SMALL_CHIP_AIR_EM) * scale
+    };
     let candidates = dom.query_all(Some(el), TEXT_EDGE_QUERY).unwrap_or_default();
     for node in candidates {
         let tag_name = dom.tag_name(node);
@@ -766,7 +973,8 @@ pub fn text_descendants_flush_sides(dom: &dyn Dom, el: ElId, rect: &Rect) -> [bo
         // either side of the edge. Text further past the edge than that is
         // not held against it: it runs out of the box (a block parked 64px
         // to the left of its column until its scroll reveal brings it in).
-        let lands = |gap: f64| gap <= edge_threshold && gap >= -edge_threshold;
+        let land = land_threshold(node);
+        let lands = |gap: f64| gap <= land && gap >= -edge_threshold;
         let sides = [
             lands(nr.top - rect.top),
             !cut_right && lands(rect.right - right),
@@ -954,10 +1162,13 @@ const PROSE_BLOCK_SKIP_SELECTOR: &str = "a, button, label, summary, select, text
 /// and nothing but phrasing under it, outside any control, and not set as
 /// preformatted text. `line-length` and `body-text-viewport-edge` measure it
 /// the way they measure a `<p>`, from its text runs only: where those cannot
-/// be measured, a generic box is not taken for a paragraph.
+/// be measured, a generic box is not taken for a paragraph. Nor is text set
+/// at display size ([`LEADING_DISPLAY_TYPE_PX`] and up): fanniemae.com sets
+/// its section titles as 28px `div.corp-h2`, a heading in a generic box.
 fn is_prose_block(dom: &dyn Dom, el: ElId, tag: &str, has_direct_text: bool) -> bool {
     has_direct_text
         && PROSE_BLOCK_TAGS.contains(&tag)
+        && !(parse_float(&dom.style(el, "fontSize")) >= LEADING_DISPLAY_TYPE_PX)
         && matches!(dom.style(el, "display").as_str(), "block" | "flow-root")
         && !dom.style(el, "whiteSpace").starts_with("pre")
         && holds_only_phrasing(dom, el)
@@ -1008,28 +1219,15 @@ fn typed_caps_label(dom: &dyn Dom, el: ElId, line_height_px: Option<f64>, every_
         && short_one_line_label(dom, el, line_height_px)
 }
 
-/// The height of one line box of an element's own box. An inline box that
-/// wraps reports the union of its fragments, two 21px highlight lines as one
-/// 43px box, while each fragment a reader sees is one line tall. Blocks, and
-/// an inline box whose lines cannot be counted, keep their box height.
-fn own_line_box_height(
-    dom: &dyn Dom,
-    el: ElId,
-    rect: &Rect,
-    own_line_height: Option<f64>,
-    font_size: f64,
-) -> f64 {
-    if dom.style(el, "display") != "inline" {
-        return rect.height;
-    }
-    let (Some(own), Some(t)) = (own_line_height, dom.direct_text_rect(el)) else {
-        return rect.height;
-    };
-    if !(own > 0.0) || !t.all_finite() || t.height <= 0.0 {
-        return rect.height;
-    }
-    let lines = text_line_count(t.height, line_pitch_px(dom, el, own), font_size);
-    rect.height / lines
+/// Whether `el`'s text is typed in capitals, every letter of it: a
+/// capitalized run ([`is_capitalized_run`]) with no letter that has no case,
+/// shorter than a sentence ([`ALL_CAPS_LONG_RUN`], where `all-caps-body`
+/// takes over a declared run but never sees a typed one).
+fn typed_caps_text(dom: &dyn Dom, el: ElId) -> bool {
+    let text = collapse_ws(js::trim(&dom.text_content(el)));
+    utf16_len(&text) < ALL_CAPS_LONG_RUN
+        && is_capitalized_run(&text)
+        && text.chars().filter(|c| c.is_alphabetic()).all(|c| c.is_uppercase())
 }
 
 /// JS: checks.mjs#isNonRenderedText(el, tag, style)
@@ -1410,11 +1608,15 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
 
     // --- Cramped padding ---
     let is_inline_code = tag == "code" && closest_or_none(dom, el, "pre").is_none();
+    // An inline box is a run of text inside a line, not a box around text:
+    // its fill (a `<mark>` highlight) hugs the glyphs by design, and its
+    // vertical padding moves nothing.
     if !is_inline_code
         && has_direct_text
         && text_len > 20
         && rect.width > 100.0
-        && own_line_box_height(dom, el, rect, q.line_height_px, font_size) > 30.0
+        && st("display") != "inline"
+        && rect.height > 30.0
     {
         let borders = [
             spx("borderTopWidth"),
@@ -1452,10 +1654,25 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
             if has_bg || border_visible[2] {
                 v_sides.push(2);
             }
-            if has_bg || border_visible[3] {
+            // A fill that spans the window ends at the screen's edges, not at
+            // an edge a reader sees beside the text: the flush form below
+            // reads a full-bleed band the same way. nexttv.com.tw's dark
+            // copyright band is the phone's full width.
+            // The window's width less a classic scrollbar, which a 100%-wide
+            // band stops at.
+            let layout_width = dom
+                .document_element()
+                .map(|h| dom.client_width(h))
+                .filter(|w| *w > 0.0 && *w <= viewport_width)
+                .unwrap_or(viewport_width);
+            let full_bleed_bg = has_bg
+                && viewport_width > 0.0
+                && rect.left <= 2.0
+                && rect.right >= layout_width - 2.0;
+            if (has_bg && !full_bleed_bg) || border_visible[3] {
                 h_sides.push(3);
             }
-            if has_bg || border_visible[1] {
+            if (has_bg && !full_bleed_bg) || border_visible[1] {
                 h_sides.push(1);
             }
             let pad_names = ["paddingTop", "paddingRight", "paddingBottom", "paddingLeft"];
@@ -1940,16 +2157,24 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
                 if tracking_em > 0.05 {
                     // Wide tracking is the standard treatment for an
                     // uppercase eyebrow, label or button. `text-transform`
-                    // says so outright; capitals typed into the markup do
-                    // not, so that reading is held to label size on one
-                    // line and running text keeps the rule.
+                    // says so outright; capitals typed into the markup say
+                    // it as plainly and take the same exemption, at any
+                    // length and over any number of lines (mialight.app's
+                    // caption that wraps on a phone). Every letter has to be
+                    // a capital for that, so a CJK line with one Latin
+                    // acronym in it stays running text unless it is a short
+                    // label on one line.
                     // A link or button label is read at a glance too
                     // (lpga.or.jp's bold CJK "Instagram" link), held to the
                     // same size on one line.
                     let control_label = closest_or_none(dom, el, TRACKED_CONTROL_LABEL).is_some()
                         && short_one_line_label(dom, el, q.line_height_px);
+                    // `text-transform: lowercase` renders no
+                    // capitals, whatever the markup typed.
+                    let lowered = st("textTransform") == "lowercase";
                     let caps_label = st("textTransform") == "uppercase"
-                        || typed_caps_label(dom, el, q.line_height_px, false);
+                        || (!lowered
+                            && (typed_caps_text(dom, el) || typed_caps_label(dom, el, q.line_height_px, false)));
                     if !caps_label && !control_label {
                         findings.push(RuleHit::new(
                             "wide-tracking",
@@ -3378,6 +3603,271 @@ mod tests {
         assert_eq!(cramped(&d, band), vec!["<div> \"band\": children flush against bg on right (no inset)"]);
     }
 
+    /// observations-42 row 5, nexttv.com.tw: a 66px line box whose second
+    /// line wraps out below the box. The box holds the first line, 23px off
+    /// each edge; the line below it is not text against the bottom border.
+    /// A full-width band's sides are the screen's edges, not a box's.
+    #[test]
+    fn cramped_padding_measures_the_lines_the_box_holds() {
+        let page = |lines: bool, width: f64| -> (FakeDom, ElId) {
+            let mut d = FakeDom::new();
+            d.inner_width = 390.0;
+            let (_h, body) = d.with_page();
+            d.set_style(body, "backgroundColor", "rgb(255, 255, 255)");
+            let p = text_el(&mut d, body, "p", "Copyright NEXT TV Broadcasting Ltd. All rights reserved.", "14px");
+            d.set_attr(p, "class", "copyright");
+            d.set_rect(p, 0.0, 1370.0, width, 66.0);
+            d.set_styles(
+                p,
+                &[
+                    ("display", "block"),
+                    ("lineHeight", "66px"),
+                    ("backgroundColor", "rgb(64, 64, 64)"),
+                    ("paddingTop", "0px"),
+                    ("paddingBottom", "0px"),
+                    ("paddingLeft", "0px"),
+                    ("paddingRight", "0px"),
+                ],
+            );
+            if lines {
+                d.set_text_lines(p, &[(1.0, 1393.0, 387.0, 20.0), (92.0, 1459.0, 205.0, 20.0)]);
+            } else {
+                d.set_text_rect(p, 1.0, 1393.0, 387.0, 86.0);
+            }
+            (d, p)
+        };
+        let (d, p) = page(true, 390.0);
+        assert!(cramped(&d, p).is_empty(), "{:?}", cramped(&d, p));
+        // A capture with no lines measures the union, as before.
+        let (d, p) = page(false, 390.0);
+        assert_eq!(cramped(&d, p), vec!["0px of space above and below the text (need ≥4.2px for 14px text)"]);
+        // A band narrower than the window has sides a reader sees, even a
+        // wide one inset from both edges.
+        let (d, p) = page(true, 360.0);
+        assert_eq!(cramped(&d, p), vec!["0px of space beside the text (need ≥8.0px for 14px text)"]);
+        // A 100% band stops at a classic scrollbar, short of the window.
+        let (mut d, p) = page(true, 375.0);
+        let html = d.document_element.unwrap();
+        d.el_mut(html).client_width = 375.0;
+        assert!(cramped(&d, p).is_empty(), "{:?}", cramped(&d, p));
+        let (mut d, p) = page(true, 380.0);
+        d.set_rect(p, 5.0, 1370.0, 380.0, 66.0);
+        assert_eq!(cramped(&d, p), vec!["0px of space beside the text (need ≥8.0px for 14px text)"]);
+    }
+
+    /// observations-42 row 5, s-1.vercel.app: a `<mark>` highlight is a run
+    /// of text inside a line; its fill hugs the glyphs by design.
+    #[test]
+    fn cramped_padding_skips_an_inline_highlight() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        d.set_style(body, "backgroundColor", "rgb(255, 255, 255)");
+        let mark = text_el(&mut d, body, "mark", "trust compounds where nothing else does", "22px");
+        d.set_styles(
+            mark,
+            &[
+                ("display", "inline"),
+                ("lineHeight", "32.3px"),
+                ("backgroundColor", "rgb(255, 236, 153)"),
+                ("paddingTop", "0px"),
+                ("paddingBottom", "0px"),
+                ("paddingLeft", "0px"),
+                ("paddingRight", "0px"),
+            ],
+        );
+        d.set_rect(mark, 40.0, 100.0, 600.0, 194.0);
+        d.set_text_rect(mark, 40.0, 100.0, 600.0, 194.0);
+        assert!(cramped(&d, mark).is_empty(), "{:?}", cramped(&d, mark));
+        d.set_style(mark, "display", "inline-block");
+        assert_eq!(cramped(&d, mark), vec!["0px of space above and below the text (need ≥6.6px for 22px text)"]);
+    }
+
+    /// A wrapper with a grey fill and the text at its right edge, inside a
+    /// row whose own paint is set by `fill`.
+    fn wrapper_in_row(row_bg: &str, row_image: &str) -> (FakeDom, ElId, ElId) {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        d.set_style(body, "backgroundColor", "rgb(255, 255, 255)");
+        let row = d.add(Some(body), "div");
+        d.set_rect(row, 50.0, 100.0, 580.0, 132.0);
+        d.set_styles(row, &[("backgroundColor", row_bg), ("backgroundImage", row_image)]);
+        let wrap = d.add(Some(row), "div");
+        d.set_attr(wrap, "class", "main-section");
+        d.set_rect(wrap, 180.0, 123.0, 374.0, 86.0);
+        d.set_styles(
+            wrap,
+            &[("display", "flex"), ("position", "static"), ("backgroundColor", "rgb(243, 243, 243)")],
+        );
+        let copy = text_el(&mut d, wrap, "p", "Single-family credit risk transfer", "16px");
+        d.set_styles(copy, &[("paddingTop", "16px"), ("paddingLeft", "16px"), ("paddingRight", "0px")]);
+        d.set_rect(copy, 180.0, 123.0, 374.0, 86.0);
+        d.set_text_rect(copy, 196.0, 139.0, 357.0, 22.0);
+        (d, row, wrap)
+    }
+
+    /// observations-42 row 5, freddiemac.com: the row paints the card's grey
+    /// with a gradient past 50px, and the grey text panel on it draws no edge.
+    #[test]
+    fn cramped_padding_reads_a_gradient_that_paints_the_same_fill() {
+        let right = vec!["<div> \"main-section\": children flush against bg on right (no inset)"];
+        let (d, _, wrap) = wrapper_in_row("rgba(0, 0, 0, 0)", "none");
+        assert_eq!(cramped(&d, wrap), right, "on the white page");
+        let (d, _, wrap) = wrapper_in_row(
+            "rgba(0, 0, 0, 0)",
+            "linear-gradient(to right, rgba(0, 0, 0, 0) 50px, rgb(243, 243, 243) 50px)",
+        );
+        assert!(cramped(&d, wrap).is_empty(), "{:?}", cramped(&d, wrap));
+        // A gradient of another colour, or a picture, is read as before.
+        let (d, _, wrap) = wrapper_in_row(
+            "rgba(0, 0, 0, 0)",
+            "linear-gradient(to right, rgba(0, 0, 0, 0) 50px, rgb(30, 64, 175) 50px)",
+        );
+        assert_eq!(cramped(&d, wrap), right, "another colour");
+        let (d, _, wrap) = wrapper_in_row("rgba(0, 0, 0, 0)", "url(\"card.png\")");
+        assert_eq!(cramped(&d, wrap), right, "a picture");
+        // The panel over the transparent part of the row shows the page.
+        let (d, _, wrap) = wrapper_in_row(
+            "rgba(0, 0, 0, 0)",
+            "linear-gradient(to right, rgba(0, 0, 0, 0) 200px, rgb(243, 243, 243) 200px)",
+        );
+        assert_eq!(cramped(&d, wrap), right, "over the transparent part");
+        let (d, _, wrap) = wrapper_in_row(
+            "rgba(0, 0, 0, 0)",
+            "linear-gradient(to right, rgba(0, 0, 0, 0) 20%, rgb(243, 243, 243) 20%)",
+        );
+        assert!(cramped(&d, wrap).is_empty(), "past 20% of the row");
+        // The same grey drawn as a 2px rule along the row's edge paints
+        // nothing under the panel; at a size that fills the row it does.
+        let grey = "linear-gradient(rgb(243, 243, 243), rgb(243, 243, 243))";
+        let (mut d, row, wrap) = wrapper_in_row("rgba(0, 0, 0, 0)", grey);
+        assert!(cramped(&d, wrap).is_empty(), "{:?}", cramped(&d, wrap));
+        d.set_style(row, "backgroundSize", "100% 2px");
+        assert_eq!(cramped(&d, wrap), right, "a strip of the fill");
+        d.set_style(row, "backgroundSize", "100% 100%");
+        assert!(cramped(&d, wrap).is_empty(), "{:?}", cramped(&d, wrap));
+    }
+
+    /// A length stop is scaled along its own axis. A row drawn at
+    /// `scaleX(0.5)` keeps its height, so a downward gradient that starts
+    /// its fill at 100px still starts it 100px down: a panel that begins
+    /// 75px down lies partly on the page and keeps its edge. Scaling the
+    /// stop by the width's half put the fill at 50px and dropped the finding.
+    #[test]
+    fn a_gradient_length_stop_is_scaled_along_its_own_axis() {
+        let right = vec!["<div> \"main-section\": children flush against bg on right (no inset)"];
+        // The row is laid out 1160 x 300 and drawn 580 x 300; the panel's
+        // top is 75px below the row's.
+        let build = |image: &str, squeeze: (f64, f64)| {
+            let (mut d, row, wrap) = wrapper_in_row("rgba(0, 0, 0, 0)", image);
+            d.set_rect(row, 50.0, 48.0, 580.0, 300.0);
+            d.el_mut(row).offset_width = 580.0 / squeeze.0;
+            d.el_mut(row).offset_height = 300.0 / squeeze.1;
+            (d, wrap)
+        };
+        let down = "linear-gradient(to bottom, rgba(0, 0, 0, 0) 100px, rgb(243, 243, 243) 100px)";
+        let (d, wrap) = build(down, (0.5, 1.0));
+        assert_eq!(cramped(&d, wrap), right, "squeezed across, the fill still starts 100px down");
+        // Squeezed down instead, the same stop is drawn 50px down and the
+        // panel lies wholly on the fill.
+        let (d, wrap) = build(down, (1.0, 0.5));
+        assert!(cramped(&d, wrap).is_empty(), "{:?}", cramped(&d, wrap));
+        // A stop along x takes the width's scale and ignores the height's:
+        // the panel starts 130px in, past a 200px stop drawn at half width
+        // and short of one drawn at full width.
+        let across = "linear-gradient(to right, rgba(0, 0, 0, 0) 200px, rgb(243, 243, 243) 200px)";
+        let (d, wrap) = build(across, (0.5, 1.0));
+        assert!(cramped(&d, wrap).is_empty(), "{:?}", cramped(&d, wrap));
+        let (d, wrap) = build(across, (1.0, 0.5));
+        assert_eq!(cramped(&d, wrap), right, "squeezed down, the fill still starts 200px in");
+    }
+
+    /// observations-42 row 5, telekom.de: the magenta card sits on a photo
+    /// laid under it by an earlier, absolutely positioned sibling; the white
+    /// page behind the photo is not an edge a reader sees.
+    #[test]
+    fn cramped_padding_reads_a_photo_laid_under_the_fill() {
+        let page = |photo: bool| -> (FakeDom, ElId) {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            d.set_style(body, "backgroundColor", "rgb(255, 255, 255)");
+            let frame = d.add(Some(body), "div");
+            d.set_rect(frame, 2.0, 100.0, 386.0, 500.0);
+            let layer = d.add(Some(frame), "div");
+            d.set_styles(layer, &[("position", "absolute"), ("backgroundColor", "rgba(0, 0, 0, 0)")]);
+            d.set_rect(layer, 12.0, 110.0, 366.0, 480.0);
+            let picture = d.add(Some(layer), "picture");
+            d.set_style(picture, "display", "inline");
+            d.set_rect(picture, 12.0, 574.0, 366.0, 21.0);
+            let img = d.add(Some(picture), "img");
+            d.set_style(img, "display", "inline");
+            if photo {
+                d.set_rect(img, 12.0, 110.0, 366.0, 480.0);
+            } else {
+                d.set_rect(img, 12.0, 110.0, 366.0, 120.0);
+            }
+            let content = d.add(Some(frame), "div");
+            d.set_rect(content, 12.0, 100.0, 366.0, 500.0);
+            let card = d.add(Some(content), "div");
+            d.set_attr(card, "class", "teaser");
+            d.set_rect(card, 71.0, 374.0, 248.0, 196.0);
+            d.set_styles(card, &[("display", "block"), ("position", "static"), ("backgroundColor", "rgb(226, 0, 116)")]);
+            let h = text_el(&mut d, card, "h2", "Das ultimative Upgrade.", "32px");
+            d.set_styles(h, &[("paddingLeft", "0px")]);
+            d.set_rect(h, 71.0, 374.0, 224.0, 64.0);
+            d.set_text_rect(h, 71.0, 374.0, 189.0, 64.0);
+            (d, card)
+        };
+        let (d, card) = page(true);
+        assert!(cramped(&d, card).is_empty(), "{:?}", cramped(&d, card));
+        let (d, card) = page(false);
+        assert_eq!(cramped(&d, card), vec!["<div> \"teaser\": children flush against bg on top/left (no inset)"]);
+        // A photo that paints nothing is no backdrop.
+        let (mut d, card) = page(true);
+        let img = d.query_all(None, "img").unwrap()[0];
+        d.set_style(img, "opacity", "0");
+        assert_eq!(cramped(&d, card), vec!["<div> \"teaser\": children flush against bg on top/left (no inset)"]);
+        // Drawn content is not a photo: a panel on a map canvas keeps its
+        // edge.
+        let (mut d, card) = page(true);
+        let img = d.query_all(None, "img").unwrap()[0];
+        d.els[img as usize].tag = "CANVAS".to_string();
+        assert_eq!(cramped(&d, card), vec!["<div> \"teaser\": children flush against bg on top/left (no inset)"]);
+    }
+
+    /// observations-42 row 5, maritime.sh: a 16px mock URL bar holds 10px
+    /// text 3px off its edges. A small chip's glyphs need a quarter of their
+    /// font size, which is 4px only for 16px text.
+    #[test]
+    fn cramped_padding_scales_a_small_chips_air_with_its_text() {
+        let mut d = FakeDom::new();
+        let (bar, label) = chip(&mut d, 16.0, "10px", "15px", (0.5, 15.0));
+        d.set_style(bar, "paddingTop", "0px");
+        d.set_style(bar, "paddingBottom", "0px");
+        d.set_text_rect(label, 628.0, 102.5, 41.0, 11.0);
+        assert!(cramped(&d, bar).is_empty(), "{:?}", cramped(&d, bar));
+        // 1px off is under a quarter of 10px.
+        d.set_text_rect(label, 628.0, 100.5, 41.0, 11.0);
+        assert_eq!(cramped(&d, bar), vec!["<div> \"faq-content__step\": children flush against bg on top (no inset)"]);
+    }
+
+    /// observations-42 row 6, fanniemae.com: a section title set at 28px in
+    /// a generic `div` is display text, not body copy at the screen's edge.
+    #[test]
+    fn a_generic_block_at_display_size_is_not_prose() {
+        let edge = |font: &str| {
+            let mut d = FakeDom::new();
+            d.inner_width = 390.0;
+            let (_h, body) = d.with_page();
+            let title = text_el(&mut d, body, "div", "Our mission is to make housing work for everyone.", font);
+            d.set_styles(title, &[("display", "block"), ("lineHeight", "36px")]);
+            d.set_rect(title, 10.0, 100.0, 370.0, 72.0);
+            d.set_text_lines(title, &[(10.0, 102.0, 300.0, 32.0), (10.0, 138.0, 120.0, 32.0)]);
+            snippets(&d, title, "body-text-viewport-edge")
+        };
+        assert_eq!(edge("18px").len(), 1, "body copy in a div");
+        assert!(edge("28px").is_empty(), "{:?}", edge("28px"));
+    }
+
     #[test]
     fn glyph_band_centres_the_em_box_on_each_line() {
         let mut d = FakeDom::new();
@@ -4427,24 +4917,57 @@ mod tests {
         d.els[up as usize].direct_text_rect = Some(Rect::from_xywh(40.0, 160.0, 260.0, 18.0));
         assert!(check_element_quality_dom(&d, up, &BrowserConfig::default()).is_empty());
 
-        // Typed capitals over two lines are no longer a label.
+        // Typed capitals take the exemption `text-transform` does, over two
+        // lines (mialight.app's caption wrapping on a phone) and past the
+        // label length alike, short of a sentence.
         d.set_rect(s, 40.0, 100.0, 140.0, 36.0);
         d.els[s as usize].direct_text_rect = Some(Rect::from_xywh(40.0, 100.0, 140.0, 36.0));
-        let hits = check_element_quality_dom(&d, s, &BrowserConfig::default());
-        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
-        assert_eq!(ids, vec!["wide-tracking"], "{hits:?}");
-
-        // Past the label length, one line or not, it is running text.
+        assert!(check_element_quality_dom(&d, s, &BrowserConfig::default()).is_empty());
         let long = text_el(
             &mut d,
             body,
             "p",
-            "SUPPORT HOURS RUN MONDAY TO FRIDAY FROM NINE UNTIL SIX",
+            "NOW AVAILABLE IN THE US, CANADA & NEW ZEALAND AND AUSTRALIA",
             "16px",
         );
-        d.set_rect(long, 40.0, 200.0, 600.0, 26.0);
+        d.set_rect(long, 40.0, 240.0, 300.0, 52.0);
         d.set_styles(long, &[("lineHeight", "26px"), ("letterSpacing", "2px")]);
-        d.els[long as usize].direct_text_rect = Some(Rect::from_xywh(40.0, 200.0, 600.0, 26.0));
+        d.els[long as usize].direct_text_rect = Some(Rect::from_xywh(40.0, 240.0, 300.0, 52.0));
+        assert!(check_element_quality_dom(&d, long, &BrowserConfig::default()).is_empty());
+
+        // A sentence typed in capitals is running text, and so are capitals a
+        // transform lowers.
+        let sentence = text_el(
+            &mut d,
+            body,
+            "p",
+            "SUPPORT HOURS RUN MONDAY TO FRIDAY, FROM NINE IN THE MORNING UNTIL SIX IN THE EVENING",
+            "16px",
+        );
+        d.set_rect(sentence, 40.0, 400.0, 600.0, 52.0);
+        d.set_styles(sentence, &[("lineHeight", "26px"), ("letterSpacing", "2px")]);
+        d.els[sentence as usize].direct_text_rect = Some(Rect::from_xywh(40.0, 400.0, 600.0, 52.0));
+        let ids: Vec<String> =
+            check_element_quality_dom(&d, sentence, &BrowserConfig::default()).into_iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec!["wide-tracking"]);
+        d.set_style(s, "textTransform", "lowercase");
+        let ids: Vec<String> =
+            check_element_quality_dom(&d, s, &BrowserConfig::default()).into_iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec!["wide-tracking"]);
+        d.set_style(s, "textTransform", "none");
+
+        // A long line of Hangul with one Latin acronym in capitals is running
+        // text: the short-label reading needs one line inside the label length.
+        let long = text_el(
+            &mut d,
+            body,
+            "p",
+            "고객센터 운영 시간은 월요일부터 금요일까지 오전 아홉 시부터 오후 여섯 시까지입니다 (KST)",
+            "16px",
+        );
+        d.set_rect(long, 40.0, 300.0, 600.0, 52.0);
+        d.set_styles(long, &[("lineHeight", "26px"), ("letterSpacing", "2px")]);
+        d.els[long as usize].direct_text_rect = Some(Rect::from_xywh(40.0, 300.0, 600.0, 52.0));
         let hits = check_element_quality_dom(&d, long, &BrowserConfig::default());
         let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
         assert_eq!(ids, vec!["wide-tracking"], "{hits:?}");

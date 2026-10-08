@@ -1929,6 +1929,72 @@ re!(
 re!(CURVE_CMD_RE, "[CSQTAcsqta]".to_string());
 re!(SIGNED_NUM_RE, r"-?[0-9.]+".to_string());
 
+/// Split `s` at `sep` where it sits outside parentheses, stopping at the
+/// parenthesis that closes the enclosing function. Empty parts are dropped.
+pub(crate) fn split_top_level(s: &str, is_sep: impl Fn(char) -> bool) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    parts.push(&s[start..i]);
+                    return parts.into_iter().map(js::trim).filter(|p| !p.is_empty()).collect();
+                }
+            }
+            _ if depth == 0 && is_sep(c) => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts.into_iter().map(js::trim).filter(|p| !p.is_empty()).collect()
+}
+
+/// One polygon coordinate as a comparable key: whitespace dropped, and a
+/// zero in any unit read as `0`.
+fn polygon_coordinate_key(token: &str) -> String {
+    let key: String = token.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+    let unit_start = key.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+'));
+    let number = &key[..unit_start.unwrap_or(key.len())];
+    if !number.is_empty() && number.parse::<f64>().is_ok_and(|v| v == 0.0) {
+        return "0".to_string();
+    }
+    key
+}
+
+/// Whether a `polygon()` body draws only horizontal and vertical edges: each
+/// vertex shares its x or its y with the next, the last with the first. A
+/// stair-stepped pixel corner (`4px 0%, calc(100% - 4px) 0%, calc(100% -
+/// 4px) 4px, ...`) is a notched rectangle however many vertices it takes,
+/// not an organic contour. A vertex that does not read as two coordinates
+/// (a fill rule, a value the split cannot pair) answers no.
+fn polygon_is_rectilinear(body: &str) -> bool {
+    let mut vertices: Vec<(String, String)> = Vec::new();
+    for (i, point) in split_top_level(body, |c| c == ',').into_iter().enumerate() {
+        let coords = split_top_level(point, char::is_whitespace);
+        if i == 0 && coords.len() == 1 && matches!(js::to_lower_case(coords[0]).as_str(), "nonzero" | "evenodd") {
+            continue;
+        }
+        let [x, y] = coords.as_slice() else {
+            return false;
+        };
+        vertices.push((polygon_coordinate_key(x), polygon_coordinate_key(y)));
+    }
+    if vertices.len() < 3 {
+        return false;
+    }
+    (0..vertices.len()).all(|i| {
+        let (a, b) = (&vertices[i], &vertices[(i + 1) % vertices.len()]);
+        a.0 == b.0 || a.1 == b.1
+    })
+}
+
 /// JS: checks.mjs#scanCssTextForOrganicClipPath
 pub fn scan_css_text_for_organic_clip_path(style_text: &str) -> Vec<PatternFinding> {
     let mut findings = Vec::new();
@@ -1973,6 +2039,9 @@ pub fn scan_css_text_for_organic_clip_path(style_text: &str) -> Vec<PatternFindi
             }
         }
         if off_grid < points.len() {
+            continue;
+        }
+        if polygon_is_rectilinear(body) {
             continue;
         }
         findings.push(PatternFinding {
@@ -2594,6 +2663,20 @@ mod tests {
 
     fn dark(c: &str) -> bool {
         css_text_has_dark_root_bg(c, &collect_css_custom_props(c))
+    }
+
+    /// overmindlab.ai: a stair-stepped pixel corner is a notched rectangle.
+    #[test]
+    fn rectilinear_polygons_are_geometric() {
+        let notch = ".px{clip-path:polygon(4px 0%, calc(100% - 4px) 0%, calc(100% - 4px) 4px, 100% 4px, 100% calc(100% - 4px), calc(100% - 4px) calc(100% - 4px), calc(100% - 4px) 100%, 4px 100%, 4px calc(100% - 4px), 0% calc(100% - 4px), 0% 4px, 4px 4px)}";
+        assert!(scan_css_text_for_organic_clip_path(notch).is_empty());
+        // A zero is a zero in any unit, and a fill rule leads the list.
+        assert!(polygon_is_rectilinear("evenodd, 0 0, 10px 0px, 10px 10px, 0% 10px)"));
+        // One diagonal edge, and a vertex that is not a pair, answer no.
+        assert!(!polygon_is_rectilinear("0 0, 10px 0, 10px 10px, 5px 12px, 0 10px)"));
+        assert!(!polygon_is_rectilinear("0 0, 10px, 10px 10px, 0 10px)"));
+        let blob = ".b{clip-path:polygon(50% 0%, 61% 8%, 74% 6%, 82% 16%, 94% 22%, 96% 36%, 100% 50%, 92% 63%, 88% 78%, 74% 88%, 60% 100%, 46% 96%)}";
+        assert_eq!(scan_css_text_for_organic_clip_path(blob).len(), 1);
     }
 
     #[test]

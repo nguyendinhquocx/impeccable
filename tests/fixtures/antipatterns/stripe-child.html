@@ -58,6 +58,15 @@
     /* PASS: wide first child */
     .card-wide { display: flex; width: 320px; height: 100px; border: 1px solid #e2e8f0; border-radius: 12px; }
     .stripe-wide { width: 40px; background: #f59e0b; }
+
+    /* PASS: square host. The stripe is the card tell only on a card rounded
+       away from it (r6-t2), the gate the border form applies. */
+    .card-square { display: flex; flex-direction: row; width: 320px; height: 100px; border: 1px solid #e2e8f0; border-radius: 0; }
+    .stripe-square { width: 4px; background: #f59e0b; flex-shrink: 0; }
+
+    /* PASS: a bar inside a heading, beside its text, marks the heading. */
+    .heading-marker { display: inline-flex; align-items: stretch; width: 320px; height: 28px; margin: 0; border-radius: 12px; font-size: 20px; }
+    .stripe-heading { width: 4px; min-height: 24px; margin-right: 8px; background: #16a34a; border-radius: 12px; }
   </style>
 </head>
 <body>
@@ -114,6 +123,14 @@
       <div class="case">
         <h3>Wide forty pixel child</h3>
         <div class="card-wide"><div class="stripe-wide"></div><div class="body">Card body</div></div>
+      </div>
+      <div class="case">
+        <h3>Square host stripe</h3>
+        <div class="card-square"><div class="stripe-square"></div><div class="body">Card body</div></div>
+      </div>
+      <div class="case">
+        <h3>Marker inside heading</h3>
+        <h2 class="heading-marker"><span class="stripe-heading"></span><span>Olho no lance</span></h2>
       </div>
     </div>
   </div>

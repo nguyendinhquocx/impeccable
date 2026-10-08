@@ -257,7 +257,7 @@ fn the_rule_pass_skips_what_is_not_painted() {
         ("undersized-ui-text", "#flag-sr-twin-copy"),
         ("low-contrast", "#flag-sr-twin-copy"),
         ("tight-leading", "#flag-open-copy"),
-        ("layout-transition", "#flag-open-tray"),
+        ("bounce-easing", "#flag-open-tray"),
         ("clipped-overflow-container", "#flag-clip-menu-host"),
         // A fixed layer is clipped by a host that is its containing block.
         ("clipped-overflow-container", "#flag-clip-fixed-cb-host"),
@@ -274,9 +274,9 @@ fn the_rule_pass_skips_what_is_not_painted() {
         // A paragraph with no height that hides its overflow.
         ("tight-leading", "#pass-collapsed-copy"),
         // Motion on boxes that paint nothing.
-        ("layout-transition", "#pass-collapsed-tray"),
-        ("layout-transition", "#pass-hidden-volume"),
-        ("layout-transition", "#pass-parked-seek-bar"),
+        ("bounce-easing", "#pass-collapsed-tray"),
+        ("bounce-easing", "#pass-hidden-volume"),
+        ("bounce-easing", "#pass-parked-seek-bar"),
         // A menu that never renders, and a fixed layer the host cannot clip.
         ("clipped-overflow-container", "#pass-clip-hidden-menu-host"),
         ("clipped-overflow-container", "#pass-clip-fixed-host"),
@@ -456,4 +456,87 @@ fn evidence_measures_the_element_the_scan_flagged_when_an_id_repeats() {
         }
     }
     assert!(hi.saturating_sub(lo) > 20, "the flagged copy is blank at its rect");
+}
+
+/// round 9: the evidence step measures the element the scan flagged, marks
+/// one that left the page (at once, or while it was away) as transient, measures one that moved a viewport
+/// width away again and records it if it stays away, and anchors a page-level
+/// halo declared through `var()` on the element that paints it.
+#[test]
+fn evidence_follows_the_scanned_element_after_the_page_changes() {
+    let Some(engine) = engine() else { return };
+    let port = serve();
+    let mut browser = engine.launch().expect("launch");
+    let url = format!("http://127.0.0.1:{port}/evidence-after-scan.html");
+    let (findings, evidence) = detect_url_evidence(
+        &mut browser,
+        &url,
+        &ScanOptions::default(),
+        "load",
+        100,
+        &EvidenceRequest::default(),
+    )
+    .expect("evidence scan");
+    browser.close();
+    let selector = |class: &str| -> String {
+        findings
+            .iter()
+            .filter(|f| f.antipattern == "low-contrast")
+            .filter_map(|f| f.extras.get("selector").and_then(|v| v.as_str()))
+            .find(|s| s.contains(class))
+            .unwrap_or_else(|| panic!("{class} not flagged: {findings:#?}"))
+            .to_string()
+    };
+    let rect = |s: &str| -> Vec<f64> {
+        evidence.element_rects[s].as_array().unwrap().iter().filter_map(|n| n.as_f64()).collect()
+    };
+
+    // The paragraph the scan flagged, not the one the class moved to.
+    let typing = selector("typing-note");
+    assert_eq!(
+        evidence.element_details[&typing]["text"].as_str(),
+        Some("Faint note the scan flagged, first of two.")
+    );
+
+    // Gone: transient, with no rect.
+    let toast = selector("toast-note");
+    assert!(evidence.element_rects.get(&toast).is_none());
+
+    // Away at the first measure and gone by a later one: transient too, and
+    // the rect and details of the first measure do not outlive it.
+    let vanish = selector("vanish-note");
+    assert_eq!(evidence.transient, vec![toast.clone(), vanish.clone()]);
+    assert!(evidence.element_rects.get(&vanish).is_none());
+    assert!(evidence.element_details.get(&vanish).is_none());
+    assert!(evidence.element_drift.get(&vanish).is_none());
+
+    // Away for good: the measured rect stands and the drift is recorded.
+    let slide = selector("slide-note");
+    assert!(rect(&slide)[0] < -2000.0, "{:?}", rect(&slide));
+    let drift = &evidence.element_drift[&slide];
+    assert!(drift["scan"][0].as_f64().unwrap() > 0.0, "{drift}");
+    assert!(drift["measured"][0].as_f64().unwrap() < -2000.0, "{drift}");
+
+    // Away and back: measured again where the scan had it.
+    let bounce = selector("bounce-note");
+    assert!(rect(&bounce)[0] >= 0.0, "{:?}", rect(&bounce));
+    assert!(evidence.element_drift.get(&bounce).is_none());
+    assert_eq!(evidence.element_drift.len(), 1, "{:?}", evidence.element_drift);
+
+    // The halo is reported on the page, and anchored on the orb.
+    assert_eq!(evidence.page_anchors.len(), findings.len());
+    let halo = findings
+        .iter()
+        .position(|f| f.antipattern == "radial-halo")
+        .unwrap_or_else(|| panic!("no radial-halo: {findings:#?}"));
+    assert_eq!(findings[halo].extras.get("selector").and_then(|v| v.as_str()), Some("body"));
+    let anchor = &evidence.page_anchors[halo];
+    assert_eq!(anchor["class"].as_str(), Some("orb"), "{anchor}");
+    let r: Vec<f64> = anchor["rect"].as_array().unwrap().iter().filter_map(|n| n.as_f64()).collect();
+    assert_eq!(r, vec![700.0, 300.0, 400.0, 400.0]);
+    for (f, a) in findings.iter().zip(&evidence.page_anchors) {
+        if f.antipattern != "radial-halo" {
+            assert!(a.is_null(), "{f:?}: {a}");
+        }
+    }
 }

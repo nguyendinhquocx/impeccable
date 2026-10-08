@@ -106,6 +106,13 @@ pub trait Dom {
     /// when no sheet declares it. Mirrors `keyframesToggleVisibilityDOM`'s
     /// walk order.
     fn keyframes(&self, name: &str) -> Option<Vec<KeyframeFrame>>;
+    /// The selector of each frame [`Dom::keyframes`] returns for `name`, in
+    /// the same order (`"0%, 35%"`, `"to"`): which offsets each frame sets.
+    /// `None` where the probe did not record them (a recording made before
+    /// it did, the in-page probe), and a caller then knows no offsets.
+    fn keyframe_keys(&self, _name: &str) -> Option<Vec<String>> {
+        None
+    }
     /// `document.documentElement.cloneNode(true)` with every
     /// `[id^="impeccable-live-"]` node removed, serialized as `outerHTML`.
     fn document_html_for_patterns(&self) -> String;
@@ -243,6 +250,41 @@ pub trait Dom {
     /// recording made before the probe existed, a DOM with no page behind it.
     /// A caller treats `None` as the base answer, hidden.
     fn shown_when_scrolled_to(&self, _el: ElId) -> Option<bool> {
+        None
+    }
+
+    // ── image load state ──────────────────────────────────────────────
+    //
+    // What tells a loaded `<img>` from one whose source failed, read
+    // together: no one of them is a load status on its own. All three
+    // answer `None` for anything that is not an `HTMLImageElement` (an
+    // `input type=image` and an SVG `<image>` have no `naturalWidth` or
+    // `complete` on their interfaces) and from a probe that cannot say. The
+    // `loading` attribute is [`Dom::attr`]`(el, "loading")`.
+    /// `(img.naturalWidth, img.naturalHeight)`: the image's own size in CSS
+    /// pixels, known as soon as the browser has read the image's dimensions,
+    /// which can be before the fetch has finished. `(0, 0)` while it has
+    /// none: not requested yet, nothing received yet, or failed. The size
+    /// alone does not say which; [`Dom::image_complete`] says whether the
+    /// browser is still waiting.
+    fn image_natural_size(&self, _el: ElId) -> Option<(f64, f64)> {
+        None
+    }
+    /// `img.complete`: the browser is not waiting on a fetch for this image.
+    /// It reports that the request is over, not that an image came of it:
+    /// true once the image is fully available, true once the fetch failed,
+    /// and true with no source at all; false while a fetch is pending, which
+    /// includes a `loading=lazy` image the browser has not requested yet.
+    /// A failed image is the one that is complete with a selected source
+    /// ([`Dom::image_current_src`]) and a natural size of 0. `None` where the
+    /// probe did not read it (a snapshot recorded before the capture did).
+    fn image_complete(&self, _el: ElId) -> Option<bool> {
+        None
+    }
+    /// `img.currentSrc`: the absolute URL the browser selected from `src`,
+    /// `srcset` and the `<source>`s of an enclosing `<picture>`. Empty when
+    /// it has selected none.
+    fn image_current_src(&self, _el: ElId) -> Option<String> {
         None
     }
 
@@ -587,5 +629,14 @@ mod tests {
     fn a_light_tree_probe_records_no_shadow_trees() {
         assert!(!LightTreeOnly.shadow_trees_recorded());
         assert_eq!(LightTreeOnly.flat_parent(3), None);
+    }
+
+    /// A probe written before the image load state existed answers
+    /// "unknown" for all of it, which a caller must not read as "failed".
+    #[test]
+    fn a_probe_without_image_state_answers_unknown() {
+        assert_eq!(LightTreeOnly.image_natural_size(3), None);
+        assert_eq!(LightTreeOnly.image_complete(3), None);
+        assert_eq!(LightTreeOnly.image_current_src(3), None);
     }
 }

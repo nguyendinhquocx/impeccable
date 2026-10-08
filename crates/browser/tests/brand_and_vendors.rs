@@ -246,12 +246,12 @@ fn widget_vendor_findings_name_the_vendor_and_keep_their_severity() {
     assert_eq!(third_party(own), None);
     assert_eq!(own.snippet, "10px functional text \"Learn More\" (below 11px floor)");
 
-    let transitions = of(&findings, "layout-transition");
-    let slide = transitions.iter().find(|f| selector(f).contains("swiper-slide")).expect("Swiper slide");
+    let easings = of(&findings, "bounce-easing");
+    let slide = easings.iter().find(|f| selector(f).contains("swiper-slide")).expect("Swiper slide");
     assert_eq!(third_party(slide), Some("Swiper"));
-    assert_eq!(slide.snippet, "transition: height (third-party: Swiper)");
-    assert_eq!(slide.severity, "advisory", "layout-transition is advisory already");
-    let copy = transitions.iter().find(|f| selector(f).contains("slide-copy")).expect("site copy in a slide");
+    assert_eq!(slide.snippet, "cubic-bezier(0.34, 1.56, 0.64, 1) (third-party: Swiper)");
+    assert_eq!(slide.severity, "advisory", "bounce-easing is advisory already");
+    let copy = easings.iter().find(|f| selector(f).contains("slide-copy")).expect("site copy in a slide");
     assert_eq!(third_party(copy), None);
 }
 

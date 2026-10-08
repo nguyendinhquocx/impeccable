@@ -8,7 +8,9 @@
 //!   `tiny-text` and `tight-leading` as advisory; a consent label fails.
 //! - r5-p26 (`mockup-structure.html`): text in a framed HTML demo read from
 //!   structure reports `undersized-ui-text`, `tiny-text` and `low-contrast`
-//!   as advisory.
+//!   as advisory. r8-t1 adds a frame named by a sample caption on it or
+//!   beside it, and r8-t2 reports `text-occlusion` as advisory inside any
+//!   recognised mockup.
 //! - r6-t3 (`nested-cards-mockups.html`): an inner card in a framed demo or
 //!   under `role="img"` reports `nested-cards` as advisory; bordered cards in
 //!   a bordered panel (paseo.sh) and under a mockup class keep failing.
@@ -163,7 +165,18 @@ fn fine_print_is_advisory_under_three_rules() {
 fn text_in_a_framed_demo_is_advisory() {
     let Some(f) = scan("mockup-structure.html") else { return };
     let rule = "undersized-ui-text";
-    for class in ["adv-dots", "adv-captioned", "adv-scaled", "adv-tilted"] {
+    for class in [
+        "adv-dots",
+        "adv-captioned",
+        "adv-scaled",
+        "adv-tilted",
+        "adv-turned",
+        "adv-wrapper",
+        // r8-t1: a sample caption on the panel or beside it.
+        "adv-pill",
+        "adv-footnote",
+        "adv-beside",
+    ] {
         let hits: Vec<&str> = f
             .iter()
             .filter(|r| r.0 == rule && r.2.split(['.', ' ', '>']).any(|p| p == class))
@@ -182,9 +195,22 @@ fn text_in_a_framed_demo_is_advisory() {
         "fail-scale-90",
         "fail-slide",
         "fail-flipped",
+        "fail-polaroid",
+        "fail-slight-turn",
+        "fail-wrapper-plain",
+        "fail-wrapper-small",
+        "fail-prose-example",
+        "fail-sample-rate",
+        "fail-sample-unframed",
+        "fail-sample-button",
+        "fail-sample-says",
     ] {
         assert_eq!(on(&f, rule, class), ["warning"], "{class}: {f:#?}");
     }
+    // r8-t2: text covered inside a mockup is advisory; covered page text
+    // keeps failing.
+    assert_eq!(on(&f, "text-occlusion", "adv-covered"), ["advisory"], "{f:#?}");
+    assert_eq!(on(&f, "text-occlusion", "fail-covered-page"), ["warning"], "{f:#?}");
     assert_eq!(on(&f, "tiny-text", "adv-dots-run"), ["advisory"], "{f:#?}");
     assert_eq!(on(&f, "tiny-text", "fail-sentence"), ["warning"], "{f:#?}");
     assert_eq!(on(&f, "low-contrast", "adv-dots-dim"), ["advisory"], "{f:#?}");
@@ -194,10 +220,25 @@ fn text_in_a_framed_demo_is_advisory() {
 fn nested_cards_in_a_mockup_are_advisory() {
     let Some(f) = scan("nested-cards-mockups.html") else { return };
     let rule = "nested-cards";
-    for id in ["#adv-window-inner", "#adv-tilted-inner", "#adv-window-itself", "#adv-picture-inner"] {
+    for id in [
+        "#adv-window-inner",
+        "#adv-tilted-inner",
+        "#adv-window-itself",
+        "#adv-scaled-window",
+        "#adv-captioned-panel",
+        "#adv-picture-inner",
+    ] {
         assert_eq!(on(&f, rule, id), ["advisory"], "{id}: {f:#?}");
     }
-    for id in ["#fail-panel-a", "#fail-panel-b", "#fail-panel-c", "#fail-two-dots-inner", "#fail-marked-inner"] {
+    for id in [
+        "#fail-panel-a",
+        "#fail-panel-b",
+        "#fail-panel-c",
+        "#fail-two-dots-inner",
+        "#fail-fanned-inner",
+        "#fail-prose-panel",
+        "#fail-marked-inner",
+    ] {
         assert_eq!(on(&f, rule, id), ["warning"], "{id}: {f:#?}");
     }
 }

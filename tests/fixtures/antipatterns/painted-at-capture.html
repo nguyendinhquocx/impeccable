@@ -12,7 +12,7 @@
        same measurement as its should-flag twin; only its paint differs.
 
        Covered here: tight-leading, undersized-ui-text, low-contrast,
-       buried-raster, layout-transition. The gate also covers the other text
+       buried-raster, bounce-easing. The gate also covers the other text
        measurements (see PAINT_GATED_TEXT_RULES). The same predicate runs
        inside clipped-overflow-container (on the positioned child it names)
        and nested-cards (on the inner card), which also skips popup layers
@@ -108,11 +108,13 @@
     /* A paragraph collapsed to no height that hides its overflow. */
     .collapsed-copy { height: 0; overflow: hidden; }
 
-    /* A tray that animates max-height, open and collapsed. */
-    .tray { width: 400px; max-height: 0; overflow: hidden; transition: max-height 0.3s ease; }
+    /* A tray that springs open, open and collapsed. The box rule read off
+       it is bounce-easing; it was layout-transition until that rule was
+       retired. */
+    .tray { width: 400px; max-height: 0; overflow: hidden; transition: max-height 0.3s cubic-bezier(0.34, 1.56, 0.64, 1); }
     .tray.open { max-height: 200px; }
-    .volume-panel { width: 40px; height: 30px; transition: width 0.2s ease; }
-    .seek-bar { width: 140px; height: 2px; background: #ccc; transition: height 0.2s ease; }
+    .volume-panel { width: 40px; height: 30px; transition: width 0.2s cubic-bezier(0.34, 1.56, 0.64, 1); }
+    .seek-bar { width: 140px; height: 2px; background: #ccc; transition: height 0.2s cubic-bezier(0.34, 1.56, 0.64, 1); }
 
     /* A clipping host with a positioned menu under it. */
     .clip-host { position: relative; width: 300px; height: 40px; overflow: hidden; margin-bottom: 120px; }

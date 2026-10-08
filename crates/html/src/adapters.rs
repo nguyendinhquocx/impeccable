@@ -28,7 +28,8 @@ use impeccable_core::checks::rules::{
     check_borders, check_colors_deduped_shaped, check_glow, check_hero_eyebrow, check_hover_contrast,
     check_icon_tile, check_italic_serif, check_kicker_above_heading, check_motion,
     check_placeholder_colors, check_stripe_child, is_close_letter_text, is_emoji_only_text,
-    is_glyph_only_text, is_heading_tag, is_icon_ligature_text, names_close_control,
+    is_glyph_only_text, is_heading_tag, is_icon_ligature_text, is_rounded_away_from_side,
+    names_close_control,
     resolve_hero_heading_size_px, BorderOpts, ColorOpts, GlowOpts, HeroEyebrowOpts,
     HoverContrastOpts, IconTileOpts, ItalicSerifOpts, KickerCandidate, MotionOpts, RuleHit,
     SafeTagTextSeen, Sides,
@@ -327,7 +328,16 @@ pub fn collect_numbered_section_label_candidates(
         if HEADING_TAGS.contains(&label.tag_lower().as_str()) {
             continue;
         }
-        if is_kicker_card_context(&heading, &label) {
+        if is_kicker_card_context(&heading, &label)
+            || label
+                .query_selector(impeccable_core::browser::text_collectors::NUMBERED_LABEL_MEDIA_SELECTOR)
+                .is_some()
+            || label.query_selector_all("svg").iter().any(|svg| {
+                svg.parent_element().is_some_and(|box_| {
+                    impeccable_core::browser::text_collectors::holds_number_text(&box_.direct_text())
+                })
+            })
+        {
             continue;
         }
         let label_text = {
@@ -860,7 +870,10 @@ pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -
     let Some(host) = el.parent_element() else {
         return Vec::new();
     };
-    if host.tag_lower() == "body" || host.tag_lower() == "html" {
+    if host.tag_lower() == "body"
+        || host.tag_lower() == "html"
+        || impeccable_core::browser::element_checks::is_stripe_heading_host(&host.tag_lower())
+    {
         return Vec::new();
     }
     if !el.children().is_empty() {
@@ -940,6 +953,14 @@ pub fn check_element_stripe_child(el: &StaticElement<'_>, style: &StyleValues) -
         }
     };
 
+    // Only on a host rounded away from the stripe (r6-t2), read the way the
+    // CSS-text stripe forms read their hosts.
+    if let Some(side) = edge.map(|e| if e == "left" { 3 } else { 1 }) {
+        let corners = resolve_side_accent_corners(&host, host_style, pf0(sv(host_style, "width")));
+        if !is_rounded_away_from_side(corners.as_ref(), side) {
+            return Vec::new();
+        }
+    }
     let bg_raw = sv(style, "backgroundColor");
     let bg = parse_rgb(Some(&bg_raw)).or_else(|| parse_any_color(Some(&bg_raw)));
     check_stripe_child(&class_selector(el), width, edge, bg)
@@ -1171,6 +1192,11 @@ pub fn check_element_colors(
             }
         }
     }
+    // A disabled control is faded on purpose: its colours are not a contrast
+    // verdict (WCAG 1.4.3 exempts inactive controls).
+    if el.closest(DISABLED_CONTROL_SELECTOR).is_some() {
+        findings.retain(|h| h.id != "low-contrast");
+    }
     findings
 }
 
@@ -1400,7 +1426,6 @@ pub fn check_element_motion(tag: &str, style: &StyleValues) -> Vec<RuleHit> {
     .collect();
     check_motion(&MotionOpts {
         tag: tag.to_string(),
-        transition_property: Some(sv(style, "transitionProperty").to_string()),
         animation_name: Some(sv(style, "animationName").to_string()),
         timing_functions: Some(timing.join(" ")),
         class_list: Some(String::new()),

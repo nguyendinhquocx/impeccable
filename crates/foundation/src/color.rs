@@ -377,8 +377,11 @@ pub fn lightness_saturation(c: &Rgba) -> (f64, f64) {
 /// ceiling, and 0.93 as lightness, which is where the eye puts it.
 pub fn is_gray_ink(c: &Rgba) -> bool {
     let (l, s) = lightness_saturation(c);
-    s < 0.2 && l > GRAY_INK_MIN_LIGHTNESS && l < 0.85
+    s < 0.2 && l > GRAY_INK_MIN_LIGHTNESS && l < GRAY_INK_MAX_LIGHTNESS
 }
+
+/// The lightness at and over which a neutral ink is near-white, not gray.
+pub const GRAY_INK_MAX_LIGHTNESS: f64 = 0.85;
 
 /// The lightness at and under which a neutral ink is near-black, not gray.
 ///

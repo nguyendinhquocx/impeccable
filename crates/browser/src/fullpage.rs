@@ -343,11 +343,21 @@ const RESTORE_JS: &str = r#"(({ scrollTop }) => {
   if (el) el.scrollTo({ left: el.scrollLeft, top: scrollTop, behavior: 'instant' });
 })"#;
 
-/// The element a flagged selector names. `identity` is `[n, count]` when the
-/// scan's capture matched the selector on `count` elements and flagged the
-/// `n`th (a repeated id): while the page still has `count` matches, the `n`th.
-/// Otherwise, and with no identity, `querySelector`'s answer.
-pub const RESOLVE_FLAGGED_JS: &str = r#"((selector, identity) => {
+/// The element a flagged selector names. `node` is the flagged element's id
+/// in the scan's capture, when the scan knows it: while that element is
+/// still in the document (the capture keeps it as `window.__impCap`), it is
+/// the answer, wherever the selector now points (a class a typing animation
+/// moved to the next span, a selector that matches a carousel's clones).
+/// Otherwise `identity` is `[n, count]` when the scan's capture matched the
+/// selector on `count` elements and flagged the `n`th (a repeated id): while
+/// the page still has `count` matches, the `n`th. Otherwise, and with neither,
+/// `querySelector`'s answer.
+pub const RESOLVE_FLAGGED_JS: &str = r#"((selector, identity, node) => {
+  if (typeof node === 'number' && node > 0) {
+    const cap = window.__impCap;
+    const el = cap && cap.elements ? cap.elements[node] : null;
+    if (el && el.isConnected) return el;
+  }
   if (Array.isArray(identity)) {
     const all = document.querySelectorAll(selector);
     if (all.length === identity[1]) return all[identity[0]] || null;
@@ -355,10 +365,10 @@ pub const RESOLVE_FLAGGED_JS: &str = r#"((selector, identity) => {
   return document.querySelector(selector);
 })"#;
 
-const ELEMENT_INTO_VIEW_JS: &str = r#"(async (resolve, { selector, identity, reuse, mayScroll }) => {
+const ELEMENT_INTO_VIEW_JS: &str = r#"(async (resolve, { selector, identity, node, reuse, mayScroll }) => {
   let el;
   try {
-    el = resolve(selector, identity);
+    el = resolve(selector, identity, node);
   } catch (e) {
     return null;
   }
@@ -728,13 +738,15 @@ pub fn needs_element_shot(rect: &[f64], origin_x: f64, shot_width: f64, shot_hei
 /// A viewport shot per flagged element past the screenshot, the element
 /// scrolled into view first. An element that stays clipped away gets none, and
 /// failures skip that element: the findings stand without the picture.
-/// `identities` names which match of a repeated selector the scan flagged
-/// ([`RESOLVE_FLAGGED_JS`]).
+/// `identities` names which match of a repeated selector the scan flagged,
+/// and `nodes` the flagged element itself (`selector: [id, x, y, width,
+/// height]`, its id in the scan's capture first; [`RESOLVE_FLAGGED_JS`]).
 #[allow(clippy::too_many_arguments)]
 pub fn capture_element_shots(
     page: &mut Page<'_>,
     rects: &Map<String, Value>,
     identities: &Map<String, Value>,
+    nodes: &Map<String, Value>,
     origin_x: f64,
     shot_width: f64,
     shot_height: f64,
@@ -759,6 +771,7 @@ pub fn capture_element_shots(
         let args = json!({
             "selector": selector,
             "identity": identities.get(selector).cloned().unwrap_or(Value::Null),
+            "node": nodes.get(selector).and_then(|n| n.get(0)).cloned().unwrap_or(Value::Null),
             "reuse": last.is_some(),
             "mayScroll": captures < MAX_ELEMENT_SHOTS,
         });

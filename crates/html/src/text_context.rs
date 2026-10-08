@@ -70,7 +70,7 @@ impl ContextNode for StaticNode<'_> {
     }
     fn style(&self, prop: &str) -> String {
         match prop {
-            "transform" | "scale" => inline_declaration(&self.0, prop),
+            "transform" | "scale" | "rotate" => inline_declaration(&self.0, prop),
             _ => sv(self.0.style(), prop).to_string(),
         }
     }

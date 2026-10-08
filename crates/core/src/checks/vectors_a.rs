@@ -323,7 +323,6 @@ pub fn call(module: &str, fn_name: &str, args: &[Value]) -> Option<Value> {
         "checkMotion" => {
             let opts = rules::MotionOpts {
                 tag: str_or_empty(f(0, "tag")),
-                transition_property: opt_str(f(0, "transitionProperty")),
                 animation_name: opt_str(f(0, "animationName")),
                 timing_functions: opt_str(f(0, "timingFunctions")),
                 class_list: opt_str(f(0, "classList")),

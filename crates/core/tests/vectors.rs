@@ -23,7 +23,13 @@ const MODULES: &[&str] = &["shared.color", "shared.inline-ignores", "rules.check
 /// `applyInlineIgnores` is handed findings as data and hands back whatever it
 /// was given, retired id or not, which is the behavior a config naming a
 /// retired rule depends on.
-const RETIRED_RULE_IDS: &[&str] = &["image-hover-transform"];
+///
+/// `layout-transition` was retired on 2026-10-07 (decision
+/// r8-t5-layout-transition-retire): advisory since the first review, and on
+/// two judged cohorts since then not one of its findings was harmful. Its
+/// hits sit in the `checkMotion`, `checkHtmlPatterns` and regex-matcher
+/// vectors beside `bounce-easing` hits, which still have to match.
+const RETIRED_RULE_IDS: &[&str] = &["image-hover-transform", "layout-transition"];
 
 /// Drops top-level findings carrying a retired rule id. Vectors name the rule
 /// `id` (pattern findings) or `antipattern` (findings); a result that is not a

@@ -49,10 +49,41 @@ fn mixed_case_label_still_flags() {
 }
 
 #[test]
-fn typed_capitals_past_label_length_still_flag() {
+fn typed_capitals_past_label_length_take_the_uppercase_exemption() {
+    // Capitals typed into the markup say what `text-transform` says, past
+    // the label length (mialight.app's caption that wraps on a phone).
     assert_eq!(
         tracking_hits(
             r#"<p class="run" style="letter-spacing: 0.12em">SUPPORT HOURS RUN MONDAY TO FRIDAY, FROM NINE UNTIL SIX.</p>"#
+        ),
+        0
+    );
+    // A sentence typed in capitals is still running text: `all-caps-body`
+    // reads only a declared transform, so this rule keeps it.
+    assert_eq!(
+        tracking_hits(
+            r#"<p class="run" style="letter-spacing: 0.12em">SUPPORT HOURS RUN MONDAY TO FRIDAY, FROM NINE IN THE MORNING UNTIL SIX IN THE EVENING.</p>"#
+        ),
+        1
+    );
+    // A transform that lowers the case renders no capitals.
+    assert_eq!(
+        tracking_hits(
+            r#"<p class="run" style="letter-spacing: 0.12em; text-transform: lowercase">SUPPORT HOURS RUN MONDAY TO FRIDAY.</p>"#
+        ),
+        1
+    );
+    // `capitalize` leaves capitals as they were typed.
+    assert_eq!(
+        tracking_hits(
+            r#"<p class="run" style="letter-spacing: 0.12em; text-transform: capitalize">SUPPORT HOURS RUN MONDAY TO FRIDAY.</p>"#
+        ),
+        0
+    );
+    // A long run with one Latin acronym among uncased letters is running text.
+    assert_eq!(
+        tracking_hits(
+            r#"<p class="run" style="letter-spacing: 0.12em">고객센터 운영 시간은 월요일부터 금요일까지 오전 아홉 시부터 오후 여섯 시까지입니다 (KST)</p>"#
         ),
         1
     );

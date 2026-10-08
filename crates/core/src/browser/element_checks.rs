@@ -436,7 +436,7 @@ pub fn check_element_stripe_child_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
         return Vec::new();
     };
     let host_tag = tag_lower(dom, host);
-    if host_tag == "body" || host_tag == "html" {
+    if host_tag == "body" || host_tag == "html" || is_stripe_heading_host(&host_tag) {
         return Vec::new();
     }
     if !dom.children(el).is_empty() {
@@ -470,9 +470,25 @@ pub fn check_element_stripe_child_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
     } else {
         None
     };
+    // The stripe is the card tell only on a card rounded away from it, the
+    // gate the border and pseudo-element forms apply (r6-t2): a bar beside
+    // a row on a square host is a marker, not a card's accent.
+    if let Some(side) = edge.map(|e| if e == "left" { 3 } else { 1 }) {
+        let corners = parse_radius_corners(Some(&dom.style(host, "borderRadius")), host_rect.width);
+        if !is_rounded_away_from_side(corners.as_ref(), side) {
+            return Vec::new();
+        }
+    }
     let width = child_rect.width;
     let bg = parse_rgb_or_any(&dom.style(el, "backgroundColor"));
     check_stripe_child(&class_selector(dom, el), width, edge, bg)
+}
+
+/// Whether a stripe child's host is a heading. A bar set inside an `h2`
+/// beside its text (lance.com.br's section titles) marks the heading; a
+/// heading is not a card.
+pub fn is_stripe_heading_host(host_tag: &str) -> bool {
+    matches!(host_tag, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
 }
 
 /// JS: checks.mjs#readPseudoSurfaceDOM(el, rect)
@@ -757,10 +773,17 @@ const REVEAL_WILL_CHANGE: &[&str] = &["opacity", "filter", "transform", "transla
 /// - its opacity is under [`REVEAL_OPACITY`] while it is moved or about to
 ///   be (a `transform` other than the identity, `translate`, `scale` or
 ///   `rotate` other than `none`, a `will-change` naming one of them): a box
-///   sliding in from 0.
+///   sliding in from 0;
+/// - it is parked below full opacity and displaced (a `transform` other than
+///   the identity, `translate`, `scale` or `rotate` other than `none`) while
+///   it declares an `opacity` transition: a scroll-told segment waiting at
+///   its start values (ascenix.co's `article.jseg` at `opacity: 0.28;
+///   transform: scale(0.982) translateY(18px)` with `transition: opacity
+///   0.5s, transform 0.5s`), or a receded carousel card. Both values are
+///   ones the box leaves when its state changes.
 ///
 /// A capture that could not read running animations (a recording made
-/// before it did) is at rest unless one of the other two holds. A box that
+/// before it did) is at rest unless one of the others holds. A box that
 /// is not at rest contributes no fade, which scores the colour as declared,
 /// and the boxes around it that are at rest still fade the ink.
 fn opacity_at_rest(dom: &dyn Dom, el: ElId, opacity: f64) -> bool {
@@ -773,12 +796,21 @@ fn opacity_at_rest(dom: &dyn Dom, el: ElId, opacity: f64) -> bool {
     if has_active_blur(&dom.style(el, "filter")) {
         return false;
     }
+    if crate::browser::painted::declares_transition_of(dom, el, "opacity") && visibly_displaced(dom, el) {
+        return false;
+    }
     opacity >= REVEAL_OPACITY || !is_moving(dom, el)
 }
 
 /// Whether the element or any ancestor is a faded box caught mid-reveal
-/// ([`opacity_at_rest`]). The pixel pass asks this before it reads a box: a
-/// frame of a reveal paints a contrast no visitor meets at rest.
+/// ([`opacity_at_rest`]), or a box running a loop that takes it out of
+/// sight every cycle ([`crate::browser::painted::loops_in_motion`]), which is
+/// at rest at no phase: ascenix.co's hero notes grow from `scale(0.22)` and
+/// fade in and out forever, and the screenshot the pixels come from is taken
+/// at another phase than the capture that read opacity 1. The pixel pass
+/// asks this before it reads a box: a frame of a reveal or a loop paints a
+/// contrast no visitor meets at rest. The element pass keeps its verdict on a
+/// loop, whose colours are the ones its visible phase shows.
 pub(crate) fn caught_mid_reveal(dom: &dyn Dom, el: ElId) -> bool {
     const MAX_ANCESTORS: usize = 64;
     let mut cur = Some(el);
@@ -786,6 +818,9 @@ pub(crate) fn caught_mid_reveal(dom: &dyn Dom, el: ElId) -> bool {
         let Some(c) = cur else { return false };
         let opacity = opacity_of(dom, c);
         if opacity < 0.999 && !opacity_at_rest(dom, c, opacity) {
+            return true;
+        }
+        if crate::browser::painted::loops_in_motion(dom, c) {
             return true;
         }
         cur = dom.parent(c);
@@ -1070,6 +1105,19 @@ fn svg_fill_is_current_colour(dom: &dyn Dom, el: ElId) -> bool {
 /// `none` or the identity matrix, `translate`, `scale` or `rotate` other
 /// than `none`, or a `will-change` naming one of them, `opacity` or `filter`.
 fn is_moving(dom: &dyn Dom, el: ElId) -> bool {
+    if is_displaced(dom, el) {
+        return true;
+    }
+    dom.style(el, "willChange")
+        .split(',')
+        .map(js::trim)
+        .any(|v| REVEAL_WILL_CHANGE.contains(&v))
+}
+
+/// A box that is moved from where it lays out: a `transform` other than
+/// `none` or the identity matrix, or `translate`, `scale` or `rotate` other
+/// than `none`.
+fn is_displaced(dom: &dyn Dom, el: ElId) -> bool {
     let transform = js::trim(&dom.style(el, "transform")).to_string();
     let identity = |t: &str| {
         let t = t.replace(' ', "");
@@ -1078,17 +1126,38 @@ fn is_moving(dom: &dyn Dom, el: ElId) -> bool {
     if !transform.is_empty() && transform != "none" && !identity(&transform) {
         return true;
     }
-    if ["translate", "scale", "rotate"].iter().any(|p| {
+    ["translate", "scale", "rotate"].iter().any(|p| {
         let v = dom.style(el, p);
         let v = js::trim(&v);
         !v.is_empty() && v != "none"
-    }) {
+    })
+}
+
+/// A box that [`is_displaced`] names and that is really moved: `translate:
+/// 0px`, `scale: 1` and `rotate: 0deg` move nothing, though they are not
+/// `none`.
+fn visibly_displaced(dom: &dyn Dom, el: ElId) -> bool {
+    let transform = js::trim(&dom.style(el, "transform")).replace(' ', "");
+    if !transform.is_empty() && transform != "none" && !is_identity_matrix(&transform) {
         return true;
     }
-    dom.style(el, "willChange")
-        .split(',')
-        .map(js::trim)
-        .any(|v| REVEAL_WILL_CHANGE.contains(&v))
+    let numbers = |v: &str| -> Vec<f64> { v.split_whitespace().map(parse_float).collect() };
+    let moved = |prop: &str, rest: f64| {
+        let v = dom.style(el, prop);
+        let v = js::trim(&v);
+        if v.is_empty() || v == "none" {
+            return false;
+        }
+        // An angle with an axis (`x 10deg`) or a value that does not read
+        // counts as moved.
+        numbers(v).iter().any(|n| !n.is_finite() || (n - rest).abs() > 1e-9)
+    };
+    moved("translate", 0.0) || moved("scale", 1.0) || moved("rotate", 0.0)
+}
+
+/// `matrix()` or `matrix3d()` of the identity, spaces removed.
+pub(crate) fn is_identity_matrix(t: &str) -> bool {
+    t == "matrix(1,0,0,1,0,0)" || t == "matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1)"
 }
 
 /// The ink a reader sees once the opacity of the boxes between the text and
@@ -1622,6 +1691,13 @@ pub fn check_element_colors_dom(
             }
         }
     }
+    // A disabled control is faded on purpose and asks nothing of the reader:
+    // its colours are not a contrast verdict (WCAG 1.4.3 exempts inactive
+    // controls). Its unfaded ink and fill were what got scored: lance.com.br's
+    // "Confirmar" sits at `disabled:opacity-50`.
+    if closest_or_none(dom, el, DISABLED_CONTROL_SELECTOR).is_some() {
+        findings.retain(|h| h.id != "low-contrast");
+    }
     findings
 }
 
@@ -1900,7 +1976,6 @@ pub fn check_element_motion_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> {
     let animation_name = dom.style(el, "animationName");
     let mut hits = check_motion(&MotionOpts {
         tag,
-        transition_property: Some(dom.style(el, "transitionProperty")),
         animation_name: Some(animation_name.clone()),
         timing_functions: Some(timing.join(" ")),
         class_list: Some(class_attr(dom, el)),
@@ -2260,7 +2335,9 @@ fn ai_palette_gradient_hit(
     let opacity = own_opacity(dom, el);
     let mut painted = 0usize;
     let mut in_band = 0usize;
+    let mut bridge = 0usize;
     let mut tell: Option<TellHue> = None;
+    let mut purple = false;
     for c in &stops {
         // A stop DESIGN.md declares was picked; it is not the default
         // palette and takes no part in the count.
@@ -2276,15 +2353,27 @@ fn ai_palette_gradient_hit(
         painted += 1;
         if let Some(band) = TellHue::of(c) {
             in_band += 1;
+            purple |= band == TellHue::Purple;
             if tell.is_none() {
                 tell = Some(band);
             }
+        } else if AI_PALETTE_BRIDGE_HUES.contains(&get_hue(Some(c))) {
+            bridge += 1;
         }
     }
     let tell = tell?;
     // One stop grazing a band edge inside an otherwise warm or brand ramp is
     // that ramp's accident, not a violet-to-cyan palette.
     if in_band * 2 < painted {
+        return None;
+    }
+    // Cyan collides with brand teals and greens, so a cyan ramp needs more
+    // than half its stops: one cyan stop beside one mint green is a tie, a
+    // teal-and-green brand wash (weborama.com's hero glow). A tie stands
+    // only where the other stops are the blues between the two bands, the
+    // stock blue-to-cyan ramp. A tie with a violet stop in it keeps the
+    // reading it had, whichever of its stops comes first.
+    if !purple && in_band * 2 == painted && bridge < painted - in_band {
         return None;
     }
     Some((
@@ -2405,6 +2494,10 @@ const AI_PALETTE_CYAN_HUES: std::ops::RangeInclusive<f64> = 170.0..=197.0;
 /// clears it.
 const AI_PALETTE_CYAN_MIN_SATURATION: f64 = 0.4;
 const AI_PALETTE_PURPLE_HUES: std::ops::RangeInclusive<f64> = 260.0..=310.0;
+
+/// The blues between the two bands, the middle of a stock violet-to-cyan
+/// ramp. A stop here is not a tell by itself; it keeps a cyan tie standing.
+const AI_PALETTE_BRIDGE_HUES: std::ops::Range<f64> = 197.0..260.0;
 
 impl TellHue {
     /// The band a hue falls in, `None` outside both. Hue alone: the
@@ -4078,6 +4171,32 @@ mod tests {
                 ("backgroundImage", "none"),
             ],
         );
+    }
+
+    /// observations-42 row 6, lance.com.br: a disabled "Confirmar" button,
+    /// faded to half opacity, was scored on its unfaded white-on-green.
+    #[test]
+    fn a_disabled_control_takes_no_contrast_verdict() {
+        let (mut d, body) = page();
+        let btn = d.add(Some(body), "button");
+        visible(&mut d, btn);
+        d.add_text(btn, "Confirmar");
+        d.set_rect(btn, 189.0, 3156.0, 283.0, 40.0);
+        d.set_text_rect(btn, 298.0, 3167.0, 65.0, 18.0);
+        d.set_styles(
+            btn,
+            &[
+                ("backgroundColor", "rgb(22, 163, 74)"),
+                ("color", "rgb(255, 255, 255)"),
+                ("fontSize", "14px"),
+                ("fontWeight", "400"),
+                ("webkitBackgroundClip", "border-box"),
+            ],
+        );
+        assert!(colors(&d, btn).iter().any(|h| h.id == "low-contrast"), "{:?}", colors(&d, btn));
+        d.set_attr(btn, "disabled", "");
+        d.add_selector(btn, "[disabled], [aria-disabled=\"true\"]");
+        assert!(colors(&d, btn).iter().all(|h| h.id != "low-contrast"), "{:?}", colors(&d, btn));
     }
 
     #[test]
@@ -6219,6 +6338,29 @@ mod tests {
             "linear-gradient(90deg, rgb(168, 85, 247), rgb(130, 255, 247))",
         );
         assert_eq!(palette_hits(&d, hero).len(), 1);
+    }
+
+    /// A tie (half the painted stops in band) falls only when every in-band
+    /// stop is cyan. With a violet stop in it the ramp reports whichever
+    /// stop comes first: cyan, violet, emerald, amber and its reverse.
+    #[test]
+    fn ai_palette_tie_with_a_violet_stop_reports_in_either_order() {
+        let (mut d, body) = page();
+        let forward = gradient_surface(
+            &mut d,
+            body,
+            "linear-gradient(90deg, rgb(6, 182, 212), rgb(124, 58, 237), rgb(16, 185, 129), rgb(245, 158, 11))",
+        );
+        assert_eq!(palette_hits(&d, forward).len(), 1, "cyan first");
+        let reverse = gradient_surface(
+            &mut d,
+            body,
+            "linear-gradient(90deg, rgb(245, 158, 11), rgb(16, 185, 129), rgb(124, 58, 237), rgb(6, 182, 212))",
+        );
+        assert_eq!(palette_hits(&d, reverse).len(), 1, "violet first");
+        // A cyan stop tied with a mint green one, and no violet: a brand wash.
+        let wash = gradient_surface(&mut d, body, "linear-gradient(90deg, rgb(6, 182, 212), rgb(16, 185, 129))");
+        assert!(palette_hits(&d, wash).is_empty(), "{:?}", palette_hits(&d, wash));
     }
 
     #[test]
@@ -8785,5 +8927,78 @@ mod tests {
             frames(&[&[("transform", "translateY(-25%)")], &[("transform", "none")]]),
         );
         assert_eq!(bounce(&d), vec!["animation: sk-bounceDelay".to_string()]);
+    }
+
+    /// ascenix.co (286361, 286363, 286575, 286577): a scroll-told segment
+    /// parked at `opacity: 0.28; transform: scale(0.982) translateY(18px)`
+    /// with `transition: opacity 0.5s, transform 0.5s`, waiting for its turn.
+    #[test]
+    fn a_displaced_box_that_transitions_opacity_is_not_at_rest() {
+        let parked = |d: &mut FakeDom, wrap: ElId| {
+            d.set_styles(
+                wrap,
+                &[
+                    ("opacity", "0.28"),
+                    ("transform", "matrix(0.982, 0, 0, 0.982, 0, 18)"),
+                    ("transitionProperty", "opacity, transform"),
+                    ("transitionDuration", "0.5s, 0.5s"),
+                ],
+            );
+        };
+        // The declared colour passes, so no fade means no finding; faded to
+        // 0.28 it would not.
+        let (mut d, wrap, word) = muted_text_in_wrapper("h3", "Behaviours", "rgb(10, 16, 21)");
+        parked(&mut d, wrap);
+        assert!(low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        assert!(super::caught_mid_reveal(&d, word));
+
+        // `all` covers opacity; a 0s duration does not.
+        d.set_styles(wrap, &[("transitionProperty", "all"), ("transitionDuration", "0.3s")]);
+        assert!(super::caught_mid_reveal(&d, word));
+        d.set_style(wrap, "transitionDuration", "0s");
+        assert!(!super::caught_mid_reveal(&d, word));
+
+        // A faded box that is not displaced, or one that names a transform
+        // only in `will-change`, sits at rest and still fades the ink.
+        parked(&mut d, wrap);
+        d.set_styles(wrap, &[("transform", "none"), ("willChange", "transform")]);
+        assert!(!super::caught_mid_reveal(&d, word));
+        assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        // `translate: 0px`, `scale: 1` and `rotate: 0deg` move nothing.
+        for (prop, value) in [("translate", "0px"), ("scale", "1"), ("rotate", "0deg")] {
+            parked(&mut d, wrap);
+            d.set_styles(wrap, &[("transform", "none"), (prop, value)]);
+            assert!(!super::caught_mid_reveal(&d, word), "{prop}: {value}");
+            d.set_style(wrap, prop, "none");
+        }
+        parked(&mut d, wrap);
+        d.set_styles(wrap, &[("transform", "none"), ("scale", "0.982")]);
+        assert!(super::caught_mid_reveal(&d, word));
+        d.set_style(wrap, "scale", "none");
+        // Displaced with no opacity transition: at rest too.
+        parked(&mut d, wrap);
+        d.set_styles(wrap, &[("transitionProperty", "transform"), ("transitionDuration", "0.5s")]);
+        assert!(!super::caught_mid_reveal(&d, word));
+        assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+    }
+
+    /// ascenix.co (286171 to 286173): a hero note caught at the opacity 1
+    /// phase of a loop that takes it to 0. The pixel pass does not read it;
+    /// the element pass keeps its verdict on the colours that phase shows.
+    #[test]
+    fn a_loop_through_nothing_is_caught_mid_reveal_at_full_opacity() {
+        let (mut d, wrap, word) = muted_text_in_wrapper("b", "Missed turn", "rgb(240, 68, 56)");
+        d.set_styles(wrap, &[("opacity", "1"), ("animationName", "orb-note"), ("animationIterationCount", "infinite")]);
+        d.keyframes.insert(
+            "orb-note".into(),
+            vec![
+                crate::browser::dom::KeyframeFrame { decls: vec![("opacity".into(), "0".into())] },
+                crate::browser::dom::KeyframeFrame { decls: vec![("opacity".into(), "1".into())] },
+            ],
+        );
+        assert!(!super::caught_mid_reveal(&d, word), "no running animations read");
+        d.set_running_animations(wrap, &["opacity", "transform"]);
+        assert!(super::caught_mid_reveal(&d, word));
+        assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
     }
 }

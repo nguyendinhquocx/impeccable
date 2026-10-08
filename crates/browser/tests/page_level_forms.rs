@@ -1,5 +1,5 @@
 //! The stylesheet-text forms of gradient-text, bounce-easing, dark-glow,
-//! radial-halo, layout-transition and marquee in the URL engine, against an
+//! radial-halo and marquee in the URL engine, against an
 //! installed browser. Skips cleanly when there is none.
 //!
 //! One declaration reports once. The element forms read computed styles off
@@ -22,7 +22,6 @@ const RULES: &[&str] = &[
     "bounce-easing",
     "dark-glow",
     "radial-halo",
-    "layout-transition",
     "marquee",
 ];
 
@@ -76,7 +75,7 @@ fn engine() -> Option<BrowserEngine> {
     Some(BrowserEngine::new(env))
 }
 
-/// `(rule, snippet)` for every finding of the six rules, sorted.
+/// `(rule, snippet)` for every finding of the five rules, sorted.
 fn scan(engine: &BrowserEngine, port: u16, fixture: &str) -> Vec<(String, String)> {
     let url = format!("http://127.0.0.1:{port}/{fixture}");
     let findings = engine.detect_url(&url, &ScanOptions::default()).expect("scan");
@@ -115,7 +114,6 @@ fn each_declaration_reports_once_where_it_paints() {
             ("gradient-text", "background-clip: text + gradient"),
             ("bounce-easing", "cubic-bezier(0.34, 1.56, 0.64, 1)"),
             ("dark-glow", "Zero-offset box-shadow glow (#f59e0b)"),
-            ("layout-transition", "transition: width"),
             (
                 "marquee",
                 ".ticker-track--original — infinite horizontal loop animation \"ticker-move\""

@@ -521,3 +521,29 @@ fn a_fixed_banner_a_transformed_ancestor_holds_is_showing() {
     browser.close();
     assert_eq!(evidence.consent.as_ref().expect("consent report").hidden, vec!["OneTrust"]);
 }
+
+/// Tealium's prompt (telekom.de) and Transcend's banner in a shadow root on a
+/// zero-size host (verizon.com) are hidden by their vendors' own ids.
+#[test]
+fn tealium_and_transcend_banners_are_hidden() {
+    let Some(engine) = engine() else { return };
+    let port = serve();
+    for (page, name) in [("tealium.html", "Tealium"), ("transcend.html", "Transcend")] {
+        let url = format!("http://127.0.0.1:{port}/{page}");
+        let scan = engine.detect_url_scan(&url, &ScanOptions::default()).expect("scan");
+        let found = flagged(&scan.findings);
+        assert!(has(&found, "low-contrast", "#covered-copy"), "{page}: {found:#?}");
+        assert!(has(&found, "low-contrast", "#covered-cta"), "{page}: {found:#?}");
+        for f in &scan.findings {
+            assert_eq!(f.extras.get("consentHidden"), Some(&serde_json::json!([name])), "{page}: {f:?}");
+        }
+        assert!(!has(&found, "low-contrast", "#utiqMessage"), "{page}: {found:#?}");
+        let kept = engine.detect_url_scan(&url, &KEEP).expect("scan");
+        assert!(kept.findings.iter().all(|f| f.extras.get("consentHidden").is_none()));
+        assert!(kept.notes.is_empty());
+        if page == "tealium.html" {
+            // Kept, the prompt's own faint text is scored as the page's.
+            assert!(has(&flagged(&kept.findings), "low-contrast", "#utiqMessage"), "{:#?}", kept.findings);
+        }
+    }
+}

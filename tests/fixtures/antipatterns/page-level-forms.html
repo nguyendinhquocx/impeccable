@@ -6,8 +6,8 @@
   <title>Page-Level Stylesheet Forms: Should Flag vs Should Pass</title>
   <style>
     /* Fixture for the stylesheet-text forms of gradient-text, bounce-easing,
-       dark-glow, radial-halo, layout-transition and marquee. The page's
-       painted root is light (#f8fafc).
+       dark-glow, radial-halo and marquee. The page's painted root is light
+       (#f8fafc).
 
        In the URL engine each declaration reports once: an element form that
        reads the declaration off an element speaks for it, and the page form
@@ -19,24 +19,22 @@
 
        Should flag, URL engine: the gradient heading once, on the heading;
        the overshooting button once, on the button; the amber CTA glow once,
-       on the CTA; the width transition of the painted "more" link, on body
-       (the motion check skips links, so the page form speaks for it); the
-       ticker strip once, its clone and its builder-specific rule block
-       folded in, its travel read through `calc()`.
+       on the CTA; the ticker strip once, its clone and its builder-specific
+       rule block folded in, its travel read through `calc()`.
 
        Should pass, URL engine: the overridden HUD glow, the token shadow,
-       the avatar glow at 15% alpha that lifts its card by 14, the
-       transitions of `border-width` and `line-height`, the collapsed
-       drawer, and the offset glow and halo declared beside a dark player
-       box on this light page.
+       the avatar glow at 15% alpha that lifts its card by 14, every
+       transition of a layout property (the layout-transition rule was
+       retired on 2026-10-07, so the painted link's width, the collapsed
+       drawer's height and the `border-width` and `line-height` lookalikes
+       are all quiet), and the offset glow and halo declared beside a dark
+       player box on this light page.
 
        The static HTML engine has no layout, no computed style of its own
        elements' pseudo-elements and no painted root, so it keeps its base
        behavior there: it reports the class and stylesheet duplicates, the
-       avatar glow, the drawer's transition, the three ticker rule blocks,
-       and the offset glow and halo "on dark page", decided from the player
-       box's `#000000`. It does not see the link's transition, since its
-       pattern pass leaves layout-transition to the element rules. The URL
+       avatar glow, the three ticker rule blocks, and the offset glow and
+       halo "on dark page", decided from the player box's `#000000`. The URL
        behavior is pinned by crates/browser/tests/page_level_forms.rs. */
     body { font: 16px/1.5 system-ui, sans-serif; margin: 0; color: #111111; background: #f8fafc; }
     .columns { display: grid; grid-template-columns: 600px 600px; gap: 40px; padding: 32px; }
@@ -69,7 +67,7 @@
     /* FLAG: overshooting easing on a button-like box. */
     .pop-button { display: block; width: 160px; height: 40px; background: #1e293b; color: #ffffff; transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1); }
 
-    /* FLAG: a width transition on a painted link. */
+    /* PASS: a width transition on a painted link. */
     .more-link { display: inline-block; width: 120px; height: 20px; color: #1d4ed8; transition: width 0.2s ease; }
 
     /* PASS: transitions that name no layout property. */
@@ -111,11 +109,6 @@
         </div>
       </div>
 
-      <div class="case">
-        <h3>Painted link with a width transition</h3>
-        <a class="more-link" href="#more">Read more</a>
-      </div>
-
       <div class="case promo-band">
         <h3>Ticker strip with a clone track</h3>
         <div class="ticker-strip">
@@ -143,6 +136,11 @@
         <div class="dark-card">
           <div class="avatar-faint"></div>
         </div>
+      </div>
+
+      <div class="case">
+        <h3>Painted link with a width transition</h3>
+        <a class="more-link" href="#more">Read more</a>
       </div>
 
       <div class="case">

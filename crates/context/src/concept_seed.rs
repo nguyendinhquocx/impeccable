@@ -108,7 +108,7 @@ fn api_base(env: &Env) -> String {
     base.strip_suffix('/').unwrap_or(&base).to_string()
 }
 
-fn card_base(env: &Env) -> String {
+pub(crate) fn card_base(env: &Env) -> String {
     env.get("IMPECCABLE_CARD_BASE").filter(|v| !v.is_empty()).cloned().unwrap_or_else(|| "https://impeccable.style/worlds/cards".to_string())
 }
 
@@ -235,10 +235,7 @@ fn render_challenger(env: &Env, concept: &Value, index: usize) -> String {
         .and_then(|s| s.as_array())
         .map(|a| a.iter().map(|r| fill(t::RENDER_CHALLENGER_RULE, &[("RULE", &value_str(r))])).collect())
         .unwrap_or_default();
-    let cb = card_base(env);
-    let id = vs(concept, "id");
-    let board = concept.get("cardBoard").filter(|v| crate::staleness::js_truthy(v)).map(value_str).unwrap_or_else(|| format!("{}/{}.webp", cb, id));
-    let hero = concept.get("cardHero").filter(|v| crate::staleness::js_truthy(v)).map(value_str).unwrap_or_else(|| format!("{}/{}-hero.webp", cb, id));
+    let (id, board, hero) = challenger_card(env, concept);
     fill(
         t::RENDER_CHALLENGER,
         &[
@@ -252,6 +249,16 @@ fn render_challenger(env: &Env, concept: &Value, index: usize) -> String {
             ("HERO", &hero),
         ],
     )
+}
+
+/// A dealt challenger's catalog id and its two card images: the QUALITY BAR
+/// line prints them and the roll record carries them, from this one place.
+fn challenger_card(env: &Env, concept: &Value) -> (String, String, String) {
+    let cb = card_base(env);
+    let id = vs(concept, "id");
+    let board = concept.get("cardBoard").filter(|v| crate::staleness::js_truthy(v)).map(value_str).unwrap_or_else(|| format!("{}/{}.webp", cb, id));
+    let hero = concept.get("cardHero").filter(|v| crate::staleness::js_truthy(v)).map(value_str).unwrap_or_else(|| format!("{}/{}-hero.webp", cb, id));
+    (id, board, hero)
 }
 
 fn value_str(v: &Value) -> String {
@@ -326,16 +333,19 @@ fn unit(scope: &str, salt: &str, key: &str) -> f64 {
 }
 
 /// JS: renderConceptSeed
-fn render_concept_seed(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Result<String, String> {
-    let (scope, reroll, roll, degraded) = render_roll(env, cwd, budget, a)?;
+/// Returns the text plus the catalog worlds the roll printed as challengers
+/// (`{"id", "board", "hero"}` each), for the roll record.
+fn render_concept_seed(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Result<(String, Vec<Value>), String> {
+    let (scope, reroll, roll, degraded, worlds) = render_roll(env, cwd, budget, a)?;
     // PRESENTATION closes every roll, where a middle-truncated read still
     // reaches it, like the restated lines above it.
     let register = a.register.clone().flatten();
-    Ok(roll + &presentation_block(env, cwd, scope, reroll, degraded, register.as_deref(), a.build_path.as_ref()))
+    Ok((roll + &presentation_block(env, cwd, scope, reroll, degraded, register.as_deref(), a.build_path.as_ref()), worlds))
 }
 
-/// The roll itself: (scope, re-roll round, text, degraded).
-fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Result<(&'static str, usize, String, bool), String> {
+/// The roll itself: (scope, re-roll round, text, degraded, printed worlds).
+#[allow(clippy::type_complexity)]
+fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Result<(&'static str, usize, String, bool, Vec<Value>), String> {
     let scope = match a.scope.as_deref() {
         Some("surface") => "surface",
         Some("direction") => "direction",
@@ -476,7 +486,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
             let mut pairs = common.clone();
             pairs.push(("DEGRADEDHEADER", &degraded_header));
             pairs.push(("AUTHORITYINSTRUCTION", &authority));
-            return Ok((scope, reroll, fill(t::DEGRADED_SAFER, &pairs), true));
+            return Ok((scope, reroll, fill(t::DEGRADED_SAFER, &pairs), true, vec![]));
         }
         let degraded_register = if register == Some("bolder") { t::DEGRADED_BOLDER.to_string() } else { String::new() };
         let mut pairs = common.clone();
@@ -486,7 +496,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
         pairs.push(("PROMOTEDINSTRUCTION", &promoted));
         pairs.push(("AUTHORITYINSTRUCTION", &authority));
         pairs.push(("RESTATED_ASSIGNED_OR_DEALT", &restated_assigned_or_dealt));
-        return Ok((scope, reroll, fill(t::DEGRADED_BODY, &pairs), true));
+        return Ok((scope, reroll, fill(t::DEGRADED_BODY, &pairs), true, vec![]));
     };
 
     let compositions_enabled = env.get("IMPECCABLE_COMPOSITIONS").map(|v| v == "1").unwrap_or(false);
@@ -532,9 +542,16 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
         _ => t::BOLDER_BLOCK.to_string(),
     };
     let round_challenger_instruction = if register == Some("bolder") { t::BOLDER_CHALLENGER.to_string() } else { challenger_instruction };
+    // The safer register spends its hand unseen, so it prints no challenger
+    // and records no world.
+    let mut worlds: Vec<Value> = Vec::new();
     let challenger_section = if register == Some("safer") {
         String::new()
     } else {
+        for c in &data.challengers {
+            let (id, board, hero) = challenger_card(env, c);
+            worlds.push(serde_json::json!({ "id": id, "board": board, "hero": hero }));
+        }
         let rendered: Vec<String> = data.challengers.iter().enumerate().map(|(i, c)| render_challenger(env, c, i)).collect();
         fill(
             t::CHALLENGER_SECTION,
@@ -561,7 +578,7 @@ fn render_roll(env: &Env, cwd: &str, budget: &mut ApiBudget, a: &SeedArgs) -> Re
     pairs.push(("RICHNESSINSTRUCTION", &richness));
     pairs.push(("TELEMETRYBLOCK", &telemetry_block));
     pairs.push(("RESTATED", &restated));
-    Ok((scope, reroll, fill(t::MAIN, &pairs), false))
+    Ok((scope, reroll, fill(t::MAIN, &pairs), false, worlds))
 }
 
 fn random_hex8() -> String {
@@ -622,11 +639,12 @@ pub fn run(args: &[String], io: &mut Io) -> i32 {
         build_path: crate::context_cli::recorded_build_path(&ctx, &cwd),
     };
     match render_concept_seed(&env, &cwd, &mut budget, &seed) {
-        Ok(text) => {
+        Ok((text, worlds)) => {
             // A valid roll: the scope and re-roll round passed validation.
             // serve-question reads the record to know a surface round when
-            // it serves one (`record_roll`).
-            crate::serve_question::record_roll(&cwd, seed.scope.as_deref().unwrap_or("surface"), &seed.key, seed.reroll as usize);
+            // it serves one, and which catalog worlds were dealt, so it can
+            // name their card images when the comps are due (`record_roll`).
+            crate::serve_question::record_roll(&cwd, seed.scope.as_deref().unwrap_or("surface"), &seed.key, seed.reroll as usize, &worlds);
             io.out(&text);
             0
         }
@@ -909,10 +927,26 @@ mod tests {
         assert_eq!(code, 0);
         let r = read();
         assert_eq!((r["scope"].as_str(), r["key"].as_str(), r["reroll"].as_u64()), (Some("surface"), Some("k1"), Some(0)));
+        // The record names every challenger the roll printed, with the same
+        // board and hero URLs as its QUALITY BAR line.
+        let (_, out) = seed(&proj, &skill, true, &["--scope", "surface", "--mode", "operate", "--from", "k1"]);
+        let worlds = read()["worlds"].as_array().cloned().unwrap();
+        assert_eq!(worlds.len(), out.matches("     SOURCE ID: ").count().min(out.matches("     QUALITY BAR: ").count()));
+        assert!(!worlds.is_empty());
+        for w in &worlds {
+            let (id, board, hero) = (w["id"].as_str().unwrap(), w["board"].as_str().unwrap(), w["hero"].as_str().unwrap());
+            assert!(out.contains(&format!("     SOURCE ID: {id}\n")), "{id}: {out}");
+            assert!(out.contains(&format!("     QUALITY BAR: board {board} · hero {hero}")), "{id}: {out}");
+        }
+        // The safer register prints no challenger, so it records no world.
+        seed(&proj, &skill, true, &["--scope", "direction", "--from", "k1", "--reroll", "1", "--register", "safer"]);
+        assert!(read().get("worlds").is_none(), "{}", read());
         assert!(r["at"].as_f64().is_some_and(|at| (crate::util::now_ms() - at).abs() < 60_000.0), "{r}");
         let (code, _) = seed(&proj, &skill, false, &["--scope", "direction", "--from", "k2", "--reroll", "1"]);
         assert_eq!(code, 0);
         let r = read();
         assert_eq!((r["scope"].as_str(), r["key"].as_str(), r["reroll"].as_u64()), (Some("direction"), Some("k2"), Some(1)));
+        // A degraded roll dealt no world: the record keeps its old shape.
+        assert!(r.get("worlds").is_none(), "{r}");
     }
 }

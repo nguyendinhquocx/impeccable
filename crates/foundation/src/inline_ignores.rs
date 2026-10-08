@@ -225,6 +225,15 @@ mod tests {
             }
         }
         assert!(is_inline_ignored(&Hit("image-hover-transform"), &d));
-        assert!(!is_inline_ignored(&Hit("layout-transition"), &d));
+        assert!(!is_inline_ignored(&Hit("bounce-easing"), &d));
+
+        // `layout-transition`, retired on 2026-10-07, named beside a live rule.
+        let d = parse_inline_ignores(Some(
+            "<!-- impeccable-disable layout-transition, bounce-easing -->",
+        ));
+        assert_eq!(d.file, vec!["layout-transition", "bounce-easing"]);
+        assert!(is_inline_ignored(&Hit("layout-transition"), &d));
+        assert!(is_inline_ignored(&Hit("bounce-easing"), &d));
+        assert!(!is_inline_ignored(&Hit("dark-glow"), &d));
     }
 }

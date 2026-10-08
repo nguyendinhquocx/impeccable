@@ -7,8 +7,8 @@
   The panels of a drawn product mockup are a picture of an interface, not
   cards nested on this page. An inner card reports nested-cards as advisory
   when it sits in a framed demo (r5-p26's structure: a window with three
-  title-bar dots, a device frame tilted in 3D or scaled down), when it is
-  that window itself, or when it sits under an HTML role="img". Every row reports; the column says at which severity.
+  title-bar dots, a device frame tilted in 3D or scaled down, a frame
+  under a wrapper that carries the scale), when it is that window itself, or when it sits under an HTML role="img". Every row reports; the column says at which severity.
 
   Bordered cards in a bordered panel outside any mockup (paseo.sh) keep
   failing, and so does a window with two dots, which is not window chrome.
@@ -32,6 +32,7 @@
   .inner { width: 360px; background: #ffffff; border: 1px solid #e4e4e7; border-radius: 10px; padding: 12px; margin: 0 0 8px; }
   .panel { width: 420px; margin: 0 0 32px; background: #ffffff; border: 1px solid #e4e4e7; border-radius: 14px; padding: 16px; }
   p { margin: 0; font-size: 14px; line-height: 20px; }
+  .foot { padding: 8px 16px; border-top: 1px solid #e4e4e7; }
 </style>
 </head>
 <body>
@@ -50,6 +51,19 @@
   <div class="shot border rounded-xl shadow-lg" id="fail-two-dots">
     <div class="bar"><span class="lights"><i class="dot"></i><i class="dot"></i></span></div>
     <div class="pane"><div class="inner border rounded-xl" id="fail-two-dots-inner"><p>Deploy finished in 42 seconds</p><p>A second line makes it a surface, not a label.</p></div></div>
+  </div>
+
+  <!-- a card fanned at full size, like a polaroid, is not a frame -->
+  <div class="panel border rounded-2xl" id="fail-fanned">
+    <div class="inner border rounded-xl" id="fail-fanned-inner" style="transform: rotate(-6deg); height: 96px"><p>The best tool we bought this year</p><p>A second line makes it a surface, not a label.</p></div>
+  </div>
+
+  <!-- a sentence that works the word "example" in is not a sample caption -->
+  <div class="panel border rounded-2xl" id="fail-prose-in-card">
+    <div class="shot border rounded-xl shadow-lg" id="fail-prose-panel" style="height: 130px; margin: 0">
+      <div class="pane"><p>Stage three of five is mapping fields.</p><p>A second line makes it a surface, not a label.</p></div>
+      <p class="foot">An example project mid-migration, one customer's data.</p>
+    </div>
   </div>
 
   <!-- a class that names a mockup is not read -->
@@ -77,6 +91,25 @@
     <div class="shot border rounded-xl shadow-lg" id="adv-window-itself">
       <div class="bar"><span class="lights"><i class="dot"></i><i class="dot"></i><i class="dot"></i></span></div>
       <div class="pane"><p>README.md, index.js and a terminal below them.</p><p>A second line makes it a surface, not a label.</p></div>
+    </div>
+  </div>
+
+  <!-- maritime.sh: a wrapper carries the scale, and the window under it is
+       the inner card of a section card -->
+  <div class="panel border rounded-2xl" id="adv-scaled-in-card">
+    <div style="scale: 0.85; width: 380px; height: 150px">
+      <div class="shot border rounded-xl shadow-lg" id="adv-scaled-window" style="width: 380px; height: 140px; margin: 0">
+        <div class="pane"><p>Inbox, three unread from the shipping desk.</p><p>A second line makes it a surface, not a label.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- getpaidlens.com: a panel with an illustrative footer note is the
+       inner card of a section card (decision r8-t1-mockups-by-caption) -->
+  <div class="panel border rounded-2xl" id="adv-captioned-in-card">
+    <div class="shot border rounded-xl shadow-lg" id="adv-captioned-panel" style="height: 130px; margin: 0">
+      <div class="pane"><p>Campaign D is spending under its budget.</p><p>A second line makes it a surface, not a label.</p></div>
+      <p class="foot">Illustrative example. Figures shown are not customer data.</p>
     </div>
   </div>
 

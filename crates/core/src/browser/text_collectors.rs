@@ -344,7 +344,11 @@ pub fn collect_numbered_section_label_candidates(dom: &dyn Dom) -> Vec<NumberedL
         if HEADING_TAGS.contains(&tag_lower(dom, label).as_str()) {
             continue;
         }
-        if is_kicker_card_context(dom, heading, label) {
+        // A count beside an icon, or a label that holds an image, is a badge
+        // (gig-connect's venue capacity, a people icon and "35" over the card
+        // photo), not a section number. A plain "01" in a painted card stays:
+        // numbered pricing and feature cards are the tell itself.
+        if is_kicker_card_context(dom, heading, label) || numbered_label_holds_media(dom, label) {
             continue;
         }
         let label_text = {
@@ -392,6 +396,30 @@ pub fn collect_numbered_section_label_candidates(dom: &dyn Dom) -> Vec<NumberedL
     candidates
 }
 
+/// The media that make a numbered label a picture rather than a section
+/// number: a photo, a video or a canvas inside it.
+pub const NUMBERED_LABEL_MEDIA_SELECTOR: &str = "img, picture, video, canvas";
+
+/// Whether `label` is a badge or a picture, not a section number: it holds a
+/// photo ([`NUMBERED_LABEL_MEDIA_SELECTOR`]), or an icon set in the same box
+/// as the number's own text (a people icon and "35"). An icon in a tile
+/// beside a card's "02" leaves the "02" a number.
+fn numbered_label_holds_media(dom: &dyn Dom, label: ElId) -> bool {
+    let found = |selector: &str| dom.query_all(Some(label), selector).unwrap_or_default();
+    found(NUMBERED_LABEL_MEDIA_SELECTOR).iter().any(|&el| el != label)
+        || found("svg").iter().any(|&svg| {
+            dom.parent(svg)
+                .is_some_and(|box_| holds_number_text(&super::dom::direct_text(dom, box_)))
+        })
+}
+
+/// Whether a box's own text is the number a numbered label reads: an icon
+/// beside other words ("Feature") is not beside the number.
+pub fn holds_number_text(own_text: &str) -> bool {
+    let text = js::trim(&collapse_ws(own_text)).to_string();
+    !text.is_empty() && parse_numbered_label_text(Some(&text)).is_some()
+}
+
 fn hits(v: Vec<crate::checks::measures::Finding>) -> Vec<RuleHit> {
     v.into_iter()
         .map(|f| RuleHit {
@@ -417,10 +445,50 @@ pub fn check_em_dash_overuse_dom(dom: &dyn Dom) -> Vec<RuleHit> {
     };
     // innerText when it is a non-empty string, else textContent.
     let text = match dom.inner_text(body) {
-        Some(t) => without_lone_dash_cells(&t),
+        Some(t) => without_choice_lines(dom, &without_lone_dash_cells(&t)),
         None => dom.text_content(body),
     };
     hits(check_em_dash_overuse(Some(&text)))
+}
+
+/// `innerText` without the lines a rendered `<select>`'s choices put there.
+/// A `<select>` lists each `<option>` on a line of its own, and a currency
+/// picker that writes "USD", a dash, "US Dollar" a hundred and fifty times
+/// (vaultlykeep.com) holds no sentence. Each choice removes one line whose
+/// collapsed text equals it, so the same words in the copy stay.
+fn without_choice_lines(dom: &dyn Dom, text: &str) -> String {
+    // Only a rendered `<select>` writes its options into `innerText`; a
+    // hidden one, or a `<datalist>`, writes nothing, and its text must not
+    // erase the same words in the copy.
+    let mut choices: Vec<String> = dom
+        .query_all(None, "option")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&o| {
+            dom.closest(o, "select")
+                .ok()
+                .flatten()
+                .is_some_and(|select| super::element_checks::is_painted_for_browser_rule(dom, select))
+        })
+        .map(|o| collapsed_text_content(dom, o))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if choices.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        let key = js::trim(&collapse_ws(line)).to_string();
+        if let Some(at) = choices.iter().position(|c| *c == key) {
+            choices.swap_remove(at);
+            continue;
+        }
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// `innerText` without the cells whose whole text is a dash. A pricing matrix
@@ -874,6 +942,51 @@ mod tests {
         );
     }
 
+    /// gig-connect-six.vercel.app: a capacity badge, a people icon and a
+    /// count in one box, is not a section number.
+    #[test]
+    fn numbered_labels_holding_an_icon_are_badges() {
+        let build = |icon: Option<&str>| {
+            let mut d = FakeDom::new();
+            let (_html, body) = d.with_page();
+            for (i, idx) in ["35", "30"].iter().enumerate() {
+                let sec = d.add(Some(body), "section");
+                let label = d.add(Some(sec), "span");
+                match icon {
+                    Some("beside") => {
+                        d.add(Some(label), "svg");
+                    }
+                    Some(_) => {
+                        let tile = d.add(Some(label), "div");
+                        d.add(Some(tile), "svg");
+                    }
+                    None => {}
+                }
+                d.add_text(label, idx);
+                d.set_styles(
+                    label,
+                    &[
+                        ("fontSize", "11px"),
+                        ("letterSpacing", "1px"),
+                        ("fontWeight", "700"),
+                        ("fontFamily", "monospace"),
+                        ("textTransform", "none"),
+                        ("color", "rgb(0, 0, 0)"),
+                    ],
+                );
+                let h = d.add(Some(sec), "h2");
+                d.add_text(h, &format!("Venue number {}", i + 1));
+                d.set_style(h, "fontSize", "28px");
+            }
+            d
+        };
+        assert_eq!(check_numbered_section_labels_dom(&build(None)).len(), 2);
+        assert!(check_numbered_section_labels_dom(&build(Some("beside"))).is_empty());
+        // An icon in a tile of its own beside a card's number leaves the
+        // number a number (arbiproseller-app.vercel.app's feature cards).
+        assert_eq!(check_numbered_section_labels_dom(&build(Some("tile"))).len(), 2);
+    }
+
     #[test]
     fn em_dash_uses_inner_text_then_text_content() {
         let mut d = FakeDom::new();
@@ -904,6 +1017,42 @@ mod tests {
         assert_eq!(hits[0].snippet, "8 em-dashes in body text");
         assert_eq!(without_lone_dash_cells("x\t—\ty\n -- \n"), "x\t\ty\n\n");
         assert_eq!(without_lone_dash_cells("no cells — here"), "no cells — here");
+    }
+
+    /// vaultlykeep.com: a currency picker lists "USD — US Dollar" and a
+    /// hundred more, each option on its own line of `innerText`.
+    #[test]
+    fn em_dash_skips_the_lines_a_select_lists() {
+        let mut d = FakeDom::new();
+        let (_html, body) = d.with_page();
+        let select = d.add(Some(body), "select");
+        let codes = ["USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CNY", "INR", "CHF"];
+        let mut lines = vec!["Prices shown in USD".to_string()];
+        for code in codes {
+            let option = d.add(Some(select), "option");
+            d.add_text(option, &format!("{code} — {code} currency"));
+            lines.push(format!("{code} — {code} currency"));
+        }
+        d.el_mut(body).inner_text = Some(lines.join("\n"));
+        assert!(check_em_dash_overuse_dom(&d).is_empty());
+        // The same lines written as copy outside the control still count.
+        let prose: Vec<String> = codes.iter().map(|c| format!("{c} — said once more")).collect();
+        d.el_mut(body).inner_text = Some(format!("{}\n{}", lines.join("\n"), prose.join("\n")));
+        assert_eq!(check_em_dash_overuse_dom(&d)[0].snippet, "9 em-dashes in body text");
+
+        // A hidden picker writes nothing into `innerText`: its options do
+        // not erase the same words written as copy.
+        let mut d = FakeDom::new();
+        let (_html, body) = d.with_page();
+        let select = d.add(Some(body), "select");
+        d.set_style(select, "display", "none");
+        d.el_mut(select).check_visibility = Some(false);
+        for code in codes {
+            let option = d.add(Some(select), "option");
+            d.add_text(option, &format!("{code} — said once more"));
+        }
+        d.el_mut(body).inner_text = Some(prose.join("\n"));
+        assert_eq!(check_em_dash_overuse_dom(&d)[0].snippet, "9 em-dashes in body text");
     }
 
     #[test]

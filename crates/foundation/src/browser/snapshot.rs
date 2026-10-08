@@ -62,8 +62,14 @@ pub const NS_MATHML: &str = "http://www.w3.org/1998/Math/MathML";
 /// sync with `STYLE_PROPS` in `browser-bundle/15-snapshot.js` (the build
 /// checks the two lists agree).
 pub const STYLE_PROPS: &[&str] = &[
+    "animationComposition",
+    "animationDelay",
+    "animationDirection",
+    "animationDuration",
+    "animationFillMode",
     "animationIterationCount",
     "animationName",
+    "animationPlayState",
     "animationTimeline",
     "animationTimingFunction",
     "aspectRatio",
@@ -244,6 +250,11 @@ pub struct MediaInfo {
     pub cur: String,
     #[serde(default)]
     pub src: String,
+    /// `complete` (img). Absent from a capture recorded before the snapshot
+    /// read it, and from every element that is not an `<img>`: `None` is
+    /// "not recorded", never "still loading".
+    #[serde(rename = "cp", default, skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
 }
 
 /// One element as captured. Field names are one letter on the wire to keep
@@ -420,6 +431,10 @@ pub struct Snapshot {
     /// `[name, frames]` in stylesheet order (first rule per name wins).
     #[serde(default)]
     pub keyframes: Vec<(String, Vec<Vec<(String, String)>>)>,
+    /// `[name, [keyText, ...]]` per `keyframes` entry: the selector of each
+    /// recorded frame. Absent in captures older than it.
+    #[serde(rename = "keyframeKeys", default)]
+    pub keyframe_keys: Vec<(String, Vec<String>)>,
     /// `__snapLinkedStylesheetText()`: the readable linked-stylesheet corpus
     /// (#709). Absent in captures older than that change.
     #[serde(rename = "linkedCss", default)]
@@ -632,6 +647,17 @@ pub struct SnapshotDom {
 }
 
 impl SnapshotDom {
+    /// The media record of an HTML `<img>`. A `<picture>`, `<video>` or
+    /// `<canvas>` carries one too, with a natural size of 0 that says
+    /// nothing about an image.
+    fn image_media(&self, el: ElId) -> Option<&MediaInfo> {
+        let node = self.snap.get(el)?;
+        if node.ns != 0 || !node.tag.eq_ignore_ascii_case("img") {
+            return None;
+        }
+        node.media.as_ref()
+    }
+
     pub fn new(snap: Snapshot) -> SnapshotDom {
         let dom = SnapshotDom {
             snap,
@@ -858,6 +884,11 @@ impl Dom for SnapshotDom {
                     .collect()
             })
     }
+    fn keyframe_keys(&self, name: &str) -> Option<Vec<String>> {
+        let frames = self.snap.keyframes.iter().find(|(n, _)| n == name)?;
+        let keys = self.snap.keyframe_keys.iter().find(|(n, _)| n == name)?;
+        (keys.1.len() == frames.1.len()).then(|| keys.1.clone())
+    }
     fn document_html_for_patterns(&self) -> String {
         self.snap.html.clone()
     }
@@ -1081,6 +1112,15 @@ impl Dom for SnapshotDom {
     }
     fn offset_height(&self, el: ElId) -> f64 {
         metric(&self.snap.node(el).metrics, 6)
+    }
+    fn image_natural_size(&self, el: ElId) -> Option<(f64, f64)> {
+        self.image_media(el).map(|m| (m.nw, m.nh))
+    }
+    fn image_complete(&self, el: ElId) -> Option<bool> {
+        self.image_media(el)?.complete
+    }
+    fn image_current_src(&self, el: ElId) -> Option<String> {
+        self.image_media(el).map(|m| m.cur.clone())
     }
     fn check_visibility(&self, el: ElId) -> Option<bool> {
         match self.snap.node(el).visibility {
@@ -1354,6 +1394,27 @@ mod tests {
         );
     }
 
+    /// The fill mode, direction, duration, delay, play state and composition of animations,
+    /// and the keyframe selectors, joined the capture later: a recording
+    /// without them reads each as empty or `None`, which the rules that end
+    /// an animation take as unknown.
+    #[test]
+    fn older_capture_without_animation_timing_props() {
+        let d = snap(SMALL);
+        for prop in [
+            "animationFillMode",
+            "animationDirection",
+            "animationDuration",
+            "animationDelay",
+            "animationPlayState",
+            "animationComposition",
+        ] {
+            assert!(STYLE_PROPS.contains(&prop), "{prop} missing from STYLE_PROPS");
+            assert_eq!(d.style(5, prop), "", "{prop}");
+        }
+        assert_eq!(d.keyframe_keys("anything"), None);
+    }
+
     /// The containing-block properties and `scrollHeight` joined the capture
     /// later: a recording without them reads the properties as empty and the
     /// metric as NaN, which the paint gate takes as undecided.
@@ -1455,6 +1516,43 @@ mod tests {
         assert_eq!(serde_json::to_string(&Facts::default()).unwrap(), r#"{"hits":[]}"#);
         let old: Facts = serde_json::from_str(r#"{"hits":[]}"#).unwrap();
         assert!(old.shown_on_scroll.is_empty());
+    }
+
+    /// An `<img>` answers from its media record. `complete` is `None` on a
+    /// capture recorded before the snapshot read it, never `false`, and an
+    /// element that is not an `<img>` answers nothing even where it carries
+    /// a media record of its own.
+    #[test]
+    fn image_load_state_comes_from_the_media_record() {
+        const PAGE: &str = r#"{
+          "v": 1, "documentElement": 1, "body": 2,
+          "els": [
+            {"t":"HTML","c":[2]},
+            {"t":"BODY","p":1,"c":[3,4,5,6,7]},
+            {"t":"IMG","p":2,"md":{"nw":0,"nh":0,"cur":"https://a.test/gone.png","src":"https://a.test/gone.png","cp":true}},
+            {"t":"IMG","p":2,"md":{"nw":0,"nh":0,"cur":"","src":"https://a.test/later.png","cp":false}},
+            {"t":"IMG","p":2,"md":{"nw":640,"nh":480,"cur":"https://a.test/old.png","src":"https://a.test/old.png"}},
+            {"t":"PICTURE","p":2,"md":{"nw":0,"nh":0,"cur":"","src":""}},
+            {"t":"image","n":1,"p":2}
+          ]
+        }"#;
+        let d = snap(PAGE);
+        assert_eq!(d.image_natural_size(3), Some((0.0, 0.0)));
+        assert_eq!(d.image_complete(3), Some(true));
+        assert_eq!(d.image_current_src(3).as_deref(), Some("https://a.test/gone.png"));
+        assert_eq!(d.image_complete(4), Some(false));
+        assert_eq!(d.image_current_src(4).as_deref(), Some(""));
+        // Recorded before `complete` was: the size is known, the state is not.
+        assert_eq!(d.image_natural_size(5), Some((640.0, 480.0)));
+        assert_eq!(d.image_complete(5), None);
+        for other in [1, 6, 7] {
+            assert_eq!(d.image_natural_size(other), None);
+            assert_eq!(d.image_complete(other), None);
+            assert_eq!(d.image_current_src(other), None);
+        }
+        // An old record serializes as it was read: no `cp` key appears.
+        let old = d.snap.node(5).media.as_ref().unwrap();
+        assert!(!serde_json::to_string(old).unwrap().contains("cp"));
     }
 
     /// A capture that recorded the text rects hands over the lines; one that

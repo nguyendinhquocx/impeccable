@@ -255,3 +255,38 @@ fn a_routing_gate_named_like_a_loader_stays() {
     assert!(scan.findings.iter().all(|f| f.extras.get("overlaysHidden").is_none()));
     assert!(scan.notes.is_empty(), "{:?}", scan.notes);
 }
+
+#[test]
+fn a_lovable_badge_is_hidden_and_the_copy_under_it_scored() {
+    let Some(engine) = engine() else { return };
+    let port = serve();
+    let url = format!("http://127.0.0.1:{port}/lovable-badge.html");
+    let scan = engine.detect_url_scan(&url, &ScanOptions::default()).expect("scan");
+    let found = flagged(&scan.findings);
+    assert!(has(&found, "low-contrast", "#covered-copy"), "{found:#?}");
+    assert!(!found.iter().any(|(_, s)| s.contains("lovable-badge")), "{found:#?}");
+    for f in &scan.findings {
+        assert_eq!(
+            f.extras.get("overlaysHidden"),
+            Some(&serde_json::json!([{ "kind": "badge", "name": "Lovable" }])),
+            "{f:?}"
+        );
+    }
+    assert_eq!(
+        scan.notes,
+        vec![format!("Hid the Lovable badge on {url} before scanning. Pass --no-overlay-hiding to scan it.")]
+    );
+
+    let mut browser = engine.launch().expect("launch");
+    let (_, evidence) =
+        detect_url_evidence(&mut browser, &url, &ScanOptions::default(), "load", 100, &EvidenceRequest::default())
+            .expect("scan");
+    let (kept, _) = detect_url_evidence(&mut browser, &url, &KEEP, "load", 100, &EvidenceRequest::default()).expect("scan");
+    browser.close();
+    let report = evidence.overlays.as_ref().expect("overlay report");
+    assert_eq!(report.hidden, vec![hidden("badge", "Lovable")]);
+    assert_eq!(report.matched, vec![("Lovable".to_string(), vec!["#lovable-badge".to_string()])]);
+    // Kept, the badge's own label is scored as the page's.
+    let shown = flagged(&kept);
+    assert!(shown.iter().any(|(_, s)| s.contains("lovable-badge")), "{shown:#?}");
+}
