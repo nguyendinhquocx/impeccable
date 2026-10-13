@@ -366,7 +366,7 @@ static VERSION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^version:\s*(.+?)\s*$
 /// Codex's validator rejects unknown top-level keys, so the Codex and
 /// `.agents` skills carry `version` under the spec-defined `metadata:` map
 /// (#703). A metadata version wins; a legacy top-level one still reads.
-fn parse_skill_frontmatter_version(content: &str) -> Option<String> {
+pub(crate) fn parse_skill_frontmatter_version(content: &str) -> Option<String> {
     let caps = FRONTMATTER_RE.captures(content)?;
     let body = caps.get(1)?.as_str();
 
@@ -427,7 +427,7 @@ fn strip_matched_quotes(v: &str) -> String {
     v.to_string()
 }
 
-fn read_local_skill_version(provider: &Provider) -> Option<String> {
+pub(crate) fn read_local_skill_version(provider: &Provider) -> Option<String> {
     let p = provider.skill_md_path()?;
     let content = safe_read(&p)?;
     parse_skill_frontmatter_version(&content)

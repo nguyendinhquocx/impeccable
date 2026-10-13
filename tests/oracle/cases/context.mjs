@@ -184,10 +184,10 @@ const WORLDS = [
 const DIRECTION_NO_COMPS = {
   title: 'Choose the visual world',
   options: [
-    { id: 'assigned', label: 'Ledger', kicker: 'THE ROLL', thesis: 'One.' },
-    { id: 'model-pick', label: 'Folio', kicker: 'IMPECCABLE’S PICK', thesis: 'Two.' },
-    { id: 'challenger-a', label: 'Rail', verdict: 'competitive', thesis: 'Three.', hero: 'https://x/a-hero.webp' },
-    { id: 'challenger-b', label: 'Field', verdict: 'declined', thesis: 'Four.', hero: 'https://x/b-hero.webp' },
+    { id: 'assigned', kind: 'assigned', label: 'Ledger', kicker: 'THE ROLL', thesis: 'One.' },
+    { id: 'model-pick', kind: 'pick', label: 'Folio', kicker: 'IMPECCABLE’S PICK', thesis: 'Two.' },
+    { id: 'challenger-a', kind: 'challenger', catalogId: 'fixture-press', label: 'Rail', verdict: 'competitive', thesis: 'Three.', hero: 'https://x/a-hero.webp' },
+    { id: 'challenger-b', kind: 'challenger', catalogId: 'fixture-signal', label: 'Field', verdict: 'declined', thesis: 'Four.', hero: 'https://x/b-hero.webp' },
   ],
   reroll: { registers: ['safer', 'bolder'] },
   buildPath: { value: 'comp', toggle: true },
@@ -204,9 +204,9 @@ const DIRECTION_WITH_COMPS = {
 const SURFACE_NO_COMPS = {
   title: 'Choose the structure',
   options: [
-    { id: 'ledger', label: 'Ledger', kicker: 'THE ROLL', thesis: 'One.' },
-    { id: 'rail', label: 'Rail', thesis: 'Two.' },
-    { id: 'field', label: 'Field', thesis: 'Three.' },
+    { id: 'ledger', kind: 'assigned', label: 'Ledger', kicker: 'THE ROLL', thesis: 'One.' },
+    { id: 'rail', kind: 'dealt', label: 'Rail', thesis: 'Two.' },
+    { id: 'field', kind: 'dealt', label: 'Field', thesis: 'Three.' },
   ],
   reroll: true,
   buildPath: { value: 'comp', toggle: true },
@@ -778,10 +778,12 @@ const cases = [
   // The render-check NEXT line prints once per hand: k1.render-check already holds this hand's id, so a later poll with a landed, sidecar-carrying decision comp stays quiet.
   { id: 'question-wait-render-check-once', verb: 'serve-question', workspace: 'ctx-empty', setup: (ws) => { write(ws, '.impeccable/questions/k1.state.json', JSON.stringify({ pid: 1, port: 1, url: 'http://127.0.0.1:1/', comps: ['.impeccable/mocks/decision/a.png'] })); write(ws, '.impeccable/questions/k1.hand.json', JSON.stringify({ id: 'h1', digest: '0000000000000000', comps: ['.impeccable/mocks/decision/a.png'], pre: {} })); write(ws, '.impeccable/questions/k1.render-check', 'h1'); write(ws, '.impeccable/mocks/decision/a.png', 'png'); write(ws, '.impeccable/mocks/decision/a.png.json', JSON.stringify({ prompt: 'a' })); }, args: ['--wait', '--key', 'k1', '--poll', '0'], env: env(), files: ['.impeccable/questions/**'] },
   // --update with a round that declares comps prints the NEXT visualize.md line; a code-led round (comp slots as flip reserve) does not.
-  { id: 'question-update-comps-next', verb: 'serve-question', workspace: 'ctx-empty', setup: (ws) => { write(ws, '.impeccable/questions/k1.state.json', JSON.stringify({ pid: 1, port: 1, url: 'http://127.0.0.1:1/' })); write(ws, 'payload.json', JSON.stringify({ title: 'Pick', options: [{ id: 'a', label: 'A', thesis: 'One.', comp: '.impeccable/mocks/decision/a.png' }, { id: 'b', label: 'B', thesis: 'Two.', comp: '.impeccable/mocks/decision/b.png' }], buildPath: { value: 'comp', toggle: true } })); }, args: ['--update', '--key', 'k1', '--payload', 'payload.json'], env: env(), files: ['.impeccable/questions/*.hand.json'],
+  { id: 'question-update-comps-next', verb: 'serve-question', workspace: 'ctx-empty', setup: (ws) => { write(ws, '.impeccable/questions/k1.state.json', JSON.stringify({ pid: 1, port: 1, url: 'http://127.0.0.1:1/' })); write(ws, 'payload.json', JSON.stringify({ title: 'Pick', options: [{ id: 'a', kind: 'assigned', label: 'A', thesis: 'One.', comp: '.impeccable/mocks/decision/a.png' }, { id: 'b', kind: 'dealt', label: 'B', thesis: 'Two.', comp: '.impeccable/mocks/decision/b.png' }], buildPath: { value: 'comp', toggle: true } })); }, args: ['--update', '--key', 'k1', '--payload', 'payload.json'], env: env(), files: ['.impeccable/questions/*.hand.json'],
     // The per-hand id mixes the clock and the pid, so it is masked.
     normalize: [['("id":")[0-9a-f]{16}', 'g', '$1<HAND_ID>']] },
-  { id: 'question-update-code-led-no-next', verb: 'serve-question', workspace: 'ctx-empty', setup: (ws) => { write(ws, '.impeccable/questions/k1.state.json', JSON.stringify({ pid: 1, port: 1, url: 'http://127.0.0.1:1/' })); write(ws, 'payload.json', JSON.stringify({ title: 'Pick', options: [{ id: 'a', label: 'A', thesis: 'One.', comp: '.impeccable/mocks/decision/a.png' }], buildPath: { value: 'code', toggle: true } })); }, args: ['--update', '--key', 'k1', '--payload', 'payload.json'], env: env() },
+  // Every card on a direction or surface page declares kind, and a challenger its catalogId among the dealt worlds: --update refuses the payload until it does.
+  { id: 'question-update-card-identity-missing', verb: 'serve-question', workspace: 'ctx-empty', setup: (ws) => { write(ws, '.impeccable/questions/k1.state.json', JSON.stringify({ pid: 1, port: 1, url: 'http://127.0.0.1:1/' })); write(ws, 'payload.json', JSON.stringify({ title: 'Pick', options: [{ id: 'a', label: 'A', thesis: 'One.' }, { id: 'c', kind: 'challenger', catalogId: 'nope', label: 'C', thesis: 'Two.' }], buildPath: { value: 'code', toggle: true } })); }, args: ['--update', '--key', 'k1', '--payload', 'payload.json'], env: env() },
+  { id: 'question-update-code-led-no-next', verb: 'serve-question', workspace: 'ctx-empty', setup: (ws) => { write(ws, '.impeccable/questions/k1.state.json', JSON.stringify({ pid: 1, port: 1, url: 'http://127.0.0.1:1/' })); write(ws, 'payload.json', JSON.stringify({ title: 'Pick', options: [{ id: 'a', kind: 'assigned', label: 'A', thesis: 'One.', comp: '.impeccable/mocks/decision/a.png' }], buildPath: { value: 'code', toggle: true } })); }, args: ['--update', '--key', 'k1', '--payload', 'payload.json'], env: env() },
   // A comp-round payload serves comps that already exist, so --update prints no NEXT line.
   { id: 'question-update-comps-landed-no-next', verb: 'serve-question', workspace: 'ctx-empty', setup: (ws) => { write(ws, '.impeccable/questions/k1.state.json', JSON.stringify({ pid: 1, port: 1, url: 'http://127.0.0.1:1/' })); write(ws, '.impeccable/mocks/comp-a.png', 'png'); write(ws, '.impeccable/mocks/comp-b.png', 'png'); write(ws, 'payload.json', JSON.stringify({ title: 'Pick', options: [{ id: 'a', label: 'A', thesis: 'One.', comp: '.impeccable/mocks/comp-a.png' }, { id: 'b', label: 'B', thesis: 'Two.', comp: '.impeccable/mocks/comp-b.png' }] })); }, args: ['--update', '--key', 'k1', '--payload', 'payload.json'], env: env() },
   // When the comps are due, the NEXT line also hands over the card images of the catalog worlds the roll dealt. concept-seed records them in roll.json; the decision page that takes the roll copies them into its hand, puts each board and hero in .impeccable/mocks/worlds/, and names the files (IMPECCABLE_IMAGE_GEN_FAKE fetches nothing, so the images are named by URL here).

@@ -14,7 +14,8 @@ describe('skill reference authoring contracts', () => {
     assert.match(recordDecision, /development-only contract/);
     assert.match(recordDecision, /under `## Direction contract` in the relevant surface brief/);
     assert.match(recordDecision, /read the brief once more/i);
-    assert.match(recordDecision, /all six contract blocks and the seed key/);
+    assert.match(recordDecision, /all six contract blocks and the seed reference/);
+    assert.match(recordDecision, /SEED REFERENCE concept-seed printed .*never the raw seed key/);
 
     for (const block of ['THESIS', 'OWN-WORLD', 'STORY', 'FIRST VIEWPORT', 'FORM', 'FINISH']) {
       assert.match(recordDecision, new RegExp(`${block}:`));

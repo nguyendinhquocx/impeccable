@@ -64,6 +64,7 @@ fn run(args: &[String], io: &mut Io) -> i32 {
         "signals" | "context-signals" => impeccable_context::run_signals(rest, io),
         "doctor" => impeccable_context::run_doctor(rest, io),
         "concept-seed" => impeccable_context::run_concept_seed(rest, io),
+        "telemetry" => impeccable_context::run_telemetry(rest, io),
         "generate-image" => impeccable_context::run_generate_image(rest, io),
         "serve-question" => impeccable_context::run_serve_question(rest, io),
         "component-review" => impeccable_context::component_review::run_with_capturer(rest, io, Some(&mut impeccable::component_capture::NativeComponentCapturer)),

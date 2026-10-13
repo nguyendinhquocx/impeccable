@@ -9,6 +9,8 @@
 pub mod git;
 pub mod jsp;
 pub mod proc;
+#[cfg(feature = "seed")]
+pub mod seed;
 
 use std::collections::HashMap;
 use std::ffi::OsString;

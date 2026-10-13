@@ -26,6 +26,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Any request a job makes to the roll API is tagged as test traffic
+# (X-Impeccable-Client carries the channel), so CI never lands in the
+# choice dataset.
+env:
+  IMPECCABLE_TELEMETRY_CHANNEL: test
+
 jobs:
   changes:
     runs-on: ubuntu-latest
