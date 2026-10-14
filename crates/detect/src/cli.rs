@@ -15,7 +15,7 @@ use crate::design_system::{load_design_system_for_target, DesignSystemCache};
 use crate::detect_text::{detect_text, TextOptions};
 use crate::engines::{EngineError, Engines, ScanOptions};
 use crate::file_system::{
-    build_import_graph_reporting, detect_framework_config, is_html_path, is_port_listening,
+    build_import_graph_reporting, detect_framework_config, is_port_listening, uses_html_engine,
     walk_dir_reporting,
 };
 use crate::jsp;
@@ -296,7 +296,7 @@ impl<'a> Ctx<'a> {
         file_path: &str,
         options: &ScanOptions,
     ) -> Result<Vec<Finding>, EngineError> {
-        if is_html_path(file_path) {
+        if uses_html_engine(file_path, &self.config.extensions) {
             return self
                 .engines
                 .html
@@ -793,7 +793,10 @@ fn scan_targets(
             for (dir, message) in walk_failures {
                 ctx.report_local_scan_failure(&dir, &message);
             }
-            let html_count = files.iter().filter(|f| is_html_path(f)).count();
+            let html_count = files
+                .iter()
+                .filter(|f| uses_html_engine(f, &ctx.config.extensions))
+                .count();
             if files.len() > 50 && ctx.stdin_tty && !ctx.json_mode && !ctx.quiet_mode {
                 ctx.io.err(&format!(
                     "\nFound {} files ({} HTML) in {}.\nScanning may take a while{}.\nTarget a specific subdirectory to narrow scope.\n",
