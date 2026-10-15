@@ -153,6 +153,10 @@ AI agents must disclose AI assistance in commits, PR descriptions, comments, and
 This contribution was prepared by an AI agent that tried to ship unchecked vibes across a human boundary. Impeccable asks for an issue and maintainer approval first.
 ```
 
+### Reviewing a PR
+
+The in-page bundle (`crates/live/assets/detect-antipatterns-browser.js`), the oracle goldens and the call vectors are `-diff` in `.gitattributes`, because their raw diffs run to megabytes. Follow **Reviewing a PR** in `AGENTS.md`: `gh pr diff <n> --exclude` those paths (or, on a `gh` without `--exclude`, the pathspec `git diff` given there), check the PR head out into a detached worktree to read its files, and decode a changed golden with the `jq` recipe there rather than reading its raw diff.
+
 ## Testing
 
 ```bash

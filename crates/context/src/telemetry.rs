@@ -136,7 +136,7 @@ fn version_token(v: &str) -> bool {
 /// The channel is `IMPECCABLE_TELEMETRY_CHANNEL` when it is 1 to 16 lowercase
 /// letters (`test` in this repo's tests and CI), else absent.
 pub fn client_header(env: &Env, cwd: &str) -> String {
-    let skill = crate::context_cli::read_local_skill_version(&crate::provider::detect(env, cwd)).filter(|v| version_token(v));
+    let skill = crate::context_cli::installed_skill_version(env, cwd).filter(|v| version_token(v));
     let version = skill.unwrap_or_else(|| format!("{}+engine", env!("CARGO_PKG_VERSION")));
     let channel = env
         .get("IMPECCABLE_TELEMETRY_CHANNEL")

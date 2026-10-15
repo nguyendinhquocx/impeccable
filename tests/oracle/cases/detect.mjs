@@ -103,6 +103,13 @@ function Thumb({ url }: { url?: string }) {
 `),
       args: ['--no-config', '--json', 'repro.tsx'],
     },
+    // #884: a non-HTML file only gets the regex engine. Text mode says so, even
+    // on a zero-finding run.
+    {
+      id: 'detect-regex-only-note', verb: 'detect',
+      setup: (ws) => fs.writeFileSync(path.join(ws, 'probe.astro'), '<p style="font-size:8px">tiny functional label</p>\n'),
+      args: ['--no-config', 'probe.astro'],
+    },
     {
       id: 'detect-unresolved-custom-property-padding', verb: 'detect',
       setup: (ws) => fs.writeFileSync(path.join(ws, 'image-card.html'), `<!doctype html>
@@ -156,7 +163,12 @@ function Thumb({ url }: { url?: string }) {
     { id: 'detect-unknown-flag', verb: 'detect', args: ['--bogus', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
     { id: 'detect-bad-viewport', verb: 'detect', args: ['--viewport', 'wide', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
     { id: 'cli-help', verb: 'cli-help', args: [] },
-    { id: 'cli-version', verb: 'cli-version', args: [] },
+    {
+      id: 'cli-version', verb: 'cli-version', args: [],
+      // A fixture skill dir keeps the golden off every release cadence.
+      setup: (ws) => fs.writeFileSync(path.join(ws, 'SKILL.md'), '---\nname: impeccable\nversion: 9.9.9\n---\n'),
+      env: { IMPECCABLE_SKILL_DIR: '<WS>' },
+    },
 
     // Project config, DESIGN.md, inline ignores (detect-config workspace)
     { id: 'detect-config-page-json', verb: 'detect', workspace: 'detect-config', args: ['--json', 'src/page.html'] },
@@ -176,6 +188,11 @@ function Thumb({ url }: { url?: string }) {
     { id: 'detect-config-extensions-dir-json', verb: 'detect', workspace: 'detect-extensions', args: ['--json', '--no-design-system', 'app/views'] },
     { id: 'detect-config-extensions-file-json', verb: 'detect', workspace: 'detect-extensions', args: ['--json', '--no-design-system', 'app/views/first.html.erb'] },
     { id: 'detect-config-extensions-dir-no-config', verb: 'detect', workspace: 'detect-extensions', args: ['--no-config', '--json', 'app/views'] },
+    // #884 with #795: a configured html-engine extension is not regex-only, so
+    // the text run prints no note; without the config the same file goes to the
+    // regex engine and is counted.
+    { id: 'detect-config-extensions-dir-text', verb: 'detect', workspace: 'detect-extensions', args: ['--no-design-system', 'app/views'] },
+    { id: 'detect-config-extensions-file-text-no-config', verb: 'detect', workspace: 'detect-extensions', args: ['--no-config', '--no-design-system', 'app/views/first.html.erb'] },
     // A file in one project must not pick up another project's DESIGN.md
     { id: 'detect-config-cross-project', verb: 'detect', workspace: 'detect-config', args: ['--json', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
 

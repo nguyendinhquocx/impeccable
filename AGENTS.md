@@ -6,7 +6,7 @@
 
 ## Build, Test, and Development Commands
 
-- `cargo build --release -p impeccable` - build this checkout's runtime into `target/release/impeccable`.
+- `cargo build --release -p impeccable` - build this checkout's runtime into `target/release/impeccable`. This one binary is also the detector (`impeccable detect`); there is no separate detector binary. Point `IMPECCABLE_BIN` at it.
 - `cargo test --workspace` - run the Rust workspace tests.
 - `bun run build` - source-first build: regenerate `dist/`, derived site assets, and validation output without syncing tracked harness folders.
 - `bun run build:release` - release/distribution build: run the full build and sync tracked root harness folders plus `plugin/`.
@@ -69,6 +69,27 @@ Run `cargo xtask bundle` after rule or browser-bundle changes and commit its two
 Recent history favors short, imperative subjects such as `Fix: ...`, `Add ...`, `Improve ...`, or `Bump ...`. Keep commits focused and explain the user-facing impact when it is not obvious. PRs should summarize what changed, list validation performed, and call out whether generated provider output was intentionally omitted or intentionally refreshed. Include screenshots for visible `site/` changes and mention affected providers when transform behavior changes.
 
 **Do not bump manifest versions or add changelog entries in a feature PR.** Bumping is a release step: a version in a feature branch conflicts with every other open branch, and a changelog entry describes a release that has not happened yet. Land the code; the maintainer bumps `package.json` / `.claude-plugin/plugin.json` / `extension/manifest.json` and writes `site/pages/changelog.astro` when cutting the release (see **Releases**). The only PR that touches a manifest version is one whose purpose is the release itself.
+
+## Reviewing a PR
+
+The in-page bundle, the oracle goldens and the call vectors are marked `-diff` in `.gitattributes`: one bundle line is the whole wasm module, and each golden's output is one escaped JSON string, so their raw diffs run to megabytes. Read the PR's files from a checkout instead of `git show <ref>:<path>` slices, and read the generated files on purpose:
+
+```sh
+gh pr diff <n> --name-only                                   # what changed
+gh pr diff <n> --exclude 'tests/oracle/golden/*' --exclude 'tests/oracle/vectors/*' --exclude 'crates/live/assets/detect-antipatterns-browser.js'
+git fetch origin pull/<n>/head && git worktree add --detach "${TMPDIR:-/tmp}/pr-<n>" FETCH_HEAD   # Read and grep the PR's files here
+git -C "${TMPDIR:-/tmp}/pr-<n>" merge-tree --write-tree --name-only origin/main HEAD   # tree id, then any files that conflict with main
+gh pr checks <n>
+```
+
+`gh pr diff` ignores `.gitattributes`, hence the `--exclude` flags. A `gh` too old for `--exclude` can skip that line and diff in the worktree instead: `git -C "${TMPDIR:-/tmp}/pr-<n>" diff origin/main...HEAD -- . ':!tests/oracle/golden' ':!tests/oracle/vectors' ':!crates/live/assets/detect-antipatterns-browser.js'`. The pathspec matters there too: a local `git diff` honours the attributes of the checked-out tree, so a branch cut before they landed still prints the raw diff. `git grep` reports these files as binary; use `rg` or `git grep -a`. To review a changed golden by hand, decode it on both sides:
+
+```sh
+g='to_entries[]|"== \(.key)\n\(.value|if type=="string" then . else tojson end)"'; f=tests/oracle/golden/<case>.json
+diff <(git show origin/main:$f 2>/dev/null | jq -r "$g") <(git show HEAD:$f | jq -r "$g")   # in the PR worktree; a new case diffs against nothing
+```
+
+Remove the worktree when done (`git worktree remove "${TMPDIR:-/tmp}/pr-<n>"`).
 
 ## Contributing, Issue, and PR Guidelines
 

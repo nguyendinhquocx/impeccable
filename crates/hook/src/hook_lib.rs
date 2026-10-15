@@ -1559,6 +1559,7 @@ impl HookScanOptions {
             rule_pack: None,
             keep_consent_banners: false,
             keep_overlays: false,
+            unreported_rules: Vec::new(),
         }
     }
 }

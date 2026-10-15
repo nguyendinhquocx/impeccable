@@ -36,6 +36,11 @@ pub struct ScanOptions {
     /// engine waits briefly for a preloader and hides what is left, and hides
     /// known tours and badges, before the rule pass.
     pub keep_overlays: bool,
+    /// URL scans only: rules whose findings the CLI removes after the scan
+    /// (`ignoreRules`, and every rule outside the requested `--scope`s). The
+    /// browser engine reports them as before; it only stops letting one of
+    /// them stand in for another rule's finding (vanishing ink).
+    pub unreported_rules: Vec<String>,
 }
 
 /// A URL scan's findings plus the notes the CLI prints about how the page

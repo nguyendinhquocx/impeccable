@@ -3,16 +3,41 @@
 
 use crate::jsp;
 
+/// The gitdir of the checkout at `dir`: `<dir>/.git` itself when it is a
+/// directory, or the path a `.git` file names after `gitdir:` (a linked
+/// worktree or a submodule), resolved against `dir`.
+pub fn git_dir(dir: &str) -> Option<String> {
+    let dot_git = jsp::join(&[dir, ".git"]);
+    if std::path::Path::new(&dot_git).is_dir() {
+        return Some(dot_git);
+    }
+    let raw = std::fs::read_to_string(&dot_git).ok()?;
+    let (key, path) = raw.trim().split_once(':')?;
+    key.eq_ignore_ascii_case("gitdir").then(|| jsp::resolve(dir, &[path.trim()]))
+}
+
+/// The shared directory a linked worktree's gitdir names in its `commondir`
+/// file, relative to itself. `None` for any other gitdir: a main checkout's or
+/// a submodule's is its own common dir.
+pub fn common_dir(git_dir: &str) -> Option<String> {
+    let raw = std::fs::read_to_string(jsp::join(&[git_dir, "commondir"])).ok()?;
+    Some(jsp::resolve(git_dir, &[raw.trim()]))
+}
+
 /// The `info/exclude` git reads for the repository whose gitdir is the
-/// absolute path `git_dir`. A linked worktree's gitdir names the shared
-/// directory in a `commondir` file, relative to itself, and git then ignores
-/// the worktree's own `info`.
+/// absolute path `git_dir`. Git ignores a linked worktree's own `info`.
 pub fn info_exclude(git_dir: &str) -> String {
-    let common = match std::fs::read_to_string(jsp::join(&[git_dir, "commondir"])) {
-        Ok(raw) => jsp::resolve(git_dir, &[raw.trim()]),
-        Err(_) => git_dir.to_string(),
-    };
+    let common = common_dir(git_dir).unwrap_or_else(|| git_dir.to_string());
     jsp::join(&[&common, "info", "exclude"])
+}
+
+/// The main checkout of the linked worktree at `dir`: the parent of the
+/// common dir its gitdir names, when that parent's own `.git` is the common
+/// dir. A bare or separate-git-dir repository has no such checkout.
+pub fn linked_worktree_checkout(dir: &str) -> Option<String> {
+    let common = common_dir(&git_dir(dir)?)?;
+    let checkout = jsp::dirname(&common);
+    (git_dir(&checkout).as_deref() == Some(common.as_str())).then_some(checkout)
 }
 
 /// The header line of every `.gitignore` the engine writes into a runtime
@@ -69,6 +94,53 @@ mod tests {
             info_exclude(&worktree_git),
             jsp::join(&[&tmp, "repo", ".git", "info", "exclude"])
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn linked_worktree_checkout_needs_a_git_file_whose_gitdir_has_commondir() {
+        let base = std::env::temp_dir().join(format!("impeccable-common-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let tmp = base.to_string_lossy().into_owned();
+        let at = |parts: &[&str]| jsp::join(&[&[tmp.as_str()], parts].concat());
+
+        let linked_git = at(&["repo", ".git", "worktrees", "wt"]);
+        std::fs::create_dir_all(&linked_git).unwrap();
+        std::fs::write(jsp::join(&[&linked_git, "commondir"]), "../..\n").unwrap();
+        std::fs::create_dir_all(at(&["abs"])).unwrap();
+        std::fs::write(at(&["abs", ".git"]), format!("gitdir: {}\n", linked_git)).unwrap();
+        let checkout = Some(at(&["repo"]));
+        assert_eq!(linked_worktree_checkout(&at(&["abs"])), checkout);
+
+        std::fs::create_dir_all(at(&["rel"])).unwrap();
+        std::fs::write(at(&["rel", ".git"]), "GitDir: ../repo/.git/worktrees/wt\r\n").unwrap();
+        assert_eq!(linked_worktree_checkout(&at(&["rel"])), checkout);
+
+        std::fs::create_dir_all(at(&["plain", ".git"])).unwrap();
+        assert_eq!(git_dir(&at(&["plain"])), Some(at(&["plain", ".git"])));
+        assert_eq!(linked_worktree_checkout(&at(&["plain"])), None);
+
+        std::fs::create_dir_all(at(&["repo", ".git", "modules", "sub"])).unwrap();
+        std::fs::create_dir_all(at(&["repo", "sub"])).unwrap();
+        std::fs::write(at(&["repo", "sub", ".git"]), "gitdir: ../.git/modules/sub\n").unwrap();
+        assert_eq!(linked_worktree_checkout(&at(&["repo", "sub"])), None);
+
+        let bare_git = at(&["bare.git", "worktrees", "wt"]);
+        std::fs::create_dir_all(&bare_git).unwrap();
+        std::fs::write(jsp::join(&[&bare_git, "commondir"]), "../..\n").unwrap();
+        std::fs::create_dir_all(at(&["unrelated", "wt"])).unwrap();
+        std::fs::write(at(&["unrelated", "wt", ".git"]), format!("gitdir: {}\n", bare_git)).unwrap();
+        assert_eq!(linked_worktree_checkout(&at(&["unrelated", "wt"])), None);
+
+        // --separate-git-dir: the checkout's `.git` is a file naming the common dir.
+        let sep_git = at(&["sep.git", "worktrees", "wt"]);
+        std::fs::create_dir_all(&sep_git).unwrap();
+        std::fs::write(jsp::join(&[&sep_git, "commondir"]), "../..\n").unwrap();
+        std::fs::create_dir_all(at(&["sep"])).unwrap();
+        std::fs::write(at(&["sep", ".git"]), format!("gitdir: {}\n", at(&["sep.git"]))).unwrap();
+        std::fs::write(at(&["unrelated", "wt", ".git"]), format!("gitdir: {}\n", sep_git)).unwrap();
+        assert_eq!(linked_worktree_checkout(&at(&["unrelated", "wt"])), None);
 
         let _ = std::fs::remove_dir_all(&base);
     }

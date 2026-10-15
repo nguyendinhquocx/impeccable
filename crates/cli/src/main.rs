@@ -37,7 +37,12 @@ fn run(args: &[String], io: &mut Io) -> i32 {
             0
         }
         "--version" | "-v" => {
-            io.out(&format!("{CLI_VERSION}\n"));
+            // The installed skill's version, the number `npx impeccable update` moves;
+            // the npm shim answers --version itself, so this reaches direct runs only.
+            let cwd = io.cwd.to_string_lossy().into_owned();
+            let version = impeccable_context::context_cli::installed_skill_version(&io.env, &cwd)
+                .unwrap_or_else(|| format!("{VERSION}+engine"));
+            io.out(&format!("{version}\n"));
             0
         }
         // Launcher handshake: a cheap discriminator so the launchers can tell
@@ -114,10 +119,6 @@ fn run(args: &[String], io: &mut Io) -> i32 {
         }
     }
 }
-
-/// The npm `impeccable` package version `cli.js --version` prints (its
-/// `package.json`), tracked separately from the crate version.
-pub const CLI_VERSION: &str = "4.0.0";
 
 /// The engines wired into `impeccable detect`: the static HTML engine
 /// (crates/html). The browser engine (crates/browser) plugs in here once it
