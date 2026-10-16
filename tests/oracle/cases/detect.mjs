@@ -162,6 +162,17 @@ function Thumb({ url }: { url?: string }) {
     },
     { id: 'detect-unknown-flag', verb: 'detect', args: ['--bogus', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
     { id: 'detect-bad-viewport', verb: 'detect', args: ['--viewport', 'wide', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
+    // --cdp / --target (#951): the flag surface only. Attaching needs a
+    // running browser, which the oracle cannot host; crates/browser/tests/
+    // cdp_attach.rs covers the scan.
+    { id: 'detect-cdp-missing-value', verb: 'detect', args: ['--cdp', '--json'] },
+    { id: 'detect-cdp-remote-host', verb: 'detect', args: ['--cdp', '10.0.0.5:9222', '--json'] },
+    { id: 'detect-cdp-bad-port', verb: 'detect', args: ['--cdp=70000'] },
+    { id: 'detect-cdp-bad-path', verb: 'detect', args: ['--cdp', 'ws://127.0.0.1:9222/json/list'] },
+    { id: 'detect-cdp-with-targets', verb: 'detect', args: ['--cdp', '9222', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
+    { id: 'detect-cdp-with-viewport', verb: 'detect', args: ['--cdp', '9222', '--viewport', '390x844'] },
+    { id: 'detect-target-without-cdp', verb: 'detect', args: ['--target', 'app', `<REPO>/tests/fixtures/antipatterns/blinking-cursor.html`], isolateHome: false },
+    { id: 'detect-target-missing-value', verb: 'detect', args: ['--cdp', '9222', '--target'] },
     { id: 'cli-help', verb: 'cli-help', args: [] },
     {
       id: 'cli-version', verb: 'cli-version', args: [],

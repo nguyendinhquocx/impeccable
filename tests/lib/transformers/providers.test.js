@@ -86,7 +86,7 @@ for (const [key, config] of Object.entries(PROVIDERS)) {
           references: [{ name: 'polish', content: 'Run `{{scripts_path}}/impeccable detect`.', filePath: '/fake/polish.md' }],
         }], TEST_DIR);
         const content = fs.readFileSync(skillPath(config, 'impeccable'), 'utf8');
-        expect(content).toContain('call the ask_user_question tool');
+        expect(content).toContain('Ask with the ask_user_question tool');
         expect(content).toContain('.dsh/skills/impeccable/scripts/impeccable context');
         expect(parseFrontmatter(content).frontmatter['allowed-tools']).toBeUndefined();
         const root = path.join(TEST_DIR, 'dsh', '.dsh');

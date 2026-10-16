@@ -97,6 +97,19 @@ pub trait UrlEngine {
     fn open_shared(&self) -> Option<Box<dyn SharedBrowser + '_>> {
         None
     }
+    /// `--cdp`: scan a page of an app that is already running, through its
+    /// DevTools endpoint, with the same passes and output as a URL scan. The
+    /// engine attaches without launching, navigating, resizing or closing
+    /// anything, and leaves the page as it found it. `target` is the
+    /// `--target` substring of the page's URL or title.
+    fn detect_cdp_scan(
+        &self,
+        _endpoint: &crate::cdp_endpoint::CdpEndpoint,
+        _target: Option<&str>,
+        _options: &ScanOptions,
+    ) -> Result<UrlScan, EngineError> {
+        Err(EngineError::new("this build cannot attach to a running app (--cdp)"))
+    }
 }
 
 /// A `createBrowserDetector()` handle: `detectUrl` per target, `close()` at the end.

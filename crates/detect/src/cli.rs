@@ -45,6 +45,13 @@ Options:
   --no-overlay-hiding URL scans: keep product tours (driver.js) and
                       preloaders still covering the page instead of hiding
                       them before the scan
+  --cdp <port|url>    Scan a page of a running Chromium-based desktop app
+                      (Electron, NW.js, CEF, WebView2) through its local
+                      DevTools port instead of loading a URL. The page is
+                      scanned as shown and left as found: never navigated,
+                      resized or closed. Takes no file or URL targets
+  --target <text>     With --cdp: pick the page whose URL or title contains
+                      this text when the app has more than one
   --help              Show this help message
 
 Advisory findings:
@@ -80,14 +87,43 @@ Detection modes:
   Non-HTML files Regex pattern matching (CSS, JSX, TSX, etc.)
   URLs           Puppeteer full browser rendering (auto-detected;
                  http(s):// and file:// URLs; accessible linked CSS included)
+  Running apps   --cdp: a page of a Chromium-based app, attached through its
+                 DevTools port and scanned like a URL
 
 Examples:
   impeccable detect src/
   impeccable detect index.html
   impeccable detect https://example.com
+  impeccable detect --cdp 9222 --target \"My App\" --json
   impeccable detect --json .
   impeccable detect --no-config src/
 ";
+
+/// Remove every `--name <value>` / `--name=<value>` from `args`. `None` when
+/// the flag is absent, `Some(None)` when it has no value (the end of the
+/// arguments, or another `--` flag next), else the last value given.
+fn take_value_flag(args: &mut Vec<String>, name: &str) -> Option<Option<String>> {
+    let inline_prefix = format!("{name}=");
+    let mut found: Option<Option<String>> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(v) = args[i].strip_prefix(&inline_prefix) {
+            found = Some(Some(v.to_string()).filter(|v| !v.is_empty()));
+            args.remove(i);
+            continue;
+        }
+        if args[i] != name {
+            i += 1;
+            continue;
+        }
+        args.remove(i);
+        match args.get(i) {
+            Some(v) if !v.starts_with("--") => found = Some(Some(args.remove(i))),
+            _ => found = Some(None),
+        }
+    }
+    found
+}
 
 fn format_finding_summary(count: usize) -> String {
     format!(
@@ -535,6 +571,38 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
         ));
         return Err(Exit(1));
     }
+    let cdp_value = take_value_flag(&mut args, "--cdp");
+    let target_filter = take_value_flag(&mut args, "--target");
+    let cdp = match cdp_value {
+        None => None,
+        Some(None) => {
+            io.err(crate::cdp_endpoint::CDP_VALUE_ERROR);
+            return Err(Exit(1));
+        }
+        Some(Some(v)) => match crate::cdp_endpoint::parse_cdp_endpoint(&v) {
+            Ok(endpoint) => Some(endpoint),
+            Err(line) => {
+                io.err(&line);
+                return Err(Exit(1));
+            }
+        },
+    };
+    let target_filter = match target_filter {
+        None => None,
+        Some(Some(v)) if !impeccable_core::js::trim(&v).is_empty() => Some(v),
+        Some(_) => {
+            io.err("Error: --target requires a substring of the page's URL or title, e.g. --target localhost:5173\n");
+            return Err(Exit(1));
+        }
+    };
+    if target_filter.is_some() && cdp.is_none() {
+        io.err("Error: --target picks a page of the app --cdp attaches to; pass --cdp <port> with it\n");
+        return Err(Exit(1));
+    }
+    if cdp.is_some() && viewport.is_some() {
+        io.err("Error: --viewport does not apply with --cdp: the attached window keeps its own size\n");
+        return Err(Exit(1));
+    }
     let design_system_enabled = config_enabled
         && !has(&args, "--no-design-system")
         && detection_config.design_system_not_disabled();
@@ -561,6 +629,10 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
     if help_mode {
         io.out(USAGE);
         return Ok(0);
+    }
+    if cdp.is_some() && !targets.is_empty() {
+        io.err("Error: --cdp scans the page of a running app and takes no file or URL targets\n");
+        return Err(Exit(1));
     }
 
     let stdin_tty = io.stdin_is_tty;
@@ -589,7 +661,40 @@ fn detect_cli(args_in: &[String], io: &mut Io, engines: &Engines) -> Result<i32,
     };
 
     let mut all: Vec<Finding> = Vec::new();
-    if !stdin_tty && targets.is_empty() {
+    if let Some(endpoint) = cdp.as_ref() {
+        // http(s) URL scans never load a design system, and neither does an
+        // attached page: its URL says nothing about which project it is.
+        let options = ctx.base.clone();
+        let result = match ctx.engines.url {
+            Some(u) => u.detect_cdp_scan(endpoint, target_filter.as_deref(), &options),
+            None => crate::engines::UrlEngine::detect_cdp_scan(
+                &crate::engines::MissingUrlEngine,
+                endpoint,
+                target_filter.as_deref(),
+                &options,
+            ),
+        };
+        match result {
+            Ok(scan) => {
+                all.extend(scan.findings);
+                for note in scan.notes {
+                    // JSON mode prints no notes, but an attached scan's capture
+                    // notes say which checks did not run (a hidden window skips
+                    // the pixel reads), so they go to stderr there and stdout
+                    // stays the JSON.
+                    if ctx.json_mode {
+                        ctx.io.err(&format!("{note}\n"));
+                    } else if !ctx.design_notes.contains(&note) {
+                        ctx.design_notes.push(note);
+                    }
+                }
+            }
+            Err(e) => {
+                ctx.had_operational_failure = true;
+                ctx.io.err(&format!("Error: {}\n", e.message));
+            }
+        }
+    } else if !stdin_tty && targets.is_empty() {
         all = ctx.handle_stdin().map_err(|e| fatal(ctx.io, e))?;
     } else {
         let paths: Vec<String> = if targets.is_empty() {

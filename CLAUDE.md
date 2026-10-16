@@ -167,7 +167,7 @@ bun run test:plugin-e2e       # Just the plugin loader E2E (also part of the def
 bun run test:cleanup          # Kill live servers a previous run of THIS checkout left behind
 ```
 
-Unit tests (build orchestration, transformers, validators) run via `bun test`. Everything that spawns the engine binary (`tests/oracle.test.mjs`, `tests/framework-fixtures.test.mjs`) runs via `node --test`; both skip cleanly when no binary is found (`bun run fetch:engine` or `IMPECCABLE_BIN`). The `test` script handles this split automatically. Runtime unit and integration tests live under `crates/` and run with `cargo test --workspace`; the oracle goldens pin observable verb behavior across the same workspace.
+Unit tests (build orchestration, transformers, validators) run via `bun test`. Everything that spawns the engine binary (`tests/oracle.test.mjs`, `tests/framework-fixtures.test.mjs`) runs via `node --test`; both skip cleanly when no binary is found (`bun run fetch:engine` or `IMPECCABLE_BIN`). The `test` script handles this split automatically. Runtime unit and integration tests live under `crates/` and run with `cargo test --workspace` (about 10 minutes, mostly the Chrome-driven `impeccable-browser` tests; `bun run test:rust-changed` runs only the crates a change reaches, see AGENTS.md); the oracle goldens pin observable verb behavior across the same workspace.
 
 ### Live servers must not outlive their test process
 
@@ -194,10 +194,11 @@ The default suite does not cover everything. When a change touches one of these 
 | `ENGINE_VERSION` bump | also `bun run test:live-e2e-accept-cleanup` | bills a provider API key |
 | `ENGINE_VERSION` bump | `bun run test:live-svelte-adapter-deepseek` | bills DeepSeek |
 | `SKILL.src.md` Setup, Setup-adjacent reference files, `ENGINE_VERSION` bump | `bun run test:skill-behavior` | ~5 min, bills all four provider keys |
+| The skill's frontmatter `description` in `SKILL.src.md` | `bun run test:skill-activation` | ~3 min, about $1 (Anthropic + Google keys); baseline in `tests/skill-behavior/README.md` |
 | `ENGINE_VERSION` bump | `bun run test:new-work-e2e` | Playwright, offline, no API cost |
 | `plugin/`, `skill/agents/`, `scripts/build.js`, plugin manifest validator | `bun run test:plugin-e2e` | ~1 s; already in the default suite, needs the `claude` CLI |
 
-For verb-level behavior changes in `crates/`, run focused crate tests and `cargo test --workspace`, then `cargo build --release -p impeccable`. Run `IMPECCABLE_BIN="$PWD/target/release/impeccable" bun run test` to exercise the changed source rather than an older downloaded release. Add a new oracle case when the contract grows and review golden changes by hand. See `docs/ENGINE.md` for browser-bundle checks and generated assets.
+For verb-level behavior changes in `crates/`, run focused crate tests and `bun run test:rust-changed` (CI runs the whole workspace), then `cargo build --release -p impeccable`. Start long cargo runs as background commands and wait for the exit notification instead of polling with `sleep` or `pgrep`. Run `IMPECCABLE_BIN="$PWD/target/release/impeccable" bun run test` to exercise the changed source rather than an older downloaded release. Add a new oracle case when the contract grows and review golden changes by hand. See `docs/ENGINE.md` for browser-bundle checks and generated assets.
 
 **Plugin loader E2E** (`tests/plugin-e2e.test.mjs`, in the default suite): installs the committed `./plugin` subtree into a real Claude Code, sandboxed via `CLAUDE_CONFIG_DIR` in a temp dir, and asserts the component inventory from `claude plugin details`: the skill parses, every `plugin/agents/*.md` is visible, hooks are discovered. This is the only check that catches loader-contract surprises the unit guards can't know about (PR #494 shipped an `agents` manifest key that silently loaded zero agents; `claude plugin validate` never flags plugin-manifest problems). Runs in about a second; skips cleanly when the `claude` CLI is not on PATH. The known contract itself (allowed manifest keys, no `agents` key, trailing-slash `skills` path, source agents shipped) is pinned deterministically by `scripts/lib/validate-plugin-manifest.js`, unit-tested in `tests/validate-plugin-manifest.test.js` and enforced as a `bun run build` gate. Never add a key to the generated plugin manifest without verifying it against a real install and extending `KNOWN_LOADER_KEYS`.
 
@@ -367,6 +368,14 @@ The rule logic lives in `crates/core`: every check, the browser rule adapters ov
 | `skill/SKILL.src.md` and `reference/*.md` | Hand-edited if the rule introduces new design guidance |
 
 Order for a new rule: fixture here first, registry row in `crates/foundation/src/registry.rs`, the check in `crates/core` against that fixture, oracle case + golden, `cargo xtask bundle` to refresh the two tracked live assets, then `bun run build && bun run test` with a binary present. Rule counts quoted in `README.md` / `README.npm.md` are validated by `generateCounts` against `crates/live/assets/antipatterns.json`.
+
+**Hook cost is part of a rule.** The edit hook is a new process on every Edit or Write in millions of agent sessions, and it runs the whole text engine (or, for `.html`, the whole static HTML engine) cold: `IMMEDIATE_TIER_RULES` only filters which findings are shown per edit, it does not skip rules. So every text or static-HTML rule is paid on every edit, regex compilation and lazy tables included, and a millisecond matters. Before landing a new or changed check in those engines, measure it on main and on the branch and put both numbers in the PR:
+
+```bash
+cargo run --release -p impeccable-html --example rule_cost -- --runs 9 tests/fixtures/antipatterns <real project source>
+```
+
+It writes `rule-cost.json`: per edit, cold, per engine, the shared parse and cascade work, and every profiled unit with the rules it emitted (mean, p50, p95 ms). A rule inside a shared pass (`color-rules`, `html-patterns`, ...) moves that pass's number. Prefer the detection that touches less: one regex over many, a tag- or property-gated check over a per-element walk, work that rides an existing pass over a new one. A check that needs layout or pixels belongs in the browser engine, not the hook. The Detector Lab's Rules page charts these numbers per rule.
 
 ### Rule packs (downstream crates adding rules)
 

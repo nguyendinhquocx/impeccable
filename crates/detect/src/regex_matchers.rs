@@ -2245,6 +2245,8 @@ pub fn analyzer_rule_id(i: usize) -> String {
         "marketing-buzzword",
         "aphoristic-cadence",
         "dark-glow",
+        "radial-halo",
+        "marquee",
     ];
     IDS.get(i)
         .map(|s| s.to_string())

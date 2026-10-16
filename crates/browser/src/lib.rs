@@ -23,6 +23,10 @@
 //! ([`overlays`]), so every pass and the screenshot see the page a visitor
 //! sees once they dismiss them.
 //!
+//! `detect --cdp` ([`attach`]) runs the same passes over a page of an app
+//! that is already running, attached through its DevTools port instead of
+//! loaded, and leaves that page as it found it.
+//!
 //! Two entry points serve measurement work rather than the CLI.
 //! [`detect_url_evidence`] runs the same scan and also returns what a
 //! reviewer needs to check the findings (the captures and hit-test answers,
@@ -30,6 +34,7 @@
 //! passes over a recorded capture with no browser, so a rule change can be
 //! measured against saved pages.
 
+pub mod attach;
 pub mod cdp;
 pub mod consent;
 pub mod overlays;
@@ -116,6 +121,15 @@ impl UrlEngine for BrowserEngine {
 
     fn detect_url_scan(&self, url: &str, options: &ScanOptions) -> Result<UrlScan, EngineError> {
         detect_url_impl(self, url, options, "networkidle0", 0, None)
+    }
+
+    fn detect_cdp_scan(
+        &self,
+        endpoint: &impeccable_detect::cdp_endpoint::CdpEndpoint,
+        target: Option<&str>,
+        options: &ScanOptions,
+    ) -> Result<UrlScan, EngineError> {
+        attach::detect_cdp(endpoint, target, options)
     }
 
     fn open_shared(&self) -> Option<Box<dyn SharedBrowser + '_>> {
@@ -1107,7 +1121,7 @@ fn scan_page_inner(
     settle_ms: u64,
     viewport: Viewport,
     profile: Option<&DetectorProfile>,
-    mut evidence: Option<(&mut Evidence, &EvidenceRequest)>,
+    evidence: Option<(&mut Evidence, &EvidenceRequest)>,
     consent: &mut ConsentReport,
     notes: &mut Vec<String>,
     overlays: &mut OverlayReport,
@@ -1131,7 +1145,24 @@ fn scan_page_inner(
             std::thread::sleep(Duration::from_millis(settle_ms))
         });
     }
+    scan_loaded(page, url, options, viewport, profile, evidence, consent, notes, overlays)
+}
 
+/// Every pass over a page that is already showing what is to be scanned: a
+/// URL scan's freshly loaded page, or an attached app's page as it stands
+/// ([`attach`]). `viewport` is the page's viewport size.
+#[allow(clippy::too_many_arguments)]
+fn scan_loaded(
+    page: &mut Page<'_>,
+    url: &str,
+    options: &ScanOptions,
+    viewport: Viewport,
+    profile: Option<&DetectorProfile>,
+    mut evidence: Option<(&mut Evidence, &EvidenceRequest)>,
+    consent: &mut ConsentReport,
+    notes: &mut Vec<String>,
+    overlays: &mut OverlayReport,
+) -> Result<Vec<RawResult>, EngineError> {
     // A challenge or error page is not the site: refuse to report on it. Nor
     // is a consent wall, unless the scan keeps the banners: then the banner
     // is what the caller asked to read.
@@ -1361,8 +1392,27 @@ fn scan_page_inner(
         )
     })
     .map_err(cdp_err)?;
-    let (mut visual, superseded) =
-        run_visual_contrast_fallback(page, &analyses, &serialized_groups, viewport, profile, url)?;
+    // A hidden window paints no frames, and a screenshot of it can wait for
+    // one that never comes: an attached page skips the pixel reads while it
+    // is hidden, and they stop if one stalls. What they would have read
+    // keeps the element pass's verdict, as advisory.
+    let pixels_off = page.is_attached()
+        && page
+            .evaluate_value("document.visibilityState === 'hidden'")
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+    let (mut visual, superseded, stalled) =
+        run_visual_contrast_fallback(page, &analyses, &serialized_groups, viewport, profile, url, pixels_off)?;
+    if pixels_off {
+        notes.push(format!(
+            "Capture note: {url} was hidden (minimized, or a background tab or window), so the pixel pass read nothing there. Bring it on screen, focused or not, and scan again for those contrast verdicts."
+        ));
+    } else if let Some(why) = stalled {
+        notes.push(format!(
+            "Capture note: the pixel pass on {url} stopped when a screenshot stalled ({why}). Bring the window on screen and scan again for the contrast verdicts it did not read."
+        ));
+    }
     settle_handed_over(&mut results, &superseded, |r| {
         repeated_match(&base, r.selector.as_deref()?, r.scan_el?)
     });
@@ -1993,6 +2043,13 @@ fn analysis_findings(
 /// target)`: the JS post-processing of the analytic/canvas analyses
 /// (`analyzeVisualContrast`, computed natively in [`snapshot_engine`]) plus the
 /// screenshot pixel fallback for candidates the analyses left unresolved.
+///
+/// `skip_pixels` leaves out the screenshot reads (an attached page that is
+/// hidden). On an attached page a screenshot that times out
+/// ([`is_screenshot_stall`]) ends the reads instead of the scan, and the
+/// third value says why; any other error (the document navigated, the
+/// connection closed) still fails the scan.
+#[allow(clippy::too_many_arguments)]
 fn run_visual_contrast_fallback(
     page: &mut Page<'_>,
     browser_analyses: &[Value],
@@ -2000,7 +2057,8 @@ fn run_visual_contrast_fallback(
     viewport: Viewport,
     profile: Option<&DetectorProfile>,
     target: &str,
-) -> Result<(Vec<RawResult>, Vec<CandidateKey>), EngineError> {
+    skip_pixels: bool,
+) -> Result<(Vec<RawResult>, Vec<CandidateKey>, Option<String>), EngineError> {
     // Text the element pass hands over rather than scores (see
     // `visual::routed_reason`): its element verdict does not keep the pixels
     // from reading it, and the pixels' verdict replaces that one.
@@ -2046,6 +2104,7 @@ fn run_visual_contrast_fallback(
         .collect();
     let filtered: Vec<&Value> = candidates
         .iter()
+        .filter(|_| !skip_pixels)
         .filter(|c| {
             let sel = c.get("selector").and_then(Value::as_str);
             (!existing_low_contrast
@@ -2065,13 +2124,18 @@ fn run_visual_contrast_fallback(
         // say nothing than measure that. Playing media is the one moving thing
         // a scan can hold still without changing what the page shows: a paused
         // video still paints the frame the visitor is looking at.
-        let _ = page.evaluate(
-            "document.querySelectorAll('video').forEach(v => { try { v.pause(); } catch (e) {} })",
-        );
+        // An attached app's page gets back the videos this paused, and only
+        // those ([`attach::RESTORE_JS`]).
+        let _ = page.evaluate(if page.is_attached() {
+            "(() => { const paused = globalThis.__impeccablePausedMedia || (globalThis.__impeccablePausedMedia = []); document.querySelectorAll('video').forEach(v => { try { if (!v.paused) { v.pause(); paused.push(v); } } catch (e) {} }); })()"
+        } else {
+            "document.querySelectorAll('video').forEach(v => { try { v.pause(); } catch (e) {} })"
+        });
     }
     let mut routed_spent = std::time::Duration::ZERO;
     let mut routed_misses = 0usize;
     let mut pixel_pairs: Vec<String> = Vec::new();
+    let mut stalled: Option<String> = None;
     for candidate in filtered {
         let sel = candidate.get("selector").and_then(Value::as_str);
         // A read the first budget's rules would not have made.
@@ -2084,7 +2148,7 @@ fn run_visual_contrast_fallback(
         }
         let started = std::time::Instant::now();
         let mut measured = false;
-        let result = step_findings(profile, "visual-contrast", "pixel-diff", target, || {
+        let read = step_findings(profile, "visual-contrast", "pixel-diff", target, || {
             let m = screenshot_contrast::measure_visual_contrast_candidate(
                 page,
                 candidate,
@@ -2104,7 +2168,15 @@ fn run_visual_contrast_fallback(
                     })
                     .unwrap_or_default(),
             )
-        })?;
+        });
+        let result = match read {
+            Ok(r) => r,
+            Err(e) if page.is_attached() && is_screenshot_stall(&e.message) => {
+                stalled = Some(e.message);
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         if extra {
             let spent = started.elapsed();
             routed_spent += spent;
@@ -2130,7 +2202,14 @@ fn run_visual_contrast_fallback(
                 }),
         );
     }
-    Ok((findings, superseded))
+    Ok((findings, superseded, stalled))
+}
+
+/// Whether a pixel read failed because its screenshot timed out (a window
+/// that paints no frames), as opposed to a page that navigated or a
+/// connection that closed.
+fn is_screenshot_stall(message: &str) -> bool {
+    message.starts_with("Page.captureScreenshot timed out")
 }
 
 /// The colour pair a pixel-pass finding reports: the candidate's ink, its
@@ -2176,6 +2255,16 @@ fn truthy(v: Option<&Value>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_screenshot_timeout_is_a_stall() {
+        assert!(is_screenshot_stall(
+            "Page.captureScreenshot timed out. Increase the 'protocolTimeout' setting in launch/connect calls for a higher timeout if needed."
+        ));
+        assert!(!is_screenshot_stall("isolated capture context was destroyed or document changed"));
+        assert!(!is_screenshot_stall("Protocol error: connection closed (IO error)"));
+        assert!(!is_screenshot_stall("Runtime.evaluate timed out. Increase the 'protocolTimeout' setting"));
+    }
 
     #[test]
     fn a_routed_pixel_pair_reports_once_per_page() {

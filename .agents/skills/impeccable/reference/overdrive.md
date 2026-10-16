@@ -14,14 +14,14 @@ Context decides what "extraordinary" means. A particle system on a creative port
 This command has the highest potential to misfire. Do NOT jump straight into implementation. You MUST:
 
 1. **Think through 2-3 different directions**: consider different techniques, levels of ambition, and aesthetic approaches. For each direction, briefly describe what the result would look and feel like.
-2. **Get the user's pick before writing any code.** STOP and use Codex's structured user-input/question tool when available; if unavailable, ask directly in chat to clarify what you cannot infer. Carry each direction's description and its trade-offs (browser support, performance cost, complexity) inside the option itself, so the user is choosing between things they can read. A structured question blocks the message it rides in until the user answers, so directions written alongside the question stay invisible while the user is being asked to choose between them.
+2. **Get the user's pick before writing any code.** Ask with Codex's structured user-input/question tool when available, or directly in chat if it is not, and wait for the answer before continuing. Carry each direction's description and its trade-offs (browser support, performance cost, complexity) inside the option itself, so the user is choosing between things they can read. A structured question blocks the message it rides in until the user answers, so directions written alongside the question stay invisible while the user is being asked to choose between them.
 3. Only proceed with the direction the user confirms.
 
 Skipping this step risks building something embarrassing that needs to be thrown away.
 
 ### Verify in the Browser
 
-Ambitious effects rarely work on the first try, so verify them in the browser rather than from code: an effect that technically runs can still stutter, ease wrong, or land on the wrong frame. SKILL.md's bounded passes apply: one batched inspection, one fix batch, at most one confirming round. Point them at the effect's timing, easing, and smoothness, then stop and name what still falls short instead of opening another round.
+Ambitious effects rarely work on the first try, so verify them in the browser rather than from code: an effect that technically runs can still stutter, ease wrong, or land on the wrong frame. Aim the checks at timing, easing, and smoothness, batch the fixes between looks, and keep refining until the effect is extraordinary.
 
 ---
 

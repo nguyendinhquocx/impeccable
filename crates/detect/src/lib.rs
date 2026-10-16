@@ -10,6 +10,7 @@
 //! [`engines::Engines`]. crates/html depends on this crate for the design
 //! system types and helpers ([`design_system`]).
 
+pub mod cdp_endpoint;
 pub mod cli;
 pub mod config;
 pub mod design_system;

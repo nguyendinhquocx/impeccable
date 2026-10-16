@@ -13,7 +13,8 @@
  *   ctx-adaptive       PRODUCT.md `## Platform` "ios, android"
  *   ctx-bad-platform   PRODUCT.md `## Platform` flutter + pubspec.yaml
  *   ctx-monorepo       pnpm-workspace + apps/a (own PRODUCT/DESIGN) + apps/b (inherits) + projectRoots
- *   ctx-legacy         unstamped PRODUCT.md with ## Register, DESIGN.json sidecar v1, bad config, orphan brief
+ *   ctx-monorepo-tooling  turbo + workspaces: apps/web (react), apps/mobile (Flutter), apps/api, packages/ui (react peer) + three tooling packages
+ *   ctx-legacy        unstamped PRODUCT.md with ## Register, DESIGN.json sidecar v1, bad config, orphan brief
  *   ctx-csp-*          one per detect-csp shape (append-arrays, append-string, middleware, meta, none)
  *   ctx-signals        git-initialised in setup() with fixed author/committer dates
  *   ctx-pin            .claude/.agents/.cursor skills dirs with impeccable installed
@@ -367,6 +368,14 @@ const cases = [
   { id: 'context-native-evidence-web', verb: 'context', workspace: 'ctx-product-only', setup: (ws) => write(ws, 'ios/Podfile', "platform :ios, '15.0'\n"), env: env(), files: IMPECCABLE_FILES },
   { id: 'context-build-path-unset-with-surfaces', verb: 'context', workspace: 'ctx-product-only', setup: (ws) => write(ws, '.impeccable/surfaces/src-app-tsx.md', '---\nversion: 1\nslug: "src-app-tsx"\nprimary_target: "src/App.tsx"\nrelated_targets: []\n---\n\n# Surface brief: App\n'), env: env(), files: IMPECCABLE_FILES },
   { id: 'context-project-roots-match-nothing', verb: 'context', workspace: 'ctx-monorepo', setup: (ws) => write(ws, '.impeccable/config.json', JSON.stringify({ projectRoots: ['services/*'] }, null, 2) + '\n'), env: env(), files: IMPECCABLE_FILES },
+  // #1014: target selection offers only workspaces with a UI signal and counts
+  // the rest; explicit projectRoots are never filtered; a `!` projectRoots
+  // entry still hides a workspace; no UI workspace at all keeps the full list.
+  { id: 'context-monorepo-tooling-root', verb: 'context', workspace: 'ctx-monorepo-tooling', env: env(), files: IMPECCABLE_FILES },
+  { id: 'context-monorepo-tooling-explicit-roots', verb: 'context', workspace: 'ctx-monorepo-tooling', setup: (ws) => write(ws, '.impeccable/config.json', JSON.stringify({ projectRoots: ['apps/*', 'packages/scripts'] }, null, 2) + '\n'), env: env(), files: IMPECCABLE_FILES },
+  { id: 'context-monorepo-tooling-negated-root', verb: 'context', workspace: 'ctx-monorepo-tooling', setup: (ws) => write(ws, '.impeccable/config.json', JSON.stringify({ projectRoots: ['!packages/ui'] }, null, 2) + '\n'), env: env(), files: IMPECCABLE_FILES },
+  { id: 'context-monorepo-tooling-no-ui', verb: 'context', workspace: 'ctx-monorepo-tooling', setup: (ws) => { fs.rmSync(path.join(ws, 'apps/web'), { recursive: true }); fs.rmSync(path.join(ws, 'packages/ui'), { recursive: true }); fs.rmSync(path.join(ws, 'apps/mobile'), { recursive: true }); }, env: env(), files: IMPECCABLE_FILES },
+  { id: 'context-monorepo-tooling-bare-name', verb: 'context', workspace: 'ctx-monorepo-tooling', args: ['--target', 'tsconfig'], env: env(), files: IMPECCABLE_FILES },
   { id: 'context-hook-manifest-source-provider', verb: 'context', workspace: 'ctx-product-only', setup: (ws) => write(ws, '.claude/settings.local.json', JSON.stringify({ hooks: { PostToolUse: [{ hooks: [{ type: 'command', command: 'node .claude/skills/impeccable/scripts/hook.mjs' }] }] } }, null, 2) + '\n'), env: env(), files: IMPECCABLE_FILES },
   // Upgrade path (triage E8): a v3 install left a `.claude/settings.local.json`
   // naming the retired `node .../hook.mjs` script. Under the real provider the

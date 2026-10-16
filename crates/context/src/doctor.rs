@@ -70,7 +70,7 @@ fn collect(cwd: &str, target: &TargetOptions, env: &Env, provider_id: &str) -> R
     let abs_design_path = ctx.design_path.as_deref().map(|p| jsp::resolve(cwd, &[p]));
     let sidecar_candidates = design_sidecar_candidates_for(&project_root, Some(&ctx.context_dir));
     let known = load_known_rule_ids();
-    let selection = resolve_target_selection(cwd, target, env);
+    let selection = resolve_workspace_selection(cwd, target, env);
     let workspace_candidates: Vec<TargetCandidate> = selection.map(|s| s.target_candidates).unwrap_or_default();
     let (ws_findings, workspaces) = check_workspaces(&ctx.repo_root, &workspace_candidates);
 

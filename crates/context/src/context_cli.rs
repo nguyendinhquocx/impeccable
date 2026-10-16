@@ -392,9 +392,23 @@ fn build_target_selection_directive(sel: &TargetSelection) -> String {
     m.insert("projectRoot".into(), Value::String(sel.project_root.clone()));
     m.insert("repoRoot".into(), Value::String(sel.repo_root.clone()));
     m.insert("targetCandidates".into(), serde_json::to_value(&sel.target_candidates).unwrap());
+    if sel.skipped_non_ui > 0 {
+        m.insert("skippedNonUiWorkspaces".into(), Value::from(sel.skipped_non_ui));
+    }
+    let skipped = if sel.skipped_non_ui > 0 {
+        format!(
+            " {} workspace{} without a UI signal (no UI framework dependency, HTML entry, native app marker, or UI source file) {} not listed; reach one with `--target <path>` only when the user names it.",
+            sel.skipped_non_ui,
+            if sel.skipped_non_ui == 1 { "" } else { "s" },
+            if sel.skipped_non_ui == 1 { "is" } else { "are" }
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "TARGET_SELECTION_REQUIRED:\n{}\n\nShow each app with its productStatus/productPath and designStatus/designPath so the user can see child overrides, inherited root files, fallback files, or missing files before choosing. Ask the user which app Impeccable should use, then rerun Impeccable helper commands from that child app cwd using this same scripts directory. Use `--target <path>` only as a fallback when changing cwd is not possible, or when the user explicitly named a file/path.",
-        json_pretty(&Value::Object(m))
+        "TARGET_SELECTION_REQUIRED:\n{}\n\nShow each app with its productStatus/productPath and designStatus/designPath so the user can see child overrides, inherited root files, fallback files, or missing files before choosing. Ask the user which app Impeccable should use, then rerun Impeccable helper commands from that child app cwd using this same scripts directory. Use `--target <path>` only as a fallback when changing cwd is not possible, or when the user explicitly named a file/path.{}",
+        json_pretty(&Value::Object(m)),
+        skipped
     )
 }
 

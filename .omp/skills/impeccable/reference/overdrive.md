@@ -21,7 +21,7 @@ Skipping this step risks building something embarrassing that needs to be thrown
 
 ### Verify in the Browser
 
-Ambitious effects rarely work on the first try, so verify them in the browser rather than from code: an effect that technically runs can still stutter, ease wrong, or land on the wrong frame. SKILL.md's bounded passes apply: one batched inspection, one fix batch, at most one confirming round. Point them at the effect's timing, easing, and smoothness, then stop and name what still falls short instead of opening another round.
+Ambitious effects rarely work on the first try, so verify them in the browser rather than from code: an effect that technically runs can still stutter, ease wrong, or land on the wrong frame. Aim the checks at timing, easing, and smoothness, batch the fixes between looks, and keep refining until the effect is extraordinary.
 
 ---
 
