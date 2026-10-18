@@ -223,6 +223,9 @@ export const SUITES = {
       ...COMMON_INFRA_PATTERNS,
       /^skill\/scripts\/live-browser/,
       /^ENGINE_VERSION$/,
+      // The HTTP core the live server runs on (in common since the decision
+      // page and component review share it) and live's re-export of it.
+      /^crates\/(common\/src\/http|live\/src\/live_http)\.rs$/,
       /^tests\/framework-fixtures/,
       /^tests\/live-e2e(\.test\.mjs|\/)/,
       /^browser-bundle\/40-overlay\.js$/,
@@ -237,20 +240,24 @@ export const SUITES = {
     ],
   },
   'new-work-e2e': {
-    description: 'Playwright smoke sweep of the new-work concept/serve-question decision page plus the offline fake image generator.',
+    description: 'Playwright smoke checks of native decision and review pages, plus the offline fake image generator.',
     optIn: true,
     needsPlaywright: true,
     triggers: [
       ...COMMON_INFRA_PATTERNS,
       /^ENGINE_VERSION$/,
       /^tests\/new-work-e2e(\.test\.mjs|\/)/,
+      /^tests\/review-theme\.test\.mjs$/,
+      /^ui\/component-review\//,
+      /^crates\/context\/src\/(question_page|serve_question)\.rs$/,
+      /^crates\/context\/src\/component_review\/server\.rs$/,
     ],
     commands: [
       {
         runner: 'node',
         timeoutMs: 600000,
         forceExit: true,
-        files: ['tests/new-work-e2e.test.mjs'],
+        files: ['tests/new-work-e2e.test.mjs', 'tests/review-theme.test.mjs'],
       },
     ],
   },

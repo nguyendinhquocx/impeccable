@@ -71,7 +71,7 @@ pub enum Unpainted {
     /// The box has no width or no height, and none of its content shows past
     /// that edge.
     NoArea,
-    /// A text measurement's text is set at a font size under 1px, and no
+    /// A text measurement's text is set at a font size of 1px or less, and no
     /// descendant sets it larger: a Slick dot's `font-size: 0` label, a link
     /// laid over a card whose words only a screen reader reads.
     NoFontSize,
@@ -141,9 +141,11 @@ pub const PAINT_GATED_TEXT_RULES: &[&str] = &[
     "justified-text",
     "line-length",
     "low-contrast",
+    "straggler",
     "text-overflow",
     "tight-leading",
     "tiny-text",
+    "unbalanced-heading",
     "undersized-ui-text",
     "wide-tracking",
 ];
@@ -562,6 +564,35 @@ fn unpainted_walk(
     outside_document(dom, &band, vis, viewport_w)
 }
 
+/// The ancestors of `el`, below the body, whose overflow can clip it, by
+/// the placement rules of [`unpainted_inside`]'s walk: an in-flow box is
+/// clipped by every ancestor, an absolute box only from its containing
+/// block up, a fixed box only from a containing ancestor up. An undecided
+/// ancestor is not taken as the containing block.
+pub(crate) fn clipping_ancestors(dom: &dyn Dom, el: ElId) -> Vec<ElId> {
+    let body = dom.body();
+    let root = dom.document_element();
+    let mut placement = Placement::of(dom, el);
+    let mut out = Vec::new();
+    let mut cur = dom.parent(el);
+    while let Some(p) = cur {
+        if Some(p) == body || Some(p) == root {
+            break;
+        }
+        let containment = if placement == Placement::InFlow {
+            Containment::DoesNot
+        } else {
+            contains_fixed(dom, p)
+        };
+        if placement.clipped_by(dom, p, containment) {
+            out.push(p);
+            placement = Placement::of(dom, p);
+        }
+        cur = dom.parent(p);
+    }
+    out
+}
+
 /// How an element's box is placed, which decides which ancestors clip it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Placement {
@@ -724,26 +755,134 @@ fn no_text(dom: &dyn Dom, el: ElId) -> Option<Unpainted> {
 /// the resource fails to load, which a capture does not record.
 const FALLBACK_HOST_TAGS: &[&str] = &["audio", "canvas", "iframe", "video"];
 
-/// A text measurement whose text is set under 1px: the element's computed
-/// font size parses below 1px, and no descendant that carries text of its own
-/// sets a size of 1px or more (the gap-collapsing `font-size: 0` on a row of
-/// inline blocks, whose children set their own). A size that does not parse
-/// keeps the finding. The subtree is read only once the element's own size
-/// is under 1px.
+/// A text measurement whose text is set at 1px or less: the element's
+/// computed font size parses to 1px or under, and no descendant that carries
+/// text of its own sets a larger size (the gap-collapsing `font-size: 0` on a
+/// row of inline blocks, whose children set their own). A glyph a pixel tall
+/// is a dot, not a letter: uni-hannover.de hides a "Die LUH auf Mastodon"
+/// link with an inline `font-size: 1px` in a static 9x1 box that no clip
+/// removes. A size that does not parse keeps the finding. The subtree is read
+/// only once the element's own size is that small. A size a transform draws
+/// larger is read at the drawn size ([`drawn_enlargement`]): `font-size: 1px`
+/// under `transform: scale(16)` paints 16px letters.
 fn no_font_size(dom: &dyn Dom, el: ElId) -> Option<Unpainted> {
-    if !under_1px(&dom.style(el, "fontSize")) {
+    if !at_most_1px(&dom.style(el, "fontSize")) {
+        return None;
+    }
+    let drawn = js::parse_float(&dom.style(el, "fontSize")) * drawn_enlargement(dom, el);
+    if !(drawn <= 1.0) {
         return None;
     }
     let sized_text = dom.query_all(Some(el), "*").unwrap_or_default().into_iter().any(|d| {
-        has_direct_text_longer_than(dom, d, 0) && !under_1px(&dom.style(d, "fontSize"))
+        has_direct_text_longer_than(dom, d, 0) && !at_most_1px(&dom.style(d, "fontSize"))
     });
     (!sized_text).then_some(Unpainted::NoFontSize)
 }
 
-/// A computed `font-size` that parses to a size under 1px.
-pub fn under_1px(font_size: &str) -> bool {
+/// A computed individual `scale` as its x and y factors: `none` or an empty
+/// value is (1, 1), one value scales both axes, and a percentage is read
+/// over 100. `None` for anything else.
+fn individual_scale(value: &str) -> Option<(f64, f64)> {
+    let v = js::trim(value);
+    if v.is_empty() || v == "none" {
+        return Some((1.0, 1.0));
+    }
+    let parts: Vec<f64> = v
+        .split_ascii_whitespace()
+        .map(|p| match p.strip_suffix('%') {
+            Some(n) => js::parse_float(n) / 100.0,
+            None => js::parse_float(p),
+        })
+        .collect();
+    if parts.is_empty() || parts.len() > 3 || !parts.iter().all(|n| n.is_finite()) {
+        return None;
+    }
+    Some((parts[0], *parts.get(1).unwrap_or(&parts[0])))
+}
+
+/// A computed individual `rotate` as a turn about z, in radians: `none` or
+/// an empty value is 0, and an angle alone, `z <angle>` or `0 0 1 <angle>`
+/// turns about z. `None` for a turn about another axis or a value that does
+/// not parse.
+fn individual_rotate_z(value: &str) -> Option<f64> {
+    let v = js::to_lower_case(js::trim(value));
+    if v.is_empty() || v == "none" {
+        return Some(0.0);
+    }
+    let parts: Vec<&str> = v.split_ascii_whitespace().collect();
+    let angle = match parts.as_slice() {
+        [a] => *a,
+        ["z", a] => *a,
+        [x, y, z, a] if js::parse_float(x) == 0.0 && js::parse_float(y) == 0.0 && js::parse_float(z) > 0.0 => *a,
+        _ => return None,
+    };
+    let (n, per_unit) = if let Some(n) = angle.strip_suffix("deg") {
+        (n, std::f64::consts::PI / 180.0)
+    } else if let Some(n) = angle.strip_suffix("grad") {
+        (n, std::f64::consts::PI / 200.0)
+    } else if let Some(n) = angle.strip_suffix("rad") {
+        (n, 1.0)
+    } else if let Some(n) = angle.strip_suffix("turn") {
+        (n, std::f64::consts::TAU)
+    } else {
+        return None;
+    };
+    let n = js::parse_float(n);
+    n.is_finite().then_some(n * per_unit)
+}
+
+/// How much larger than its layout size `el`'s letters are drawn: the
+/// computed `transform`s and individual `scale`s and `rotate`s of `el` and
+/// its ancestors multiplied, and the
+/// shorter of the drawn lengths of a unit step along x and along y, when
+/// that enlarges by more than a twentieth; else 1. A rotation draws both
+/// steps at their own length, so it enlarges nothing, and a stretch on one
+/// axis (`scaleX(2)`) leaves the letters as thin as they were the other way;
+/// `rotate(90deg) scale(16)` draws 16px letters. A transform that does not
+/// read as a matrix, an individual `rotate` about another axis than z, or a
+/// chain deeper than the walk reads counts as no enlargement.
+fn drawn_enlargement(dom: &dyn Dom, el: ElId) -> f64 {
+    const MAX_ANCESTORS: usize = 64;
+    let mut total = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let mut cur = Some(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { break };
+        let t = dom.style(c, "transform");
+        let t = js::trim(&t);
+        if !(t.is_empty() || t == "none") {
+            let Some(m) = linear_part(t) else { return 1.0 };
+            total = multiply(&rows(&m), &total);
+        }
+        // The individual `scale` property composes outside `transform`
+        // (the element's matrix is translate, rotate, scale, then transform,
+        // left to right), so it multiplies after it.
+        let Some((sx, sy)) = individual_scale(&dom.style(c, "scale")) else { return 1.0 };
+        if sx != 1.0 || sy != 1.0 {
+            total = multiply(&[[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]], &total);
+        }
+        // The individual `rotate` composes outside `scale`. A turn about an
+        // axis other than z, or one that does not parse, claims nothing.
+        let Some(turn) = individual_rotate_z(&dom.style(c, "rotate")) else { return 1.0 };
+        if turn != 0.0 {
+            let (sin, cos) = turn.sin_cos();
+            total = multiply(&[[cos, -sin, 0.0], [sin, cos, 0.0], [0.0, 0.0, 1.0]], &total);
+        }
+        cur = dom.parent(c);
+    }
+    if cur.is_some() {
+        return 1.0;
+    }
+    let x = (total[0][0] * total[0][0] + total[1][0] * total[1][0]).sqrt();
+    let y = (total[0][1] * total[0][1] + total[1][1] * total[1][1]).sqrt();
+    let scale = x.min(y);
+    if scale.is_finite() && scale > 1.05 { scale } else { 1.0 }
+}
+
+/// A computed `font-size` that parses to 1px or less: a size no glyph can be
+/// read at.
+pub fn at_most_1px(font_size: &str) -> bool {
     let n = js::parse_float(font_size);
-    n.is_finite() && n < 1.0
+    n.is_finite() && n <= 1.0
 }
 
 /// Whether `node` is a face turned away under `backface-visibility: hidden`:
@@ -1059,6 +1198,73 @@ fn is_script_scroll_frame(dom: &dyn Dom, p: ElId, cr: &Rect, viewport_h: f64) ->
         && cr.height >= fold - 1.0
         && has_overflow(dom.scroll_height(p), dom.client_height(p))
         && !capped_by_max_height(dom, p, cr, js::math_max(fold, viewport_h))
+        && content_runs_past(dom, p, cr)
+}
+
+/// How many descendants [`content_runs_past`] reads before it stops and
+/// answers yes.
+const IN_FLOW_WALK_BUDGET: usize = 2000;
+
+/// The share of the frame's height an absolutely placed box has to take to
+/// count as content a script moves through the frame.
+const PLACED_CONTENT_MIN_SHARE: f64 = 0.5;
+
+/// Whether content a script could scroll through `p` runs past its bottom
+/// edge (`frame`): a descendant in `p`'s flow whose box ends more than a
+/// pixel below it, or an absolutely placed box that starts inside it, runs
+/// past it, and is at least half as tall as it. A scroll library moves one
+/// wrapper that holds the page, in flow or placed; incredible.one's pinned
+/// stage (a sticky section at `overflow: hidden`) holds a placed screen,
+/// 707px of its 800, that it lifts into view as the page scrolls. A map
+/// holds its markers as small absolutely placed boxes: chefsspecial.app's
+/// Mapbox box (896x800, `overflow: hidden`) records a scroll height of 1,626
+/// from markers placed below its edge, and those are clipped, not scrolled
+/// to. A placed box under half the frame's height is not read further; a
+/// taller one (a wrapper at `inset: 0`) is read like the frame's own flow,
+/// and a fixed one adds nothing.
+/// A box the capture did not measure, text of `p`'s own, or a walk past
+/// [`IN_FLOW_WALK_BUDGET`] answers yes, which keeps the frame.
+fn content_runs_past(dom: &dyn Dom, p: ElId, frame: &Rect) -> bool {
+    // Text of its own may be what runs past; the capture measures no text
+    // node, so that keeps the frame too.
+    if has_direct_text_longer_than(dom, p, 0) {
+        return true;
+    }
+    let bottom = frame.bottom;
+    let mut stack = dom.children(p);
+    let mut read = 0usize;
+    while let Some(c) = stack.pop() {
+        read += 1;
+        if read > IN_FLOW_WALK_BUDGET {
+            return true;
+        }
+        let r = dom.rect(c);
+        if !r.all_finite() {
+            return true;
+        }
+        match dom.style(c, "position").as_str() {
+            "fixed" => continue,
+            "absolute" => {
+                if r.height < frame.height * PLACED_CONTENT_MIN_SHARE {
+                    continue;
+                }
+                if r.top < bottom - 1.0 && r.bottom > bottom + 1.0 {
+                    return true;
+                }
+                // A placed wrapper that fills the frame (`position: absolute;
+                // inset: 0`, as some smooth-scroll setups hold the page) holds
+                // the content in its own flow: read it.
+                stack.extend(dom.children(c));
+                continue;
+            }
+            _ => {}
+        }
+        if r.bottom > bottom + 1.0 {
+            return true;
+        }
+        stack.extend(dom.children(c));
+    }
+    false
 }
 
 /// Whether a box stands at its `max-height`: a "read more" panel held at
@@ -1575,6 +1781,39 @@ pub(crate) fn moves_mid_animation(dom: &dyn Dom, el: ElId) -> bool {
         cur = dom.parent(c);
     }
     false
+}
+
+/// Whether `el` or an ancestor is caught part way through a change of width
+/// that ends: the capture saw an animation or transition running on the box
+/// that sets `width`, `min-width`, `max-width` or an inline-size longhand,
+/// and the page traces it to something that stops ([`traced_to_an_end`]).
+/// lockheedmartin.com's section headings type themselves out (`typing`, one
+/// run, `width` from 0 to 100%), and a capture part way through reads the
+/// heading spilling out of a box that has not finished opening.
+pub(crate) fn resizes_mid_animation(dom: &dyn Dom, el: ElId) -> bool {
+    const MAX_ANCESTORS: usize = 64;
+    let mut cur = Some(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { return false };
+        if Some(c) == dom.body() || Some(c) == dom.document_element() {
+            return false;
+        }
+        if let Some(props) = dom.running_animation_properties(c) {
+            if props.iter().any(|p| sets_width(p) && traced_to_an_end(dom, c, p)) {
+                return true;
+            }
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+
+/// Whether a running CSS property sets a box's width on the x axis.
+fn sets_width(p: &str) -> bool {
+    matches!(
+        p,
+        "width" | "min-width" | "max-width" | "inline-size" | "min-inline-size" | "max-inline-size"
+    )
 }
 
 /// Whether a running property `p` moves `el` on the x axis at capture.
@@ -2423,7 +2662,7 @@ mod tests {
 
     /// jyes.com.tw's Slick dots: the label of each dot is `font-size: 0`.
     #[test]
-    fn text_set_under_1px_is_not_painted_for_text_rules() {
+    fn text_set_at_1px_or_less_is_not_painted_for_text_rules() {
         let (mut d, body) = page();
         let dot = d.add(Some(body), "button");
         d.set_style(dot, "fontSize", "0px");
@@ -2449,9 +2688,79 @@ mod tests {
         // A size that does not parse keeps the text.
         d.set_style(dot, "fontSize", "");
         assert_eq!(text(&d, dot), None);
-        assert!(under_1px("0.5px"));
-        assert!(!under_1px("1px"));
-        assert!(!under_1px(""));
+        assert!(at_most_1px("0.5px"));
+        assert!(!at_most_1px(""));
+
+        // uni-hannover.de (10046522): a link hidden with an inline
+        // `font-size: 1px` in a static 9x1 box nothing clips. Its should-flag
+        // twin is the same link at 2px, which still paints marks.
+        let hidden = d.add(Some(body), "a");
+        d.set_style(hidden, "fontSize", "1px");
+        d.set_rect(hidden, 76.0, 5895.0, 9.0, 1.0);
+        d.add_text(hidden, "Die LUH auf Mastodon");
+        assert_eq!(text(&d, hidden), Some(Unpainted::NoFontSize));
+        assert!(at_most_1px("1px"));
+        // The same 1px text drawn sixteen times larger by a transform paints
+        // readable letters, turned upright too.
+        let enlarged = d.add(Some(body), "span");
+        d.set_style(enlarged, "fontSize", "1px");
+        d.set_rect(enlarged, 76.0, 400.0, 160.0, 16.0);
+        d.add_text(enlarged, "Scaled label");
+        d.set_style(enlarged, "transform", "matrix(16, 0, 0, 16, 0, 0)");
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "transform", "matrix(0, 16, -16, 0, 0, 0)");
+        assert_eq!(text(&d, enlarged), None);
+        // A scale set on an ancestor counts the same.
+        let wrap = d.add(Some(body), "div");
+        let inner = d.add(Some(wrap), "span");
+        d.set_style(inner, "fontSize", "1px");
+        d.set_rect(inner, 76.0, 600.0, 160.0, 16.0);
+        d.add_text(inner, "Scaled label");
+        d.set_style(wrap, "transform", "matrix3d(16, 0, 0, 0, 0, 16, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)");
+        assert_eq!(text(&d, inner), None);
+        // A rotation alone, and a stretch on one axis (`scaleX(2)`,
+        // `scaleY(16)`), leave the letters a pixel thin.
+        d.set_style(enlarged, "transform", "matrix(0, 1, -1, 0, 0, 0)");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        d.set_style(enlarged, "transform", "matrix(0.707107, 0.707107, -0.707107, 0.707107, 0, 0)");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        d.set_style(enlarged, "transform", "matrix(2, 0, 0, 1, 0, 0)");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        d.set_style(enlarged, "transform", "matrix(1, 0, 0, 16, 0, 0)");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        // The individual `scale` property enlarges the same, on its own or
+        // under a rotation; on one axis it does not.
+        d.set_style(enlarged, "transform", "none");
+        d.set_style(enlarged, "scale", "16");
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "transform", "matrix(0, 1, -1, 0, 0, 0)");
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "scale", "1600% 100%");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        // An individual `rotate` composes with the scales: a uniform scale
+        // stays an enlargement under it, and a one-axis scale turned against
+        // an ancestor's stretch on the other axis does not become one.
+        d.set_styles(enlarged, &[("transform", "none"), ("scale", "16"), ("rotate", "90deg")]);
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "rotate", "0deg");
+        assert_eq!(text(&d, enlarged), None);
+        d.set_style(enlarged, "rotate", "z 0.25turn");
+        assert_eq!(text(&d, enlarged), None);
+        let stretched = d.add(Some(body), "div");
+        d.set_style(stretched, "transform", "matrix(1, 0, 0, 16, 0, 0)");
+        let turned = d.add(Some(stretched), "span");
+        d.set_styles(turned, &[("fontSize", "1px"), ("scale", "16 1"), ("rotate", "90deg")]);
+        d.set_rect(turned, 76.0, 800.0, 16.0, 160.0);
+        d.add_text(turned, "Turned label");
+        assert_eq!(text(&d, turned), Some(Unpainted::NoFontSize));
+        // A turn about another axis claims nothing.
+        d.set_style(enlarged, "rotate", "x 45deg");
+        assert_eq!(text(&d, enlarged), Some(Unpainted::NoFontSize));
+        d.set_styles(enlarged, &[("scale", "none"), ("rotate", "none")]);
+        d.set_style(hidden, "fontSize", "2px");
+        d.set_rect(hidden, 76.0, 5895.0, 18.0, 2.0);
+        assert_eq!(text(&d, hidden), None);
+        assert!(!at_most_1px("1.5px"));
     }
 
     /// stroq.dev's "your browser does not support video" line inside the
@@ -3144,6 +3453,74 @@ mod tests {
         d.set_rect(shell, 0.0, 0.0, 1280.0, 800.0);
         d.el_mut(shell).client_height = 800.0;
         assert_eq!(why(&d, below), None);
+    }
+
+    /// chefsspecial.app (10047562): a Mapbox box 800px tall that hides its
+    /// overflow records a scroll height of 1,626 from markers placed below
+    /// its edge. They are absolutely placed in a static canvas container of
+    /// no height, so nothing in the box's flow runs past it: the markers
+    /// below the edge are clipped. The same box around an in-flow wrapper
+    /// that runs past it is a scroll frame.
+    #[test]
+    fn a_map_whose_overflow_is_placed_markers_is_not_a_scroll_frame() {
+        let (mut d, body) = page();
+        let map = d.add(Some(body), "div");
+        d.set_styles(map, &[("display", "block"), ("position", "relative"), ("overflowX", "hidden"), ("overflowY", "hidden")]);
+        d.set_rect(map, 0.0, 0.0, 896.0, 800.0);
+        d.el_mut(map).client_height = 800.0;
+        d.el_mut(map).scroll_height = Some(1626.0);
+        let canvas_box = d.add(Some(map), "div");
+        d.set_style(canvas_box, "display", "block");
+        d.set_rect(canvas_box, 0.0, 0.0, 896.0, 0.0);
+        let canvas = d.add(Some(canvas_box), "canvas");
+        d.set_style(canvas, "position", "absolute");
+        d.set_rect(canvas, 0.0, 0.0, 896.0, 800.0);
+        let marker = d.add(Some(canvas_box), "div");
+        d.set_style(marker, "position", "absolute");
+        d.set_rect(marker, 147.0, 860.0, 56.0, 56.0);
+        // The marker's count sits in a static box inside it, which is in
+        // the marker's flow, not the map's.
+        let pin = d.add(Some(marker), "div");
+        d.set_rect(pin, 165.0, 878.0, 20.0, 20.0);
+        let count = d.add(Some(pin), "div");
+        d.set_rect(count, 165.0, 878.0, 20.0, 20.0);
+        d.add_text(count, "12");
+        assert_eq!(why(&d, count), Some(Unpainted::ClippedOut));
+
+        // An in-flow wrapper that runs past the box makes it a frame again,
+        // and the same marker is kept.
+        let content = d.add(Some(map), "div");
+        d.set_rect(content, 0.0, 0.0, 896.0, 1626.0);
+        assert_eq!(why(&d, count), None);
+        // So does one the capture did not measure.
+        d.set_rect(content, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+        assert_eq!(why(&d, count), None);
+        // incredible.one (10048156): a pinned stage lifts a placed screen,
+        // most of the frame's height, that starts inside it and runs past.
+        d.set_rect(content, 0.0, 0.0, 896.0, 400.0);
+        assert_eq!(why(&d, count), Some(Unpainted::ClippedOut));
+        // A placed wrapper the frame's own height (`absolute; inset: 0`)
+        // holding in-flow content that runs past is a smooth-scroll frame.
+        let wrapper = d.add(Some(map), "div");
+        d.set_style(wrapper, "position", "absolute");
+        d.set_rect(wrapper, 0.0, 0.0, 896.0, 800.0);
+        let sections = d.add(Some(wrapper), "div");
+        d.set_rect(sections, 0.0, 0.0, 896.0, 2100.0);
+        assert_eq!(why(&d, count), None);
+        d.set_rect(sections, 0.0, 0.0, 896.0, 600.0);
+        assert_eq!(why(&d, count), Some(Unpainted::ClippedOut));
+
+        let screen = d.add(Some(map), "div");
+        d.set_style(screen, "position", "absolute");
+        d.set_rect(screen, 0.0, 700.0, 896.0, 707.0);
+        assert_eq!(why(&d, count), None);
+        // A small placed box across the edge (a marker half under it) is
+        // not that.
+        d.set_rect(screen, 0.0, 780.0, 56.0, 56.0);
+        assert_eq!(why(&d, count), Some(Unpainted::ClippedOut));
+        // And text the box holds of its own.
+        d.add_text(map, "Loading the map of every restaurant near you");
+        assert_eq!(why(&d, count), None);
     }
 
     /// smooth-scrollbar and Locomotive Scroll: a viewport-tall wrapper that

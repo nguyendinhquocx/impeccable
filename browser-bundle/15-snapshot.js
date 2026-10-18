@@ -42,7 +42,7 @@ const __SNAP_STYLE_PROPS = [
   "paddingTop", "perspective", "pointerEvents", "position", "right", "rotate",
   "scale", "textAlign",
   "textDecoration", "textDecorationLine", "textIndent", "textOverflow",
-  "textShadow", "textTransform", "top", "transform", "transitionDuration",
+  "textShadow", "textTransform", "textWrap", "textWrapStyle", "top", "transform", "transitionDuration",
   "transitionProperty", "transitionTimingFunction", "translate", "unicodeBidi",
   "verticalAlign",
   "visibility", "webkitBackgroundClip", "webkitClipPath", "webkitHyphens",
@@ -55,7 +55,7 @@ const __SNAP_PSEUDO_PROPS = [
   "content", "position", "opacity", "display", "width", "height", "top",
   "right", "bottom", "left", "backgroundColor", "backgroundImage",
   "background", "borderRadius", "transform", "visibility", "zIndex",
-  "translate", "scale", "rotate", "filter", "fontSize",
+  "translate", "scale", "rotate", "filter", "fontSize", "maskImage",
 ];
 // Pseudo-class states recorded per element (`el.matches(':name')`), so the
 // snapshot selector engine can answer `:checked` / `:disabled` / ... the way

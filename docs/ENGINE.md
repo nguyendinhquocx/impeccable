@@ -22,7 +22,8 @@ ENGINE_VERSION          which engine release the launcher / npm shim download
 browser-bundle/         the page JS the in-page bundle is built from
 crates/
   cli          the `impeccable` binary: verb router, exit codes
-  common       Io handle (stdout/stderr/stdin/env/cwd), path + process helpers
+  common       Io handle (stdout/stderr/stdin/env/cwd), path + process helpers,
+               the HTTP/1.1 server core (`http`) behind every local server
   context      context, doctor, staleness, signals, concept-seed, pin, ...
   hook         the design hook (hook, hook-before-edit, hook-admin)
   live         live mode: server, wrap, accept, manual edits, Svelte/Vue
@@ -64,6 +65,16 @@ IMPECCABLE_BIN=target/release/impeccable node tests/oracle/run.mjs   # the behav
 release there; `IMPECCABLE_BIN=target/release/impeccable bun run fetch:engine`
 copies a local build), then `target/release/impeccable`, so a plain
 `cargo build --release -p impeccable` is enough.
+
+Every local server the engine runs (`live-server`, the `serve-question`
+decision page, `component-review serve`) is built on `impeccable_common::http`:
+a `TcpListener`, one thread per connection, request parsing with a body cap,
+and responses that close their connection. The live server drives connections
+itself (turnstile ordering, SSE, parked polls); the other two take requests one
+at a time from `SerialServer`, so their handlers stay single-threaded while no
+connection waits on another to be read. That replaced tiny_http, whose 0.12
+pool could leave part of a browser's connection burst unanswered (#1071). Add
+new servers on the same core rather than another HTTP crate.
 
 The frozen function-level vectors in `tests/oracle/vectors/calls/` replay
 through `impeccable_core::vectors::call` (`cargo test -p impeccable-core`),

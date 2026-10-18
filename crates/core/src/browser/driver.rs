@@ -1185,6 +1185,143 @@ struct PatternItem {
     matches: Option<Vec<ElId>>,
 }
 
+/// Whether a pattern finding stands on the live page: `None` when its
+/// selector resolves to nothing, only to waived elements, only to elements
+/// nobody sees, or (for a style-text stripe) to no card rounded away from
+/// it; otherwise the elements its selector resolves to (`None` inside when
+/// it names no selector).
+fn pattern_finding_stands(
+    dom: &dyn Dom,
+    f: &crate::checks::css_scan::PatternFinding,
+) -> Option<Option<Vec<ElId>>> {
+    let Some(selector) = f.selector.as_deref().filter(|s| !s.is_empty()) else {
+        return Some(None);
+    };
+    let matches = selector_nodes_for_live_dom(dom, selector)?;
+    if matches.is_empty() {
+        return None;
+    }
+    if !matches.iter().any(|el| !scoped_ignore_active(dom, *el, &f.id)) {
+        return None;
+    }
+    // A motion, glow or dot declared for elements a visitor never
+    // sees (a loader at `display: none`, a progress bar inside a
+    // transparent wrapper, the rail of a stepper not drawn at this
+    // width) is not on the page.
+    if !super::painted::page_form_painted(dom, &f.id, &matches) {
+        return None;
+    }
+    // A stripe rule inside an `@media` or `@supports` block that does not
+    // apply, or one a later rule overrides, paints nothing on the element
+    // it names: its computed image must carry a repeating gradient.
+    if f.id == "repeating-stripes-gradient"
+        && !matches.iter().any(|&el| repeating_gradient_applies(dom, el, selector))
+    {
+        return None;
+    }
+    // A stripe on any edge from the style-text scans reports only
+    // on a card rounded away from it, read off the elements it paints.
+    if let Some(side) = crate::checks::css_scan::side_stripe_index(f) {
+        let rounded = matches.iter().any(|&el| {
+            let corners = crate::checks::measures::parse_radius_corners(
+                Some(&dom.style(el, "borderRadius")),
+                dom.rect(el).width,
+            );
+            crate::checks::rules::is_rounded_away_from_side(corners.as_ref(), side)
+        });
+        if !rounded {
+            return None;
+        }
+    }
+    Some(Some(matches))
+}
+
+/// Whether the box a stripe selector names on `el` computes a repeating
+/// gradient as its background or mask image: the `::before` / `::after`
+/// box for a part of the selector list that names one, `el` itself for a
+/// part that does not. A value the Dom did not record answers yes: a host
+/// with none of its images recorded, or a pseudo-element whose mask the
+/// capture predates.
+fn repeating_gradient_applies(dom: &dyn Dom, el: ElId, selector: &str) -> bool {
+    let repeats = |v: &str| v.to_ascii_lowercase().contains("repeating-");
+    let host = || {
+        let values = [
+            dom.style(el, "backgroundImage"),
+            dom.style(el, "maskImage"),
+            dom.style(el, "webkitMaskImage"),
+        ];
+        values.iter().all(|v| v.is_empty()) || values.iter().any(|v| repeats(v))
+    };
+    let pseudo = |name: &str| {
+        let read = |prop: &str| dom.pseudo_style(el, name, prop).unwrap_or_default();
+        let content = read("content");
+        if content == "none" || content == "normal" {
+            return false;
+        }
+        let mask = read("maskImage");
+        mask.is_empty() || repeats(&mask) || repeats(&read("backgroundImage"))
+    };
+    selector_list_pseudos(selector).into_iter().any(|part| match part {
+        Some(name) => pseudo(name),
+        None => host(),
+    })
+}
+
+/// For each part of a selector list (split on commas outside quotes,
+/// brackets and parentheses), the `::before` / `::after` it names at its
+/// top level, if any. A comma inside `:is()` or a `:before` inside an
+/// attribute value (`[data-icon=":before"]`) is not one.
+fn selector_list_pseudos(selector: &str) -> Vec<Option<&'static str>> {
+    let bytes = selector.as_bytes();
+    let mut parts = Vec::new();
+    let mut current: Option<&'static str> = None;
+    let mut quote: Option<u8> = None;
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => quote = Some(b),
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b',' if depth <= 0 => parts.push(current.take()),
+            b':' if depth <= 0 => {
+                let rest = &selector[i..];
+                let name = rest.trim_start_matches(':');
+                for (word, pseudo) in [("before", "::before"), ("after", "::after")] {
+                    let ends = name
+                        .as_bytes()
+                        .get(word.len())
+                        .is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_'));
+                    if name.len() >= word.len()
+                        && name.as_bytes()[..word.len()].eq_ignore_ascii_case(word.as_bytes())
+                        && ends
+                    {
+                        current = Some(pseudo);
+                    }
+                }
+                i += rest.len() - name.len();
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(current);
+    parts
+}
+
 /// [`scoped_html_pattern_findings`] keeping each finding's selector and the
 /// elements it resolves to, plus the style corpus the pass read.
 fn html_pattern_items(
@@ -1200,8 +1337,13 @@ fn html_pattern_items(
         corpora.style_text.push('\n');
         corpora.style_text.push_str(&linked_css);
     }
-    let all =
-        crate::checks::html_patterns::check_html_patterns_with(&html, Some(&corpora), context);
+    // A rule that reports one candidate reports the first that stands here.
+    let all = crate::checks::html_patterns::check_html_patterns_picking(
+        &html,
+        Some(&corpora),
+        context,
+        &|f| pattern_finding_stands(dom, f).is_some(),
+    );
     let mut out = Vec::new();
     // Computed lazily: the accent check below is the only caller and it is
     // rare, so an unrelated page never pays for the sweep.
@@ -1220,40 +1362,9 @@ fn html_pattern_items(
                 continue;
             }
         }
-        let mut resolved: Option<Vec<ElId>> = None;
-        if let Some(selector) = f.selector.as_deref().filter(|s| !s.is_empty()) {
-            let Some(matches) = selector_nodes_for_live_dom(dom, selector) else {
-                continue;
-            };
-            if matches.is_empty() {
-                continue;
-            }
-            if !matches.iter().any(|el| !scoped_ignore_active(dom, *el, &f.id)) {
-                continue;
-            }
-            // A motion, glow or dot declared for elements a visitor never
-            // sees (a loader at `display: none`, a progress bar inside a
-            // transparent wrapper, the rail of a stepper not drawn at this
-            // width) is not on the page.
-            if !super::painted::page_form_painted(dom, &f.id, &matches) {
-                continue;
-            }
-            // A stripe on any edge from the style-text scans reports only
-            // on a card rounded away from it, read off the elements it paints.
-            if let Some(side) = crate::checks::css_scan::side_stripe_index(&f) {
-                let rounded = matches.iter().any(|&el| {
-                    let corners = crate::checks::measures::parse_radius_corners(
-                        Some(&dom.style(el, "borderRadius")),
-                        dom.rect(el).width,
-                    );
-                    crate::checks::rules::is_rounded_away_from_side(corners.as_ref(), side)
-                });
-                if !rounded {
-                    continue;
-                }
-            }
-            resolved = Some(matches);
-        }
+        let Some(resolved) = pattern_finding_stands(dom, &f) else {
+            continue;
+        };
         let mut item = BrowserFinding::new(f.id.clone(), f.snippet.clone());
         if let Some(sev) = f.severity.as_ref().filter(|s| !s.is_empty()) {
             item.severity = Some(sev.clone());
@@ -2619,6 +2730,7 @@ pub fn collect_browser_findings(dom: &dyn Dom, config: &BrowserConfig) -> Collec
         findings.extend(hits(ec::check_element_icon_tile_dom(dom, el)));
         findings.extend(hits(ec::check_element_italic_serif_dom(dom, el)));
         findings.extend(hits(q::check_element_quality_dom(dom, el, config)));
+        findings.extend(hits(super::line_breaks::check_element_line_breaks_dom(dom, el)));
         findings.extend(hits(ec::check_element_oversized_h1_dom(dom, el)));
         findings.extend(hits(ec::check_element_clipped_overflow_dom(dom, el)));
         findings.extend(hits(ec::check_element_gpt_border_shadow_dom(dom, el)));
@@ -2911,6 +3023,147 @@ mod tests {
             vec!["bounce-easing", "dark-glow", "organic-clip-path", "pulsing-dot", "repeating-stripes-gradient"]
         );
         assert_eq!(run(true), vec!["organic-clip-path"]);
+    }
+
+    /// Review of #1042: a rule that reports its first candidate reports the
+    /// first one the page shows. A stripe or glow declared inside an
+    /// `@media` block for an element that is not on the page does not hide
+    /// a later one that is painted.
+    #[test]
+    fn a_first_candidate_the_page_does_not_show_hides_nothing() {
+        let run = |later: bool| {
+            let mut d = FakeDom::new();
+            let (html, body) = d.with_page();
+            d.set_rect(html, 0.0, 0.0, 1280.0, 2000.0);
+            d.set_rect(body, 0.0, 0.0, 1280.0, 2000.0);
+            d.el_mut(html).scroll_width = 1280.0;
+            for (selector, y) in [(".stripes", 100.0), (".bar", 200.0)] {
+                let el = d.add(Some(body), "div");
+                d.add_selector(el, selector);
+                d.set_rect(el, 0.0, y, 200.0, 40.0);
+            }
+            let tail = if later {
+                ".stripes{background:repeating-linear-gradient(45deg,#000 0 2px,#fff 2px 4px)}\
+.bar{box-shadow:0 0 16px rgba(26, 58, 214, 0.8)}"
+            } else {
+                ""
+            };
+            d.html_for_patterns = format!(
+                "<html><head><style>\
+@media (min-width: 1024px) {{ .gone {{ background: repeating-linear-gradient(45deg,#000 0 2px,#fff 2px 4px); box-shadow: 0 0 16px rgba(26, 58, 214, 0.8) }} }}\
+{tail}</style></head><body><div class=\"stripes\"></div><div class=\"bar\"></div></body></html>"
+            );
+            let mut ids: Vec<String> = scoped_html_pattern_findings(&d).into_iter().map(|f| f.type_).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(run(true), vec!["dark-glow", "repeating-stripes-gradient"]);
+        assert!(run(false).is_empty());
+    }
+
+    /// Second review of #1042: a stripe rule for a visible element inside an
+    /// `@media` block that does not apply is not on the page. The element's
+    /// computed image says whether the rule applied.
+    #[test]
+    fn a_stripe_rule_the_element_does_not_compute_is_not_reported() {
+        let run = |image: &str| {
+            let mut d = FakeDom::new();
+            let (html, body) = d.with_page();
+            d.set_rect(html, 0.0, 0.0, 1280.0, 2000.0);
+            d.set_rect(body, 0.0, 0.0, 1280.0, 2000.0);
+            d.el_mut(html).scroll_width = 1280.0;
+            let card = d.add(Some(body), "div");
+            d.add_selector(card, ".card");
+            d.set_rect(card, 0.0, 100.0, 200.0, 40.0);
+            d.set_styles(card, &[("backgroundImage", image), ("maskImage", "none")]);
+            d.html_for_patterns = "<html><head><style>\
+.gone{background:repeating-linear-gradient(45deg,#000 0 2px,#fff 2px 4px)}\
+@media (min-width: 2000px) { .card { background: repeating-linear-gradient(45deg,#000 0 2px,#fff 2px 4px) } }\
+</style></head><body><div class=\"card\"></div></body></html>"
+                .to_string();
+            scoped_html_pattern_findings(&d).into_iter().map(|f| f.type_).collect::<Vec<_>>()
+        };
+        assert!(run("none").is_empty());
+        assert_eq!(
+            run("repeating-linear-gradient(45deg, rgb(0, 0, 0) 0px, rgb(0, 0, 0) 2px, rgb(255, 255, 255) 2px, rgb(255, 255, 255) 4px)"),
+            vec!["repeating-stripes-gradient"]
+        );
+    }
+
+    /// Fourth review of #1042: a selector list splits on its top-level
+    /// commas only, and a pseudo-element counts only outside quotes,
+    /// brackets and parentheses.
+    #[test]
+    fn selector_list_pseudos_reads_the_top_level_only() {
+        let cases: &[(&str, &[Option<&str>])] = &[
+            (".a", &[None]),
+            (".a::before", &[Some("::before")]),
+            (".a:AFTER", &[Some("::after")]),
+            (".a, .b::before", &[None, Some("::before")]),
+            (":is(.a, .b)::before", &[Some("::before")]),
+            (":where(.a, .b), .c:after", &[None, Some("::after")]),
+            (".card:not(.x, .y)", &[None]),
+            ("[data-icon=\":before\"]", &[None]),
+            ("[data-icon=\":before\"]::after", &[Some("::after")]),
+            ("[title='a,b'] .c", &[None]),
+            (".a\\:before", &[None]),
+            (".a:before-ish", &[None]),
+        ];
+        for (selector, want) in cases {
+            assert_eq!(selector_list_pseudos(selector).as_slice(), *want, "{selector:?}");
+        }
+        // The reviewers' cases through the gate: a quoted `:before` paints on
+        // the host; an `:is()` comma does not let the host's stripes stand
+        // in for a pseudo rule that did not apply.
+        let mut d = FakeDom::new();
+        let (_, body) = d.with_page();
+        let el = d.add(Some(body), "div");
+        d.set_styles(el, &[("backgroundImage", "repeating-linear-gradient(90deg, black 0px 2px, white 2px 4px)"), ("maskImage", "none")]);
+        d.set_pseudo_style(el, "::before", "content", "\"\"");
+        d.set_pseudo_style(el, "::before", "backgroundImage", "none");
+        d.set_pseudo_style(el, "::before", "maskImage", "none");
+        assert!(repeating_gradient_applies(&d, el, "[data-icon=\":before\"]"));
+        assert!(!repeating_gradient_applies(&d, el, ":is(.a, .b)::before"));
+    }
+
+    /// Third review of #1042: a `::before` stripe is judged by the
+    /// pseudo-element's own paint, its mask included, never the host's.
+    #[test]
+    fn a_pseudo_stripe_is_judged_by_the_pseudo_element() {
+        const STRIPES: &str = "repeating-linear-gradient(90deg, rgb(0, 0, 0) 0px, rgb(0, 0, 0) 2px, rgba(0, 0, 0, 0) 2px, rgba(0, 0, 0, 0) 4px)";
+        let run = |host_image: &str, pseudo: &[(&str, &str)]| {
+            let mut d = FakeDom::new();
+            let (html, body) = d.with_page();
+            d.set_rect(html, 0.0, 0.0, 1280.0, 2000.0);
+            d.set_rect(body, 0.0, 0.0, 1280.0, 2000.0);
+            d.el_mut(html).scroll_width = 1280.0;
+            let card = d.add(Some(body), "div");
+            d.add_selector(card, ".card");
+            d.set_rect(card, 0.0, 100.0, 200.0, 40.0);
+            d.set_styles(card, &[("backgroundImage", host_image), ("maskImage", "none")]);
+            for (prop, value) in pseudo {
+                d.set_pseudo_style(card, "::before", prop, value);
+            }
+            d.html_for_patterns = "<html><head><style>\
+.card::before { content: \"\"; background: black; mask-image: repeating-linear-gradient(90deg, black 0 2px, transparent 2px 4px) }\
+</style></head><body><div class=\"card\"></div></body></html>"
+                .to_string();
+            scoped_html_pattern_findings(&d).into_iter().map(|f| f.type_).collect::<Vec<_>>()
+        };
+        let drawn = |mask: &'static str| {
+            vec![("content", "\"\""), ("backgroundImage", "none"), ("maskImage", mask)]
+        };
+        // Stripes drawn through the pseudo-element's mask, host plain.
+        assert_eq!(run("none", &drawn(STRIPES)), vec!["repeating-stripes-gradient"]);
+        // The pseudo rule did not apply; the host's own stripes say nothing.
+        assert!(run(STRIPES, &drawn("none")).is_empty());
+        // No pseudo box at all.
+        assert!(run(STRIPES, &[("content", "none")]).is_empty());
+        // A capture that predates the pseudo mask column lets it stand.
+        assert_eq!(
+            run("none", &[("content", "\"\""), ("backgroundImage", "none")]),
+            vec!["repeating-stripes-gradient"]
+        );
     }
 
     /// te.eg: `#5c2d91` section headings under a `#5c2d91` nav bar. The

@@ -174,6 +174,8 @@ pub const STYLE_PROPS: &[&str] = &[
     "textOverflow",
     "textShadow",
     "textTransform",
+    "textWrap",
+    "textWrapStyle",
     "top",
     "transform",
     "transitionDuration",
@@ -225,6 +227,9 @@ pub const PSEUDO_PROPS: &[&str] = &[
     "rotate",
     "filter",
     "fontSize",
+    // Appended, so a capture made before it (which carries its own
+    // `pseudoProps`) reads this column as unrecorded.
+    "maskImage",
 ];
 
 /// One child of an element: an element (by id) or a text node's data.

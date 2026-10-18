@@ -29,7 +29,7 @@ use crate::checks::rules::{
     TypeSample, TYPE_HIERARCHY_SELECTOR,
 };
 use crate::color::{composite_color_over, parse_any_color, Rgba};
-use crate::constants::{is_brand_font_on_own_domain, CSS_GENERIC_FONTS, OVERUSED_FONTS, SAFE_TAGS};
+use crate::constants::{is_brand_font_on_own_domain, overused_font_name, CSS_GENERIC_FONTS, OVERUSED_FONTS, SAFE_TAGS};
 use crate::js::{self, math_max, math_min, math_round, number_to_string, parse_float, to_fixed};
 use crate::js_ext_a::num_truthy;
 use crate::js_ext_b::{slice_utf16_prefix, utf16_len};
@@ -245,6 +245,9 @@ pub fn check_typography(dom: &dyn Dom) -> Vec<BrowserFinding> {
         else {
             continue;
         };
+        // One face under two spellings (`GeistSans` from the `geist`
+        // package, `Geist Sans` elsewhere) is counted, and named, once.
+        let primary = &overused_font_name(primary).map_or_else(|| primary.clone(), str::to_string);
         if let Some(slot) = font_usage.iter_mut().find(|(k, _)| k == primary) {
             slot.1 += 1.0;
         } else {
@@ -567,7 +570,7 @@ fn card_edge_sides(
 /// an image or a gradient, or a colour that, composited over that surface,
 /// moves a channel by more than 3. Where the surface cannot be read, any
 /// colour that is not transparent counts, as it did before.
-fn fill_differs_from_surface(dom: &dyn Dom, el: ElId) -> bool {
+pub(crate) fn fill_differs_from_surface(dom: &dyn Dom, el: ElId) -> bool {
     let image = dom.style(el, "backgroundImage");
     if !image.is_empty() && image != "none" {
         return true;
@@ -778,7 +781,9 @@ fn is_figure_box(dom: &dyn Dom, el: ElId, rect: &Rect) -> bool {
 /// space, or text whose inline runs hold 80% of it): sample output, a
 /// terminal transcript, a request printed as code. A stack of rows set in a
 /// monospace face (a list of providers with toggles, a table of fields) is
-/// ordinary text and controls and keeps reporting, and so does any box on a
+/// ordinary text and controls and keeps reporting, unless the rows stand
+/// one under another, each is one run, and most of them read as a line of
+/// code ([`row_reads_as_code`]; a sample written one line per block), and so does any box on a
 /// page whose outer card is set in a monospace face itself. The block is the
 /// box's main child only when the box holds no control but its own chrome (a
 /// copy button, an icon button such as a code window's "more options" menu):
@@ -848,9 +853,48 @@ fn is_output_block(dom: &dyn Dom, el: ElId, outer: ElId) -> bool {
             let ws = dom.style(node, "whiteSpace");
             ws.starts_with("pre") || ws == "break-spaces"
         };
-        preformatted || run[i] as f64 >= text[i] as f64 * 0.8
+        preformatted || run[i] as f64 >= text[i] as f64 * 0.8 || {
+            // A code sample set one row per block (v0's integration panel:
+            // `<div>const response = await nexus.send({</div>` and so on):
+            // every child is one run of text, the box holds no text of its
+            // own, and the text reads as code. A stack of monospace rows
+            // that does not (a log of requests, a table of fields) stays
+            // ordinary text.
+            // The rows stand one under another: chips laid side by side in
+            // a flex row (paseo.sh's `create_agent #412` tool-call line)
+            // are one line, not a stack.
+            let rows: Vec<usize> = dom.children(node).iter().filter_map(|c| index.get(c).copied()).collect();
+            let stacked = rows.windows(2).all(|pair| {
+                let (a, b) = (dom.rect(nodes[pair[0]]), dom.rect(nodes[pair[1]]));
+                a.height > 0.0 && b.height > 0.0 && b.top >= a.bottom - 1.0
+            });
+            let code_rows = rows.iter().filter(|&&r| row_reads_as_code(&dom.text_content(nodes[r]))).count();
+            rows.len() >= 2
+                && stacked
+                && text[i] == rows.iter().map(|&r| text[r]).sum::<usize>()
+                && rows.iter().all(|&r| run[r] as f64 >= text[r] as f64 * 0.8)
+                && code_rows * 2 > rows.len()
+        }
     })
 }
+
+/// Whether one row of a stacked sample reads as a line of source code: it
+/// assigns (`=`), opens or closes a block (`{`, `}`), calls something
+/// (`name(...)`), ends a statement (`;`) or is a `//` comment. A quote, an
+/// underscore or a `>` alone do not: `Added "dark mode"`, `user_id` and
+/// `Settings > Billing` are labels set in a monospace face.
+fn row_reads_as_code(text: &str) -> bool {
+    let t = js::trim(text);
+    t.contains('=')
+        || t.contains('{')
+        || t.contains('}')
+        || t.ends_with(';')
+        || t.starts_with("//")
+        || CALL_RE.is_match(t)
+}
+
+static CALL_RE: once_cell::sync::Lazy<regex::Regex> =
+    once_cell::sync::Lazy::new(|| regex::Regex::new(r"[A-Za-z_$][A-Za-z0-9_$]*\([^()]*\)").expect("CALL_RE"));
 
 /// A media player that is the box's main child. The box holds a visible
 /// `<audio>` or `<video>` (drawn with its own controls, or covering 40% of
@@ -3055,6 +3099,67 @@ fn is_table_part(dom: &dyn Dom, el: ElId) -> bool {
     )
 }
 
+/// The range of a page's side gutter, in px: a scroller whose clip edge sits
+/// this far inside the viewport shows a card at that edge with the page's
+/// gutter around it. Further in (a desktop scroller in a centred column)
+/// the gutter is not what frames the card, and it is judged as before.
+const EDGE_FLUSH_PAGE_GUTTER_PX: (f64, f64) = (12.0, 48.0);
+
+fn in_page_gutter(inset: f64) -> bool {
+    (EDGE_FLUSH_PAGE_GUTTER_PX.0..=EDGE_FLUSH_PAGE_GUTTER_PX.1).contains(&inset)
+}
+
+/// The distance from the viewport's left and right edges to the scroller's,
+/// on each side where nothing draws an edge at the scroller's clip edge (no
+/// fill with alpha or border on the scroller, no bordered or filled panel
+/// edge within 2px of it); `0` on a side where something does or where the
+/// viewport width is unknown, so the card there is judged as before.
+fn scroller_page_insets(dom: &dyn Dom, scroller: ElId, rect: &Rect) -> (f64, f64) {
+    let vw = dom.inner_width();
+    if !(vw > 0.0) || !rect.all_finite() {
+        return (0.0, 0.0);
+    }
+    // A fill, a background image or a visible shadow draws the box's edge.
+    let paints_surface = |el: ElId| {
+        parse_any_color(Some(&dom.style(el, "backgroundColor"))).is_some_and(|c| c.alpha_or_one() > 0.0)
+            || {
+                let image = dom.style(el, "backgroundImage");
+                !image.is_empty() && image != "none"
+            }
+            || crate::checks::measures::parse_shadow_layers(&dom.style(el, "boxShadow")).iter().any(|l| {
+                l.alpha >= crate::checks::measures::FAINT_PAINT_ALPHA
+                    && (l.x != 0.0 || l.y != 0.0 || l.blur > 0.0 || l.spread != 0.0)
+            })
+    };
+    if paints_surface(scroller) {
+        return (0.0, 0.0);
+    }
+    let border = |el: ElId, side: &str| border_side_shows(dom, el, side, None);
+    // A panel the scroller fills with no padding draws its edge at the
+    // scroller's clip edge: an ancestor (up to six levels) whose edge on that
+    // side lies within 2px of the scroller's, with a border there, a fill, a
+    // background image or a shadow.
+    let panel_edge = |side: &str| {
+        let mut cur = dom.parent(scroller);
+        for _ in 0..6 {
+            let Some(a) = cur else { return false };
+            if Some(a) == dom.body() || Some(a) == dom.document_element() {
+                return false;
+            }
+            let r = dom.rect(a);
+            let at_edge = if side == "Left" { (r.left - rect.left).abs() <= 2.0 } else { (r.right - rect.right).abs() <= 2.0 };
+            if at_edge && (border(a, side) || paints_surface(a)) {
+                return true;
+            }
+            cur = dom.parent(a);
+        }
+        false
+    };
+    let left = if border(scroller, "Left") || panel_edge("Left") { 0.0 } else { rect.left.max(0.0) };
+    let right = if border(scroller, "Right") || panel_edge("Right") { 0.0 } else { (vw - rect.right).max(0.0) };
+    (left, right)
+}
+
 /// JS: checks.mjs#checkEdgeFlushCardsDOM()
 pub fn check_edge_flush_cards_dom(dom: &dyn Dom) -> Vec<ElFinding> {
     let mut findings = Vec::new();
@@ -3098,6 +3203,14 @@ pub fn check_edge_flush_cards_dom(dom: &dyn Dom) -> Vec<ElFinding> {
         }
         let content_left = sc_rect.left + dom.client_left(scroller);
         let content_right = content_left + dom.client_width(scroller);
+        // Where the scroller's clip edge sits on the page. An unpainted
+        // scroller inset from the viewport (a strip inside the page's
+        // 16px gutter) shows a card that sits at its edge, uncut, with the
+        // page's gutter around it: munsifdaily.in's RTL thumbnail strip
+        // 26px in from the right, imageto3d.studio's grid 16px in. Such a
+        // card is not flush. A scroller that paints a fill or a border on
+        // that side draws the edge the card touches, and keeps reporting.
+        let (left_inset, right_inset) = scroller_page_insets(dom, scroller, &sc_rect);
 
         struct Flush {
             card: ElId,
@@ -3147,8 +3260,14 @@ pub fn check_edge_flush_cards_dom(dom: &dyn Dom) -> Vec<ElFinding> {
             last_left = math_max(last_left, rect.left);
             let left_gutter = rect.left - content_left;
             let right_gap = content_right - rect.right;
-            let flush_right = left_gutter >= 6.0 && right_gap < 8.0 && right_gap > -24.0;
-            let flush_left = right_gap >= 6.0 && left_gutter < 8.0 && left_gutter > -24.0;
+            let flush_right = left_gutter >= 6.0
+                && right_gap < 8.0
+                && right_gap > -24.0
+                && !(right_gap >= 0.0 && in_page_gutter(right_inset));
+            let flush_left = right_gap >= 6.0
+                && left_gutter < 8.0
+                && left_gutter > -24.0
+                && !(left_gutter >= 0.0 && in_page_gutter(left_inset));
             if !flush_right && !flush_left {
                 continue;
             }
@@ -3597,7 +3716,7 @@ fn is_scroller_arrow(dom: &dyn Dom, top: ElId, victim: ElId) -> bool {
 /// Whether `el` or a box above it is drawn rotated or skewed: a computed
 /// `transform` whose matrix turns the axes (`matrix(a, b, c, d, ..)` with `b`
 /// or `c` off zero), or a 3D matrix, which this does not read.
-fn drawn_tilted(dom: &dyn Dom, el: ElId) -> bool {
+pub(crate) fn drawn_tilted(dom: &dyn Dom, el: ElId) -> bool {
     let mut cur = Some(el);
     while let Some(c) = cur {
         let t = dom.style(c, "transform");
@@ -3668,6 +3787,136 @@ fn buried_under_answer(dom: &dyn Dom, stack: &[ElId], victim: ElId) -> bool {
         matches!(tag_lower(dom, layer).as_str(), "img" | "video" | "canvas" | "picture")
             || (dom.contains(layer, victim) && paints_opaque_fill(dom, layer))
     })
+}
+
+/// The layer a curtain footer sits in: `el`'s nearest `sticky` or `fixed`
+/// ancestor (or `el` itself), when it sets a numeric `z-index` of 0 or below,
+/// which puts it under the page's later positioned layers, and is anchored to
+/// the bottom of the window (computed `top: auto`, `bottom` a length): the
+/// page scrolls off it. runlatent.ai's `footer#footer` is `position: sticky;
+/// top: auto; bottom: 0; z-index: 0` under a `main` at `z-index: 1` with an
+/// opaque fill, so the page uncovers it as `main` scrolls away. A header
+/// pinned to the top at `z-index: 0` that the page lays over is buried for
+/// good, which is a collision, so it is no curtain. A browser resolves a
+/// fixed box's `top` to pixels whichever side it was anchored to, so a fixed
+/// layer never shows `top: auto` and is never taken: the capture cannot say
+/// which edge holds it. `None` for `z-index: auto`, a `top` that is set, or
+/// anything not recorded.
+fn curtain_layer(dom: &dyn Dom, el: ElId) -> Option<ElId> {
+    let body = dom.body();
+    let mut cur = Some(el);
+    while let Some(c) = cur {
+        if Some(c) == body {
+            return None;
+        }
+        if matches!(dom.style(c, "position").as_str(), "sticky" | "fixed") {
+            let z = js::trim(&dom.style(c, "zIndex")).to_string();
+            let n = parse_float(&z);
+            let numeric = !z.is_empty() && z.bytes().all(|b| b.is_ascii_digit() || b == b'-');
+            let bottom_anchored = dom.style(c, "top") == "auto" && dom.style(c, "bottom").ends_with("px");
+            return (numeric && n.is_finite() && n <= 0.0 && bottom_anchored).then_some(c);
+        }
+        cur = dom.parent(c);
+    }
+    None
+}
+
+/// The fill alpha a box needs to bury a curtain layer under it.
+const CURTAIN_COVER_MIN_ALPHA: f64 = 0.95;
+
+/// Whether the hit-test stack at a point shows `victim`, inside the curtain
+/// layer `layer` ([`curtain_layer`]), under a box outside that layer that
+/// paints an opaque fill and is painted at capture with every box up to the
+/// root at an opacity of 0.95 or more (a page block caught before its fade-in
+/// buries nothing): the page laid over a curtain footer. Such a point shows
+/// the page, not the footer's words. `false` when no stack was recorded or
+/// the victim is not in it.
+///
+/// The fill counts only where it paints as itself: clipped to the border
+/// box (or the padding box of a box with no border), with no blend mode,
+/// filter, mask or clip-path on it or a box above it. A white page at
+/// `multiply` leaves every word of the footer under it.
+fn buried_under_the_page(dom: &dyn Dom, stack: &[ElId], victim: ElId, layer: ElId) -> bool {
+    let Some(at) = stack.iter().position(|&e| e == victim) else {
+        return false;
+    };
+    stack[..at].iter().any(|&box_| {
+        !dom.contains(box_, victim)
+            && !dom.contains(layer, box_)
+            && parse_any_color(Some(&dom.style(box_, "backgroundColor")))
+                .is_some_and(|c| c.alpha_or_one() >= CURTAIN_COVER_MIN_ALPHA)
+            && fill_paints_its_border_box(dom, box_)
+            && composited_plainly(dom, box_)
+            && painted_at_capture(dom, box_)
+            && effective_opacity_dom(dom, box_) >= CURTAIN_COVER_MIN_ALPHA
+    })
+}
+
+/// Whether `el`'s background reaches the edge of its box: clipped to the
+/// border box, or to the padding box of a box whose borders are all 0.
+fn fill_paints_its_border_box(dom: &dyn Dom, el: ElId) -> bool {
+    ["backgroundClip", "webkitBackgroundClip"].iter().all(|prop| match dom.style(el, prop).as_str() {
+        "" | "border-box" => true,
+        "padding-box" => ["Top", "Right", "Bottom", "Left"]
+            .iter()
+            .all(|s| parse_float(&dom.style(el, &format!("border{s}Width"))) == 0.0),
+        _ => false,
+    })
+}
+
+/// Whether `el` and every box above it composite as plain paint: no
+/// `mix-blend-mode` other than `normal`, no `filter`, no mask and no
+/// clip-path.
+fn composited_plainly(dom: &dyn Dom, el: ElId) -> bool {
+    let mut cur = Some(el);
+    while let Some(c) = cur {
+        if !matches!(dom.style(c, "mixBlendMode").as_str(), "normal" | "")
+            || !matches!(dom.style(c, "filter").as_str(), "none" | "")
+            || super::text_layers::masked_or_clipped(dom, c)
+        {
+            return false;
+        }
+        cur = dom.parent(c);
+    }
+    true
+}
+
+/// The points of `el`'s occlusion grid ([`occlusion_probe_points`]) that
+/// lie on its own lines of text.
+///
+/// Where the capture recorded the lines, a point off every line (the
+/// empty end of a wrapped paragraph's last line, its box past the
+/// words) has no text under it to cover, and the share is taken over
+/// the points on the lines. Under a rotation or skew a line's rect is
+/// the bounds of a tilted line, not the line, so the grid stands.
+fn occlusion_points_on_lines(dom: &dyn Dom, el: ElId, rect: &Rect, vw: f64, vh: f64) -> Vec<(f64, f64)> {
+    let points = occlusion_probe_points(rect, vw, vh);
+    let lines = if drawn_tilted(dom, el) {
+        None
+    } else {
+        // The lines of the victim's own text: a child's line on a row of
+        // its own is the child's text, which the probe already skips.
+        let own = dom.direct_text_rect(el).filter(|r| r.all_finite());
+        dom.text_line_rects(el)
+            .map(|l| {
+                l.into_iter()
+                    .filter(|r| {
+                        own.as_ref().map_or(true, |o| {
+                            r.top < o.bottom && r.bottom > o.top && r.left < o.right && r.right > o.left
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|l| !l.is_empty() && l.iter().all(|r| r.all_finite()))
+    }
+    // A grid none of whose points lands on a line (one centred line in a
+    // tall box, between two grid rows) says nothing either way; the
+    // whole grid stands.
+    .filter(|l| points.iter().any(|&(x, y)| l.iter().any(|r| rect_holds_point(r, x, y))));
+    points
+        .into_iter()
+        .filter(|&(x, y)| !lines.as_ref().is_some_and(|l| !l.iter().any(|r| rect_holds_point(r, x, y))))
+        .collect()
 }
 
 /// How many ancestors of a hit-test answer text-occlusion asks whether they
@@ -3766,6 +4015,7 @@ fn overprints(dom: &dyn Dom, top: ElId, victim: ElId) -> bool {
 pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
     let mut findings = Vec::new();
     let mut seen_victims: Vec<ElId> = Vec::new();
+    let mut curtains: std::collections::HashMap<ElId, bool> = std::collections::HashMap::new();
     // The inline boxes reported for a fill that leaks: there the element is
     // what covers, not what is covered.
     let mut leak_hosts: Vec<ElId> = Vec::new();
@@ -3925,6 +4175,17 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
         text_els.push(TextEl { el, rect, text });
     }
 
+    let sr_only = |el: ElId, rect: &Rect| {
+        is_screen_reader_only_text_style(
+            Some(&ElStyle { dom, el }),
+            &SrOnlyMetrics {
+                width: Some(rect.width),
+                client_width: Some(dom.client_width(el)),
+                height: Some(rect.height),
+                client_height: Some(dom.client_height(el)),
+            },
+        )
+    };
     for victim in &text_els {
         let el = victim.el;
         let rect = &victim.rect;
@@ -3932,16 +4193,7 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
         if seen_victims.contains(&el) {
             continue;
         }
-        let style = ElStyle { dom, el };
-        if is_screen_reader_only_text_style(
-            Some(&style),
-            &SrOnlyMetrics {
-                width: Some(rect.width),
-                client_width: Some(dom.client_width(el)),
-                height: Some(rect.height),
-                client_height: Some(dom.client_height(el)),
-            },
-        ) {
+        if sr_only(el, rect) {
             continue;
         }
 
@@ -3951,6 +4203,33 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
         // sit below the text rather than over it, and cannot be counted. Text
         // it names overlaps the victim whichever of the two is on top.
         let passes_through = ignores_pointer_events(dom, el);
+        // A curtain layer the page covers wherever a probe asks: no point
+        // over any of its text answers with the layer or anything in it,
+        // and at every one the page lays an opaque fill over the text
+        // ([`buried_under_the_page`]). There the victim's words are buried
+        // under the page, not crossed by the text on it. One point the
+        // layer answers (a footer the page has scrolled off), one point not
+        // answered, or one where only a transparent box answers keeps every
+        // finding in it.
+        let curtain = curtain_layer(dom, el).filter(|&layer| {
+            *curtains.entry(layer).or_insert_with(|| {
+                let mut asked = 0usize;
+                let in_layer = |t: &&TextEl| (t.el == layer || dom.contains(layer, t.el)) && !sr_only(t.el, &t.rect);
+                for t in text_els.iter().filter(in_layer) {
+                    for (x, y) in occlusion_points_on_lines(dom, t.el, &t.rect, vw, vh) {
+                        asked += 1;
+                        match dom.element_from_point(x, y) {
+                            Some(a)
+                                if a != layer
+                                    && !dom.contains(layer, a)
+                                    && buried_under_the_page(dom, &dom.elements_from_point(x, y), t.el, layer) => {}
+                            _ => return false,
+                        }
+                    }
+                }
+                asked > 0
+            })
+        });
         // Each side's glyphs are read as the band they ink where that can
         // be told, the content area otherwise.
         let victim_glyphs = dom
@@ -3961,38 +4240,7 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
         let mut occluded = 0usize;
         let mut occluder_el: Option<ElId> = None;
         let mut occluder_kind = "";
-        // Where the capture recorded the lines, a point off every line (the
-        // empty end of a wrapped paragraph's last line, its box past the
-        // words) has no text under it to cover, and the share is taken over
-        // the points on the lines. Under a rotation or skew a line's rect is
-        // the bounds of a tilted line, not the line, so the grid stands.
-        let points = occlusion_probe_points(rect, vw, vh);
-        let lines = if drawn_tilted(dom, el) {
-            None
-        } else {
-            // The lines of the victim's own text: a child's line on a row of
-            // its own is the child's text, which the probe already skips.
-            let own = dom.direct_text_rect(el).filter(|r| r.all_finite());
-            dom.text_line_rects(el)
-                .map(|l| {
-                    l.into_iter()
-                        .filter(|r| {
-                            own.as_ref().map_or(true, |o| {
-                                r.top < o.bottom && r.bottom > o.top && r.left < o.right && r.right > o.left
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .filter(|l| !l.is_empty() && l.iter().all(|r| r.all_finite()))
-        }
-        // A grid none of whose points lands on a line (one centred line in a
-        // tall box, between two grid rows) says nothing either way; the
-        // whole grid stands.
-        .filter(|l| points.iter().any(|&(x, y)| l.iter().any(|r| rect_holds_point(r, x, y))));
-        for (x, y) in points {
-            if lines.as_ref().is_some_and(|l| !l.iter().any(|r| rect_holds_point(r, x, y))) {
-                continue;
-            }
+        for (x, y) in occlusion_points_on_lines(dom, el, rect, vw, vh) {
             total += 1;
             let Some(top) = dom.element_from_point(x, y) else { continue };
             if top == el || dom.contains(el, top) || dom.contains(top, el) {
@@ -4016,7 +4264,11 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
             }
             // The answer may lie on a layer that buries the victim, not on
             // the victim.
-            if buried_under_answer(dom, &dom.elements_from_point(x, y), el) {
+            let stack = dom.elements_from_point(x, y);
+            if buried_under_answer(dom, &stack, el) {
+                continue;
+            }
+            if curtain.is_some_and(|layer| buried_under_the_page(dom, &stack, el, layer)) {
                 continue;
             }
             // A label at `font-size: 0` (a hidden link's) draws nothing, and
@@ -4037,9 +4289,15 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
                 continue;
             }
             let top_own_text = !element_direct_text(dom, top).is_empty()
-                && !super::painted::under_1px(&dom.style(top, "fontSize"))
+                && !super::painted::at_most_1px(&dom.style(top, "fontSize"))
                 && glyphs_may_cover(top_glyphs, victim_glyphs.as_ref(), x, y);
-            let top_in_svg = closest_or_none(dom, top, "svg").is_some();
+            // Under text that ignores pointer events the probe passes
+            // through to what lies beneath, so a graphic it names may be the
+            // art the text is laid on (boardlab.dev's canvas hint panel over
+            // a circuit diagram), as with an opaque box below. An SVG text
+            // element still overlaps the victim whichever is on top.
+            let top_in_svg = closest_or_none(dom, top, "svg").is_some()
+                && (!passes_through || SVG_TEXT_TAGS.contains(&top_tag.as_str()));
             let top_has_text = top_own_text || top_in_svg;
             // A box paints its fill and borders inside its own rect. Where the
             // box the page answered with is not at the point in the capture,
@@ -4163,6 +4421,11 @@ pub fn check_text_occlusion_dom(dom: &dyn Dom) -> Vec<ElFinding> {
         let rect = &victim.rect;
         let text = &victim.text;
         if seen_victims.contains(&el) {
+            continue;
+        }
+        // Nor does text in a curtain layer the page covers wherever a probe
+        // asked: none of it is on screen to overhang a card.
+        if curtain_layer(dom, el).is_some_and(|layer| curtains.get(&layer) == Some(&true)) {
             continue;
         }
         let font_size = {
@@ -4426,6 +4689,32 @@ fn is_link_list_rail(dom: &dyn Dom, column: ElId) -> bool {
     total > 0.0 && link_chars >= 0.9 * total && link_chars / shown.len() as f64 <= LINK_RAIL_MEAN_CHARS
 }
 
+/// Whether a column only wraps a navigation rail: through boxes that each
+/// hold one element child and no text of their own (at most four), it
+/// reaches a `nav` or `role="navigation"`, which the fold test leaves out
+/// when it is the column itself. w3c.github.io's guidebook sets its
+/// "Related content" rail as `section > div.related > nav` beside the
+/// article, and the rail's own `h2` keeps the links under nine tenths of
+/// its text.
+fn is_wrapped_rail(dom: &dyn Dom, column: ElId) -> bool {
+    let mut cur = column;
+    for _ in 0..4 {
+        let kids = dom.children(cur);
+        if kids.len() != 1 || !js::trim(&collapse_ws(&direct_text(dom, cur))).is_empty() {
+            return false;
+        }
+        cur = kids[0];
+        if tag_lower(dom, cur) == "nav"
+            || dom.attr(cur, "role").is_some_and(|r| {
+                r.split_ascii_whitespace().any(|t| js::to_lower_case(t) == "navigation")
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// JS: checks.mjs#checkFirstViewportColumnOverflowDOM()
 pub fn check_first_viewport_column_overflow_dom(dom: &dyn Dom) -> Vec<ElFinding> {
     let mut findings = Vec::new();
@@ -4492,6 +4781,7 @@ pub fn check_first_viewport_column_overflow_dom(dom: &dyn Dom) -> Vec<ElFinding>
                         .any(|t| matches!(js::to_lower_case(t).as_str(), "navigation" | "tablist"))
                 })
                 || is_link_list_rail(dom, child)
+                || is_wrapped_rail(dom, child)
             {
                 continue;
             }
@@ -4655,6 +4945,32 @@ mod tests {
 
     fn font_finding(d: &FakeDom) -> Option<String> {
         check_typography(d).into_iter().find(|f| f.type_ == "overused-font").map(|f| f.detail)
+    }
+
+    /// incredible.one: the `geist` package registers its face as
+    /// `GeistSans`, and the page's mockups set the same face as `Geist
+    /// Sans`. Both spellings name one listed face, counted together, so an
+    /// even split is not a tie between two faces.
+    #[test]
+    fn one_face_under_two_spellings_is_counted_once() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        for _ in 0..10 {
+            typeset(&mut d, body, "p", "Copy set in the package face", "GeistSans, \"GeistSans Fallback\"");
+            typeset(&mut d, body, "span", "Mockup copy", "\"Geist Sans\", sans-serif");
+        }
+        for _ in 0..4 {
+            typeset(&mut d, body, "p", "Body copy in another face", "Georgia, serif");
+        }
+        assert_eq!(font_finding(&d).as_deref(), Some("Primary font: geist sans (83% of text)"));
+
+        // A face whose name only starts like a listed one is not that face.
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        for _ in 0..20 {
+            typeset(&mut d, body, "p", "Copy", "\"Inter Tight\", sans-serif");
+        }
+        assert_eq!(font_finding(&d), None);
     }
 
     /// walla.co.il: Arial is "40% of text" by element and sets 2% of the
@@ -5665,6 +5981,7 @@ mod tests {
     #[test]
     fn edge_flush_cards_skips_page_scrollers_and_lone_boxes() {
         let mut d = FakeDom::new();
+        d.inner_width = 390.0;
         let (html, body) = d.with_page();
         let setup_scroller = |d: &mut FakeDom, el: ElId, x: &str, shorthand: &str| {
             d.set_styles(el, &[("overflowX", x), ("overflow", shorthand)]);
@@ -5711,6 +6028,8 @@ mod tests {
     #[test]
     fn edge_flush_cards() {
         let mut d = FakeDom::new();
+        // The scroller spans the viewport, so its edges are the screen's.
+        d.inner_width = 600.0;
         let (_h, body) = d.with_page();
         let sc = d.add(Some(body), "div");
         d.set_attr(sc, "class", "rail");
@@ -5755,7 +6074,8 @@ mod tests {
         d.set_style(card, "display", "block");
         d.set_style(next, "display", "block");
         let table = d.add(Some(body), "table");
-        d.set_styles(table, &[("overflowX", "auto"), ("overflow", "auto"), ("display", "block")]);
+        // A painted table draws the edge its cells touch.
+        d.set_styles(table, &[("overflowX", "auto"), ("overflow", "auto"), ("display", "block"), ("backgroundColor", "rgb(255, 255, 255)")]);
         d.set_rect(table, 24.0, 400.0, 342.0, 300.0);
         {
             let e = d.el_mut(table);
@@ -5769,6 +6089,202 @@ mod tests {
             d.add_text(th, &format!("Column {i}"));
         }
         assert!(check_edge_flush_cards_dom(&d).iter().all(|f| f.el != Some(table)), "table headers");
+    }
+
+    /// observations-1004 row 28 (w3c.github.io 10046208): a column that
+    /// only wraps a navigation rail is left out of the fold test like the
+    /// rail itself, whatever heading the rail carries.
+    #[test]
+    fn first_viewport_column_overflow_reads_a_wrapped_rail() {
+        let build = |wrap_text: Option<&str>, rail_tag: &str| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let grid = d.add(Some(body), "div");
+            d.set_styles(grid, &[("display", "grid")]);
+            d.set_rect(grid, 0.0, 0.0, 1280.0, 1600.0);
+            let block = |d: &mut FakeDom, parent: ElId, tag: &str, rect: (f64, f64, f64, f64), text: &str| {
+                let e = d.add(Some(parent), tag);
+                d.set_styles(e, &[("display", "block"), ("position", "static"), ("visibility", "visible")]);
+                d.set_rect(e, rect.0, rect.1, rect.2, rect.3);
+                if !text.is_empty() {
+                    d.add_text(e, text);
+                }
+                e
+            };
+            let article = block(&mut d, grid, "article", (0.0, 0.0, 860.0, 1600.0), "");
+            block(&mut d, article, "p", (0.0, 0.0, 860.0, 1580.0), "A long guidebook article.");
+            let section = block(&mut d, grid, "section", (900.0, 0.0, 380.0, 1600.0), "");
+            let related = block(&mut d, section, "div", (900.0, 0.0, 380.0, 200.0), wrap_text.unwrap_or(""));
+            let rail = block(&mut d, related, rail_tag, (900.0, 0.0, 380.0, 200.0), "");
+            block(&mut d, rail, "h2", (900.0, 0.0, 380.0, 30.0), "Related content");
+            for (i, label) in ["GitHub repositories", "Working groups"].iter().enumerate() {
+                block(&mut d, rail, "a", (900.0, 40.0 + 30.0 * i as f64, 380.0, 24.0), label);
+            }
+            mark_body_descendants(&mut d);
+            check_first_viewport_column_overflow_dom(&d).len()
+        };
+        assert_eq!(build(None, "nav"), 0, "a rail in a wrapper");
+        assert_eq!(build(None, "div"), 1, "a short column of copy");
+        assert_eq!(build(Some("Text of the wrapper's own"), "nav"), 1, "a wrapper with copy of its own");
+    }
+
+    /// observations-1004 row 28 (munsifdaily.in 10046628, imageto3d.studio
+    /// 10049147): a scroller inset from the viewport, painting no edge of
+    /// its own, shows a card at its edge with the page's gutter around it.
+    #[test]
+    fn edge_flush_cards_reads_where_the_scroller_sits() {
+        let row = |left: f64, painted: bool, gap: f64| {
+            let mut d = FakeDom::new();
+            d.inner_width = 390.0;
+            let (_h, body) = d.with_page();
+            let sc = d.add(Some(body), "div");
+            d.set_styles(sc, &[("overflowX", "auto"), ("overflow", "auto")]);
+            if painted {
+                d.set_style(sc, "backgroundColor", "rgb(240, 240, 240)");
+            }
+            d.set_rect(sc, left, 100.0, 390.0 - 2.0 * left, 200.0);
+            {
+                let e = d.el_mut(sc);
+                e.client_width = 390.0 - 2.0 * left;
+                e.scroll_width = 900.0;
+            }
+            let first = d.add(Some(sc), "article");
+            d.set_styles(first, &[("backgroundColor", "rgb(255, 255, 255)")]);
+            d.set_rect(first, left + gap, 110.0, 260.0, 150.0);
+            let next = d.add(Some(sc), "article");
+            d.set_styles(next, &[("backgroundColor", "rgb(255, 255, 255)")]);
+            d.set_rect(next, left + gap + 272.0, 110.0, 260.0, 150.0);
+            check_edge_flush_cards_dom(&d).len()
+        };
+        // Full-bleed: the first card touches the screen's edge.
+        assert_eq!(row(0.0, false, 4.0), 1);
+        // Inside the 16px page gutter, uncut: not flush.
+        assert_eq!(row(16.0, false, 4.0), 0);
+        assert_eq!(row(16.0, false, 0.0), 0);
+        // A scroller that paints its own surface draws the edge.
+        assert_eq!(row(16.0, true, 4.0), 1);
+        // A card the clip cuts into still reports, wherever the scroller sits.
+        assert_eq!(row(16.0, false, -10.0), 1);
+        // Under the gutter floor the screen's edge is the edge.
+        assert_eq!(row(8.0, false, 4.0), 1);
+
+        // An unpainted scroller filling a bordered panel with no padding:
+        // the panel's border is the edge the card touches.
+        let in_panel = |panel_left: f64| {
+            let mut d = FakeDom::new();
+            d.inner_width = 390.0;
+            let (_h, body) = d.with_page();
+            let panel = d.add(Some(body), "div");
+            d.set_styles(
+                panel,
+                &[
+                    ("borderLeftWidth", "1px"),
+                    ("borderLeftStyle", "solid"),
+                    ("borderLeftColor", "rgb(220, 220, 220)"),
+                    ("borderRightWidth", "1px"),
+                    ("borderRightStyle", "solid"),
+                    ("borderRightColor", "rgb(220, 220, 220)"),
+                ],
+            );
+            d.set_rect(panel, panel_left, 90.0, 390.0 - 2.0 * panel_left, 220.0);
+            let sc = d.add(Some(panel), "div");
+            d.set_styles(sc, &[("overflowX", "auto"), ("overflow", "auto")]);
+            d.set_rect(sc, 16.0, 100.0, 358.0, 200.0);
+            {
+                let e = d.el_mut(sc);
+                e.client_width = 358.0;
+                e.scroll_width = 900.0;
+            }
+            for x in [20.0, 292.0] {
+                let card = d.add(Some(sc), "article");
+                d.set_styles(card, &[("backgroundColor", "rgb(255, 255, 255)")]);
+                d.set_rect(card, x, 110.0, 260.0, 150.0);
+            }
+            check_edge_flush_cards_dom(&d).len()
+        };
+        assert_eq!(in_panel(15.0), 1, "the panel's border sits at the clip edge");
+        assert_eq!(in_panel(4.0), 0, "the panel's border sits 12px out");
+        // A shadow-only or gradient panel draws its edge too, and so does a
+        // scroller's own shadow.
+        let drawn_by = |on_scroller: bool, prop: &str, value: &str| {
+            let mut d = FakeDom::new();
+            d.inner_width = 390.0;
+            let (_h, body) = d.with_page();
+            let panel = d.add(Some(body), "div");
+            d.set_rect(panel, 16.0, 90.0, 358.0, 220.0);
+            let sc = d.add(Some(panel), "div");
+            d.set_styles(sc, &[("overflowX", "auto"), ("overflow", "auto")]);
+            d.set_rect(sc, 16.0, 100.0, 358.0, 200.0);
+            d.set_style(if on_scroller { sc } else { panel }, prop, value);
+            {
+                let e = d.el_mut(sc);
+                e.client_width = 358.0;
+                e.scroll_width = 900.0;
+            }
+            for x in [20.0, 292.0] {
+                let card = d.add(Some(sc), "article");
+                d.set_styles(card, &[("backgroundColor", "rgb(255, 255, 255)")]);
+                d.set_rect(card, x, 110.0, 260.0, 150.0);
+            }
+            check_edge_flush_cards_dom(&d).len()
+        };
+        let shadow = "rgba(0, 0, 0, 0.12) 0px 4px 16px 0px";
+        assert_eq!(drawn_by(false, "boxShadow", shadow), 1, "a shadow-only panel");
+        assert_eq!(drawn_by(false, "backgroundImage", "linear-gradient(rgb(250, 250, 250), rgb(240, 240, 240))"), 1, "a gradient panel");
+        assert_eq!(drawn_by(true, "boxShadow", shadow), 1, "the scroller's own shadow");
+        assert_eq!(drawn_by(false, "boxShadow", "none"), 0, "an unpainted panel");
+        // A transparent border draws nothing, on the panel or the scroller.
+        let transparent_border = |on_scroller: bool| {
+            let mut d = FakeDom::new();
+            d.inner_width = 390.0;
+            let (_h, body) = d.with_page();
+            let panel = d.add(Some(body), "div");
+            d.set_rect(panel, 16.0, 90.0, 358.0, 220.0);
+            let sc = d.add(Some(panel), "div");
+            d.set_styles(sc, &[("overflowX", "auto"), ("overflow", "auto")]);
+            d.set_rect(sc, 16.0, 100.0, 358.0, 200.0);
+            d.set_styles(
+                if on_scroller { sc } else { panel },
+                &[
+                    ("borderLeftWidth", "1px"),
+                    ("borderLeftStyle", "solid"),
+                    ("borderLeftColor", "rgba(0, 0, 0, 0)"),
+                ],
+            );
+            {
+                let e = d.el_mut(sc);
+                e.client_width = 358.0;
+                e.scroll_width = 900.0;
+            }
+            for x in [20.0, 292.0] {
+                let card = d.add(Some(sc), "article");
+                d.set_styles(card, &[("backgroundColor", "rgb(255, 255, 255)")]);
+                d.set_rect(card, x, 110.0, 260.0, 150.0);
+            }
+            check_edge_flush_cards_dom(&d).len()
+        };
+        assert_eq!(transparent_border(false), 0, "a transparent panel border");
+        assert_eq!(transparent_border(true), 0, "a transparent scroller border");
+
+        // Past the gutter range (a desktop scroller in a centred column) the
+        // card is judged as before.
+        let mut d = FakeDom::new();
+        d.inner_width = 1280.0;
+        let (_h, body) = d.with_page();
+        let sc = d.add(Some(body), "div");
+        d.set_styles(sc, &[("overflowX", "auto"), ("overflow", "auto")]);
+        d.set_rect(sc, 90.0, 100.0, 1100.0, 200.0);
+        {
+            let e = d.el_mut(sc);
+            e.client_width = 1100.0;
+            e.scroll_width = 2400.0;
+        }
+        for x in [94.0, 466.0, 838.0, 1210.0] {
+            let card = d.add(Some(sc), "article");
+            d.set_styles(card, &[("backgroundColor", "rgb(255, 255, 255)")]);
+            d.set_rect(card, x, 110.0, 360.0, 150.0);
+        }
+        assert_eq!(check_edge_flush_cards_dom(&d).len(), 1, "90px in: not the page's gutter");
     }
 
     #[test]
@@ -5986,6 +6502,170 @@ mod tests {
         let f = run("none", Some("Emailadresse eingeben"));
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].finding.detail.contains("overlapping text"), "{f:?}");
+    }
+
+    /// runlatent.ai (10048585, 10048718): `footer#footer` is `position:
+    /// sticky; bottom: 0; z-index: 0` under a `main` at `z-index: 1` with an
+    /// opaque fill. Every probe over the footer's links answers the page's
+    /// headings, with the footer under `main` in the stack: a curtain the
+    /// page uncovers as it scrolls away, not text a reader sees collide.
+    #[test]
+    fn text_occlusion_skips_a_curtain_footer_the_page_covers() {
+        let run_with = |z: &str,
+                        page_fill: &str,
+                        footer_shows: bool,
+                        top: &str,
+                        bottom: &str,
+                        page_opacity: &str,
+                        page_extra: &[(&str, &str)]| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            d.inner_width = 390.0;
+            d.inner_height = 844.0;
+            let footer = d.add(Some(body), "footer");
+            d.set_styles(footer, PROBE_BASE);
+            d.set_styles(footer, &[("position", "sticky"), ("zIndex", z), ("backgroundColor", "rgb(43, 70, 249)")]);
+            d.set_styles(footer, &[("top", top), ("bottom", bottom)]);
+            d.set_rect(footer, 0.0, 90.0, 390.0, 754.0);
+            let privacy = d.add(Some(footer), "a");
+            d.set_styles(privacy, PROBE_BASE);
+            d.set_rect(privacy, 16.0, 700.0, 60.0, 20.0);
+            d.add_text(privacy, "Privacy");
+            let terms = d.add(Some(footer), "a");
+            d.set_styles(terms, PROBE_BASE);
+            d.set_rect(terms, 16.0, 800.0, 60.0, 20.0);
+            d.add_text(terms, "Terms");
+            let main = d.add(Some(body), "main");
+            d.set_styles(main, PROBE_BASE);
+            d.set_styles(main, &[("position", "relative"), ("zIndex", "1"), ("backgroundColor", page_fill), ("opacity", page_opacity)]);
+            d.set_styles(main, page_extra);
+            // The page covers the whole footer, or stops short of its last
+            // row, which then shows.
+            d.set_rect(main, 0.0, 0.0, 390.0, if footer_shows { 780.0 } else { 13087.0 });
+            let h2 = d.add(Some(main), "h2");
+            d.set_styles(h2, PROBE_BASE);
+            d.set_rect(h2, 16.0, 690.0, 358.0, 40.0);
+            d.add_text(h2, "Watch Latent catch it");
+            let lede = d.add(Some(main), "p");
+            d.set_styles(lede, PROBE_BASE);
+            d.set_rect(lede, 16.0, 600.0, 358.0, 40.0);
+            d.add_text(lede, "Every regression, before your users");
+            // The footer's 48px wordmark lies across the edge of a bordered
+            // pricing card on the page: buried with the rest of the footer,
+            // it overhangs nothing a reader sees.
+            let card = d.add(Some(main), "article");
+            d.set_styles(card, PROBE_BASE);
+            d.set_styles(card, &[("backgroundColor", "rgb(255, 255, 255)"), ("borderTopWidth", "1px")]);
+            d.set_rect(card, 200.0, 300.0, 170.0, 120.0);
+            let mark = d.add(Some(footer), "span");
+            d.set_styles(mark, PROBE_BASE);
+            d.set_styles(mark, &[("fontSize", "48px"), ("lineHeight", "56px")]);
+            d.set_rect(mark, 16.0, 330.0, 240.0, 56.0);
+            d.add_text(mark, "Latent");
+            mark_body_descendants(&mut d);
+            check_text_occlusion_dom(&d)
+                .into_iter()
+                .map(|f| f.finding.detail)
+                .filter(|s| s.contains("\"Privacy\"") || s.contains("\"Terms\"") || s.contains("\"Latent\""))
+                .collect::<Vec<_>>()
+        };
+        let run_full = |z: &str, page_fill: &str, footer_shows: bool, top: &str, bottom: &str, page_opacity: &str| {
+            run_with(z, page_fill, footer_shows, top, bottom, page_opacity, &[])
+        };
+        let run_anchored = |z: &str, page_fill: &str, footer_shows: bool, top: &str, bottom: &str| {
+            run_full(z, page_fill, footer_shows, top, bottom, "1")
+        };
+        let run = |z: &str, page_fill: &str, footer_shows: bool| run_anchored(z, page_fill, footer_shows, "auto", "0px");
+        // Both links: one under the page's heading, one under its fill;
+        // and the wordmark, under the card.
+        let base = run("auto", "rgb(10, 11, 16)", false);
+        assert_eq!(base.len(), 3, "{base:?}");
+        assert!(base[0].contains("on an opaque layer (main)"), "{base:?}");
+        // Sticky at z-index 0, or below it: buried under the page.
+        assert!(run("0", "rgb(10, 11, 16)", false).is_empty());
+        assert!(run("-1", "rgb(10, 11, 16)", false).is_empty());
+        // The same layer pinned to the top (a header at `z-index: 0` that
+        // the page lays over) is buried for good, not uncovered by scrolling:
+        // its words collide. So does one whose anchoring was not recorded.
+        assert_eq!(run_anchored("0", "rgb(10, 11, 16)", false, "0px", "auto").len(), 3);
+        assert_eq!(run_anchored("0", "rgb(10, 11, 16)", false, "", "").len(), 3);
+        // A page block caught part way into its fade-in buries nothing: the
+        // footer shows through it.
+        assert!(!run_full("0", "rgb(10, 11, 16)", false, "auto", "0px", "0.5").is_empty());
+        // Above the page, or under a page with no opaque fill, it collides.
+        assert_eq!(run("2", "rgb(10, 11, 16)", false).len(), 3);
+        // Under a faint page the footer's words show, so its wordmark
+        // overhangs the card too.
+        let faint = run("0", "rgba(10, 11, 16, 0.5)", false);
+        assert_eq!(faint.len(), 2, "{faint:?}");
+        assert!(faint[0].contains("\"Privacy\""), "{faint:?}");
+        assert!(faint[1].contains("\"Latent\""), "{faint:?}");
+        // So do they under an opaque page that blends, filters or masks its
+        // fill: a page at `multiply` leaves the footer showing.
+        for extra in [
+            ("mixBlendMode", "multiply"),
+            ("filter", "opacity(0.5)"),
+            ("maskImage", "linear-gradient(black, transparent)"),
+            ("backgroundClip", "content-box"),
+        ] {
+            let seen = run_with("0", "rgb(10, 11, 16)", false, "auto", "0px", "1", &[extra]);
+            assert!(seen.iter().any(|s| s.contains("\"Privacy\"")), "{extra:?}: {seen:?}");
+            assert!(seen.iter().any(|s| s.contains("\"Latent\"")), "{extra:?}: {seen:?}");
+        }
+        // Where one of its links shows, the footer is on screen, and what
+        // the page lies on is covered: the link under its heading, the
+        // wordmark under its fill.
+        let shows = run("0", "rgb(10, 11, 16)", true);
+        assert_eq!(shows.len(), 2, "{shows:?}");
+        assert!(shows[0].contains("\"Privacy\""), "{shows:?}");
+        assert!(shows[1].contains("\"Latent\" is 100% covered by an opaque element (main)"), "{shows:?}");
+    }
+
+    /// boardlab.dev (10047349): the canvas hint panel is `pointer-events:
+    /// none` over a circuit SVG, so the probe passes through the panel's
+    /// text to the drawing under it. A graphic answer cannot be ranked
+    /// against such text; an SVG text answer still overlaps it.
+    #[test]
+    fn text_occlusion_cannot_rank_a_graphic_under_text_that_ignores_pointer_events() {
+        let run = |pointer_events: &str, svg_child: &str| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let canvas = d.add(Some(body), "div");
+            d.set_styles(canvas, PROBE_BASE);
+            d.set_style(canvas, "position", "relative");
+            d.set_rect(canvas, 589.0, 148.0, 496.0, 651.0);
+            let panel = d.add(Some(canvas), "div");
+            d.set_styles(panel, PROBE_BASE);
+            d.set_styles(panel, &[("position", "absolute"), ("pointerEvents", pointer_events)]);
+            d.set_rect(panel, 601.0, 160.0, 240.0, 120.0);
+            let label = d.add(Some(panel), "p");
+            d.set_styles(label, PROBE_BASE);
+            d.set_style(label, "pointerEvents", pointer_events);
+            d.set_rect(label, 614.0, 169.0, 214.0, 16.0);
+            d.add_text(label, "Canvas");
+            // Later in the tree, so the fake hit test answers it first, as
+            // the browser's does when the probe passes through the panel.
+            let svg = d.add(Some(canvas), "svg");
+            d.set_styles(svg, PROBE_BASE);
+            d.set_rect(svg, 589.0, 148.0, 496.0, 651.0);
+            let mark = d.add(Some(svg), svg_child);
+            d.set_styles(mark, PROBE_BASE);
+            d.set_rect(mark, 600.0, 160.0, 300.0, 40.0);
+            if svg_child == "text" {
+                d.add_text(mark, "Input A");
+            }
+            mark_body_descendants(&mut d);
+            check_text_occlusion_dom(&d)
+                .into_iter()
+                .map(|f| f.finding.detail)
+                .filter(|s| s.contains("\"Canvas\""))
+                .collect::<Vec<_>>()
+        };
+        let base = run("auto", "path");
+        assert_eq!(base.len(), 1, "{base:?}");
+        assert!(base[0].contains("an SVG graphic"), "{base:?}");
+        assert!(run("none", "path").is_empty());
+        assert_eq!(run("none", "text").len(), 1);
     }
 
     /// ladepeche.fr's stretched link: its transparent `::after` answers for
@@ -7413,6 +8093,49 @@ mod tests {
             d.add_text(row, name);
         }
         assert_eq!(check_layout(&d).len(), 1, "a stack of monospace rows");
+        // observations-1004 row 28 (v0-saa-s-landing-page 10047462): a code
+        // sample written one line per block reads as code, and is one
+        // output block.
+        let (mut d, card) = page();
+        let sample = d.add(Some(card), "div");
+        outlined(&mut d, sample, "8px");
+        d.set_rect(sample, 24.0, 24.0, 500.0, 160.0);
+        d.set_style(sample, "fontFamily", "\"Geist Mono\", monospace");
+        for (i, line) in ["// Example: Send notification", "const response = await nexus.send({", "channel: \"#general\",", "});"].iter().enumerate() {
+            let row = d.add(Some(sample), "div");
+            d.set_styles(row, &[("display", "block"), ("fontFamily", "\"Geist Mono\", monospace")]);
+            d.set_rect(row, 48.0, 48.0 + 24.0 * i as f64, 452.0, 16.0);
+            d.add_text(row, line);
+        }
+        assert!(check_layout(&d).is_empty(), "a code sample, one row per line");
+        // The same runs laid side by side are one line of chips (paseo.sh's
+        // `create_agent #412` tool-call row), not a stack.
+        for (i, row) in d.children(sample).into_iter().enumerate() {
+            d.set_rect(row, 48.0 + 110.0 * i as f64, 48.0, 100.0, 16.0);
+        }
+        assert_eq!(check_layout(&d).len(), 1, "runs side by side");
+        for (i, row) in d.children(sample).into_iter().enumerate() {
+            d.set_rect(row, 48.0, 48.0 + 24.0 * i as f64, 452.0, 16.0);
+        }
+        // A row that is not one run (a row holding a block) breaks the read.
+        let rows = d.children(sample);
+        let nested = d.add(Some(rows[1]), "div");
+        d.set_styles(nested, &[("display", "block"), ("fontFamily", "\"Geist Mono\", monospace")]);
+        d.add_text(nested, "a block of its own inside a row, longer than the row's own text");
+        assert_eq!(check_layout(&d).len(), 1, "a row that holds a block");
+        // Review of round 11: monospace rows holding a quote, an underscore
+        // or a `>` are labels, not code.
+        let (mut d, card) = page();
+        let stack = d.add(Some(card), "div");
+        outlined(&mut d, stack, "8px");
+        d.set_rect(stack, 24.0, 24.0, 500.0, 160.0);
+        for (i, line) in ["Added \"dark mode\"", "Renamed user_id", "Settings > Billing"].iter().enumerate() {
+            let row = d.add(Some(stack), "div");
+            d.set_styles(row, &[("display", "block"), ("fontFamily", "\"Geist Mono\", monospace")]);
+            d.set_rect(row, 48.0, 48.0 + 24.0 * i as f64, 452.0, 16.0);
+            d.add_text(row, line);
+        }
+        assert_eq!(check_layout(&d).len(), 1, "a changelog set in a monospace face");
         // A terminal: a header line and one paragraph of monospace output
         // with inline links in it.
         let (mut d, card) = page();
