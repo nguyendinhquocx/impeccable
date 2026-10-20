@@ -181,7 +181,12 @@ fn unfinished_comp_stop_is_owned_bounded_and_does_not_reopen_on_unrelated_turn()
 
 /// A comp build this session recorded as shipped, the way `finish` leaves it.
 fn shipped_build(t: &Tmp) {
-    t.write("index.html", "<main>Shipped</main>");
+    shipped_build_in(t, "");
+}
+
+/// `shipped_build` under `dir` (empty or ending in `/`), where `build-phase` ran.
+fn shipped_build_in(t: &Tmp, dir: &str) {
+    t.write(&format!("{dir}index.html"), "<main>Shipped</main>");
     let mut state = json!({
         "tool":"build-phase", "version":2, "startedAt":"build-one", "phase":"review",
         "sessionId":"owner", "artifact":"index.html", "capturePolicy":"native-html-v1", "phases":{}
@@ -189,10 +194,10 @@ fn shipped_build(t: &Tmp) {
     for phase in ["comps", "spec", "plates", "hero", "sections", "motion", "responsive", "review"] {
         state["phases"][phase] = json!({"status":"closed"});
     }
-    let hash = impeccable_comp_verbs::completion::artifact_hash(std::path::Path::new(&t.path()), &state).unwrap();
+    let hash = impeccable_comp_verbs::completion::artifact_hash(&t.0.join(dir), &state).unwrap();
     state["finish"] = json!({"disposition":"ship", "phaseAtFinish":"review", "artifactSha256":hash,
         "captureInputs":[{"path":"index.html","sha256":hash}]});
-    t.write(".impeccable/build/state.json", &state.to_string());
+    t.write(&format!("{dir}.impeccable/build/state.json"), &state.to_string());
 }
 
 #[test]
@@ -2681,6 +2686,78 @@ fn stop_cache_syncs_after_clean_scan_so_reintroductions_fire() {
     t.write("src/a.css", SIDE_TAB_CSS);
     let again = hook::run_stop_hook(&r, &stop_event(&cwd, "s1"));
     assert!(again.stdout.contains("[side-tab]"), "{}", again.stdout);
+}
+
+#[test]
+fn stop_from_a_subfolder_finds_the_root_cache() {
+    // #1088: the per-edit pass keys the cache to the project root; Stop from a
+    // subfolder, even one with its own `.impeccable/`, must still find it.
+    let t = Tmp::new();
+    t.write("package.json", "{}");
+    let cwd = t.path();
+    let css = t.write("src/a.css", SIDE_TAB_CSS);
+    let docs = jsp::join(&[&cwd, "docs"]);
+    t.write("docs/readme.txt", "x");
+    let app = jsp::join(&[&cwd, "app"]);
+    t.write("app/.impeccable/live/roots.json", "{}");
+    for (session, sub) in [("s1", &docs), ("s2", &app)] {
+        hook::run_hook(&rt(&cwd), &edit_event(&cwd, &css, session));
+        let res = hook::run_stop_hook(&rt(sub), &stop_event(sub, session));
+        assert!(res.stdout.contains("[side-tab]"), "{session}: {}", res.stdout);
+        assert_eq!(audit_str(&res.audit, "cwd"), Some(cwd.as_str()));
+    }
+}
+
+#[test]
+fn stop_from_a_subfolder_build_keeps_its_reminder_and_scans_the_root_cache() {
+    // #1088: `build-phase` keeps its state under its own cwd, so the reminder
+    // and its config stay there, while the scan still finds root edits.
+    let t = Tmp::new();
+    t.write("package.json", "{}");
+    let cwd = t.path();
+    let css = t.write("src/a.css", SIDE_TAB_CSS);
+    t.write("app/index.html", "<main>In progress</main>");
+    let build = |owner: &str| t.write("app/.impeccable/build/state.json", &json!({
+        "tool":"build-phase", "version":2, "startedAt":"build-one",
+        "sessionId":owner, "artifact":"index.html", "finish":null,
+        "phases":{"hero":{"status":"open"}}
+    }).to_string());
+    let app = jsp::join(&[&cwd, "app"]);
+    hook::run_hook(&rt(&cwd), &edit_event(&cwd, &css, "owner"));
+    build("other");
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert!(res.stdout.contains("[side-tab]"), "{}", res.stdout);
+    build("owner");
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert!(res.stdout.contains("Comp build"), "{}", res.stdout);
+    t.write("app/.impeccable/config.json", r#"{"hook":{"enabled":false}}"#);
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert_eq!(audit_str(&res.audit, "skipped"), Some("config-disabled"));
+    // The root's own config gates the scan of root edits.
+    t.write("app/.impeccable/config.json", "{}");
+    t.write("app/.impeccable/build/state.json", "{}");
+    t.write(".impeccable/config.json", r#"{"hook":{"enabled":false}}"#);
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert_eq!(audit_str(&res.audit, "skipped"), Some("config-disabled"));
+    assert_eq!(audit_str(&res.audit, "cwd"), Some(cwd.as_str()));
+}
+
+#[test]
+fn stop_from_a_subfolder_shipped_build_marks_the_build_folder_cache() {
+    // #1088: findings from a root edit over a build shipped in the subfolder
+    // carry the finish note, and its marker lands where the reminder reads it.
+    let t = Tmp::new();
+    t.write("package.json", "{}");
+    let cwd = t.path();
+    shipped_build_in(&t, "app/");
+    let css = t.write("src/a.css", SIDE_TAB_CSS);
+    hook::run_hook(&rt(&cwd), &edit_event(&cwd, &css, "owner"));
+    let app = jsp::join(&[&cwd, "app"]);
+    let res = hook::run_stop_hook(&rt(&app), &stop_event(&app, "owner"));
+    assert!(res.stdout.contains("[side-tab]"), "{}", res.stdout);
+    assert!(res.stdout.contains("finish --disposition ship recorded"), "{}", res.stdout);
+    assert!(t.read("app/.impeccable/hook.cache.json").contains("findingsAfterFinish"));
+    assert!(!t.read(".impeccable/hook.cache.json").contains("findingsAfterFinish"));
 }
 
 #[test]

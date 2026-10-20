@@ -140,6 +140,7 @@ pub fn detect_html_source_json(html: &str, file_path: &str, options_json: &str) 
             text_content_analyzers: Some(&analyzers),
             profile: None,
             warn: None,
+            ignored_linked_stylesheet: None,
             static_rule_pack: installed_static_rule_pack(),
             rule_pack: crate::installed_rule_pack(),
         },

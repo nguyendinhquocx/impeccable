@@ -216,10 +216,7 @@ pub fn run_hook(rt: &Runtime, stdin: &str) -> RunResult {
             last_skip = "extension";
             continue;
         }
-        let rel_for_match = relativize(rt, file_path, &project_cwd);
-        if matches_any_glob_list(&rel_for_match, &config.ignore_files)
-            || matches_any_glob_list(file_path, &config.ignore_files)
-        {
+        if is_ignored_file(&rt.proc_cwd, file_path, &project_cwd, &config.ignore_files) {
             last_skip = "config-ignore-file";
             continue;
         }
@@ -657,16 +654,19 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
             }
         }
     }
-    let project_cwd = rt.resolve(&[str_field(&event, "cwd").unwrap_or(&rt.proc_cwd)]);
-    audit.insert("cwd".into(), Value::String(project_cwd.clone()));
     let session_value = session_id_of(&event);
     let session_id = session_key(&session_value);
+    // The build-completion stage keeps the session cwd: `build-phase` writes
+    // its state under its own cwd. Only the touched-file scan moves to the
+    // root the per-edit pass keyed this session's cache to (#1088).
+    let session_cwd = rt.resolve(&[str_field(&event, "cwd").unwrap_or(&rt.proc_cwd)]);
+    audit.insert("cwd".into(), Value::String(session_cwd.clone()));
     audit.insert(
         "session".into(),
         session_value.unwrap_or_else(|| Value::from("unknown")),
     );
 
-    let config = read_config(&project_cwd);
+    let config = read_config(&session_cwd);
     if !config.enabled {
         return result(
             &audit,
@@ -680,10 +680,10 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
     // included. Resolving the platform reads PRODUCT.md, so it is paid only
     // when there is a build state to remind about or touched files to scan.
     let mut platform_memo: Option<Option<String>> = None;
-    let native_skip = |platform_memo: &mut Option<Option<String>>| -> Option<RunResult> {
-        let platform = platform_memo.get_or_insert_with(|| resolve_project_platform(rt, &project_cwd)).clone();
+    let native_skip = |audit: &Map<String, Value>, cwd: &str, platform_memo: &mut Option<Option<String>>| -> Option<RunResult> {
+        let platform = platform_memo.get_or_insert_with(|| resolve_project_platform(rt, cwd)).clone();
         is_native_platform(platform.as_deref()).then(|| result(
-            &audit,
+            audit,
             vec![
                 ("skipped", Value::from("native-platform")),
                 ("platform", Value::String(platform.unwrap_or_default())),
@@ -691,12 +691,12 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
             ],
         ))
     };
-    if std::path::Path::new(&project_cwd).join(".impeccable/build/state.json").is_file() {
-        if let Some(skip) = native_skip(&mut platform_memo) { return skip; }
+    if std::path::Path::new(&session_cwd).join(".impeccable/build/state.json").is_file() {
+        if let Some(skip) = native_skip(&audit, &session_cwd, &mut platform_memo) { return skip; }
     }
-    let mut cache = read_cache(&project_cwd);
+    let mut cache = read_cache(&session_cwd);
     if matches!(harness, "claude" | "codex" | "gemini") {
-        if let Some(message) = crate::build_completion::reminder(rt, &project_cwd, &session_id, stop_hook_active, &mut cache) {
+        if let Some(message) = crate::build_completion::reminder(rt, &session_cwd, &session_id, stop_hook_active, &mut cache) {
             return RunResult {
                 stdout: payload(&message, "Stop", harness),
                 audit: with(&audit, vec![("kind", Value::from("build-completion")), ("emitted", Value::Bool(true)), ("durationMs", ms_since(started))]),
@@ -709,6 +709,28 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
     if truthy(rt.env("IMPECCABLE_HOOK_COMPLETION_ONLY")) {
         return result(&audit, vec![("skipped", Value::from("no-build-continuation")), ("durationMs", ms_since(started))]);
     }
+    let project_cwd = resolve_stop_cwd(rt, &session_cwd, &session_id);
+    // At another root the scan runs under that root's config and cache, as
+    // the per-edit pass did; the session cwd's cache keeps the build marker.
+    let mut build_cache = None;
+    let config = if project_cwd == session_cwd {
+        config
+    } else {
+        audit.insert("cwd".into(), Value::String(project_cwd.clone()));
+        let config = read_config(&project_cwd);
+        if !config.enabled {
+            return result(
+                &audit,
+                vec![
+                    ("skipped", Value::from("config-disabled")),
+                    ("durationMs", ms_since(started)),
+                ],
+            );
+        }
+        platform_memo = None;
+        build_cache = Some(std::mem::replace(&mut cache, read_cache(&project_cwd)));
+        config
+    };
     let touched = touched_files(&cache, &session_id);
     if touched.is_empty() {
         return result(
@@ -719,7 +741,7 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
             ],
         );
     }
-    if let Some(skip) = native_skip(&mut platform_memo) { return skip; }
+    if let Some(skip) = native_skip(&audit, &project_cwd, &mut platform_memo) { return skip; }
     let mut scans = HashMap::new();
 
     let mut fresh_groups: Vec<Group> = Vec::new();
@@ -743,10 +765,7 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
         if !ALLOWED_EXTS.contains(&ext.as_str()) && configured.is_none() {
             continue;
         }
-        let rel = relativize(rt, file_path, &project_cwd);
-        if matches_any_glob_list(&rel, &config.ignore_files)
-            || matches_any_glob_list(file_path, &config.ignore_files)
-        {
+        if is_ignored_file(&rt.proc_cwd, file_path, &project_cwd, &config.ignore_files) {
             continue;
         }
         if !exists(file_path) || !is_scan_target_inside_project(rt, file_path, &project_cwd) {
@@ -865,7 +884,15 @@ pub fn run_stop_hook(rt: &Runtime, stdin: &str) -> RunResult {
         append_design_system_note_once(rt, &text, scan, &mut cache, &session_id, &config);
     // Findings shown over a comp build already recorded as shipped: a fix voids
     // that finish, so say so with the findings, not after the agent stops.
-    let text = match crate::build_completion::finished_build_note(rt, &project_cwd, &session_id, &mut cache) {
+    let note = match build_cache.as_mut() {
+        Some(build_cache) => {
+            let note = crate::build_completion::finished_build_note(rt, &session_cwd, &session_id, build_cache);
+            if note.is_some() { persist_cache(rt, &session_cwd, build_cache); }
+            note
+        }
+        None => crate::build_completion::finished_build_note(rt, &session_cwd, &session_id, &mut cache),
+    };
+    let text = match note {
         Some(note) => format!("{text}\n\n{note}"),
         None => text,
     };

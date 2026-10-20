@@ -120,6 +120,21 @@ export default [
     setup: (ws) => { fs.mkdirSync(`${ws}/.impeccable`, { recursive: true }); fs.writeFileSync(`${ws}/.impeccable/config.json`, JSON.stringify({ detector: { ignoreFiles: ['src/components/**'] } }, null, 2) + '\n'); },
     stdin: claudeEdit('src/components/Card.module.css'), files: CACHE_FILES,
   },
+  // #1087: a linked stylesheet detector.ignoreFiles waives is not reported
+  // again under the page that links it.
+  ...[['hook-linked-sheet', null], ['hook-linked-sheet-ignored', ['src/vendor/**']]].map(([id, ignoreFiles]) => ({
+    id, verb: 'hook', workspace: 'hook-project',
+    setup: (ws) => {
+      fs.mkdirSync(`${ws}/src/vendor`, { recursive: true });
+      fs.writeFileSync(`${ws}/src/vendor/lib.css`, '.unused-text { background-image: linear-gradient(90deg, #f00, #00f); background-clip: text; -webkit-background-clip: text; color: transparent; }\n');
+      fs.writeFileSync(`${ws}/src/linked.html`, '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>mock</title>\n<link rel="stylesheet" href="vendor/lib.css"></head><body><main><h1>Mock</h1></main></body></html>\n');
+      if (ignoreFiles) {
+        fs.mkdirSync(`${ws}/.impeccable`, { recursive: true });
+        fs.writeFileSync(`${ws}/.impeccable/config.json`, JSON.stringify({ detector: { ignoreFiles } }, null, 2) + '\n');
+      }
+    },
+    stdin: claudeEdit('src/linked.html'), files: CACHE_FILES,
+  })),
   {
     id: 'hook-config-per-edit-all', verb: 'hook', workspace: 'hook-project',
     setup: (ws) => { fs.mkdirSync(`${ws}/.impeccable`, { recursive: true }); fs.writeFileSync(`${ws}/.impeccable/config.json`, JSON.stringify({ hook: { perEditRules: 'all' } }, null, 2) + '\n'); },

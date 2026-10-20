@@ -41,6 +41,10 @@ pub struct ScanOptions {
     /// browser engine reports them as before; it only stops letting one of
     /// them stand in for another rule's finding (vanishing ink).
     pub unreported_rules: Vec<String>,
+    /// Whether `detector.ignoreFiles` waives a linked stylesheet (given its
+    /// absolute path). The static HTML engine still reads it for the cascade
+    /// but leaves it out of the page-level pattern scan.
+    pub ignored_linked_stylesheet: Option<Rc<dyn Fn(&str) -> bool>>,
 }
 
 /// A URL scan's findings plus the notes the CLI prints about how the page

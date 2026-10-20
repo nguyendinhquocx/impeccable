@@ -55,6 +55,11 @@ export default [
     id: 'live-boot-full-cycle', verb: 'live', workspace: 'live-html', files: [...F, 'index.html', 'public/**'], normalize: PORT_NORM,
     steps: [{ verb: 'live' }, { verb: 'live-inject', args: ['--check'] }, { verb: 'live-server', args: ['stop'] }],
   },
+  {
+    id: 'live-server-background-static-subdir', verb: 'live-server', workspace: 'live-workspaces', cwd: 'static-mock', normalize: PORT_NORM,
+    setup: (ws) => { fakeGit(ws); rm(ws, 'apps/admin'); write(ws, 'static-mock/index.html', '<!doctype html><title>mock</title><main><h1>Mock</h1></main>\n'); },
+    steps: [{ args: ['--background'] }, { args: ['stop', '--keep-inject'] }],
+  },
 
   // --- live-inject.mjs ---
   { id: 'live-inject-help', verb: 'live-inject', workspace: 'live-html', args: ['--help'] },

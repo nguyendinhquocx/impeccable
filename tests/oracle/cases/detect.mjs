@@ -225,6 +225,37 @@ function Thumb({ url }: { url?: string }) {
       args: ['--json', 'index.html'],
     },
 
+    // #1087: a linked stylesheet that detector.ignoreFiles waives is not
+    // reported again under the page that links it; the page's own <style>
+    // still is.
+    ...[
+      ['detect-linked-sheet-dir-json', null, '.'],
+      ['detect-linked-sheet-dir-ignored-json', ['vendor/**'], '.'],
+      ['detect-linked-sheet-file-ignored-json', ['vendor/**'], 'index.html'],
+    ].map(([id, ignoreFiles, target]) => ({
+      id, verb: 'detect',
+      setup: (ws) => {
+        fs.writeFileSync(path.join(ws, 'package.json'), '{"name":"linked-sheet"}\n');
+        fs.mkdirSync(path.join(ws, 'vendor'));
+        fs.writeFileSync(
+          path.join(ws, 'index.html'),
+          '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>mock</title>\n<style>.band { background: repeating-linear-gradient(45deg, #111 0 10px, #eee 10px 20px); }</style>\n<link rel="stylesheet" href="vendor/lib.css"></head><body><main><h1>Mock</h1></main></body></html>\n',
+        );
+        fs.writeFileSync(
+          path.join(ws, 'vendor', 'lib.css'),
+          '.unused-text { background-image: linear-gradient(90deg, #f00, #00f); background-clip: text; -webkit-background-clip: text; color: transparent; }\n',
+        );
+        if (ignoreFiles) {
+          fs.mkdirSync(path.join(ws, '.impeccable'));
+          fs.writeFileSync(
+            path.join(ws, '.impeccable', 'config.json'),
+            JSON.stringify({ detector: { ignoreFiles } }) + '\n',
+          );
+        }
+      },
+      args: ['--json', target],
+    })),
+
     // A DESIGN.md that declares a purple switches ai-color-palette's
     // purple/violet forms off for its project, in the static and the regex
     // engines alike, and text mode says so; a DESIGN.md without one changes

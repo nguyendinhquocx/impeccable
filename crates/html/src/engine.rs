@@ -89,6 +89,10 @@ pub struct DetectHtmlOptions<'a> {
     /// Sink for the JS `process.stderr.write` notices (unreadable linked
     /// stylesheets); `None` drops them.
     pub warn: Option<&'a dyn Fn(&str)>,
+    /// Whether `detector.ignoreFiles` waives a linked stylesheet (given its
+    /// resolved path). It is still read for the cascade but leaves the
+    /// page-level pattern scan; `None` keeps every linked sheet in.
+    pub ignored_linked_stylesheet: Option<&'a dyn Fn(&str) -> bool>,
     /// A rule pack's static-document hook: rules over the parsed page.
     pub static_rule_pack: Option<&'static dyn StaticRulePack>,
     /// The same pack's engine-wide text hook. An HTML file gets **one** pack
@@ -223,7 +227,14 @@ pub fn detect_html_source(
         Meta::new("parse-html", "parse-document", fp),
         || StaticDocument::parse(html),
     );
-    let css_text = collect_static_css_text(&doc, &file_dir, profile, fp, options.warn);
+    let (css_text, pattern_css_text) = collect_static_css_text(
+        &doc,
+        &file_dir,
+        profile,
+        fp,
+        options.warn,
+        options.ignored_linked_stylesheet,
+    );
     build_static_style_map(&mut doc, css_text.as_str(), profile, fp);
     // A stylesheet the engine could not read may round any card it never saw
     // a radius for; the side-accent gate keeps those findings.
@@ -354,7 +365,7 @@ pub fn detect_html_source(
                 class_attr_parts.push(c.to_string());
             }
         }
-        let mut style_parts = vec![css_text.clone()];
+        let mut style_parts = vec![pattern_css_text];
         style_parts.extend(style_attr_parts);
         let corpora = HtmlPatternCorpora {
             style_text: style_parts.join("\n"),
@@ -480,7 +491,7 @@ pub fn unsupported_selectors(html: &str, file_path: &Path) -> Vec<String> {
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
     let mut doc = StaticDocument::parse(html);
-    let css_text = collect_static_css_text(&doc, &file_dir, None, &file_str, None);
+    let (css_text, _) = collect_static_css_text(&doc, &file_dir, None, &file_str, None, None);
     build_static_style_map(&mut doc, &css_text, None, &file_str);
     doc.unsupported_selectors()
 }
