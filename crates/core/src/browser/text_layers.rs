@@ -29,7 +29,7 @@
 //! alone wherever it cannot tell.
 
 use super::dom::{flat_contains, tag_lower, Dom, ElId};
-use super::element_checks::{effective_opacity_dom, parse_rgb_or_any};
+use super::element_checks::{blur_radius_px, effective_opacity_dom, parse_rgb_or_any};
 use super::page_checks::{
     occlusion_grid_size, occlusion_probe_points, occlusion_probe_rect, occlusion_viewport,
     rect_holds_point,
@@ -126,22 +126,51 @@ fn distance(a: &Rgba, b: &Rgba) -> f64 {
     (a.r - b.r).abs() + (a.g - b.g).abs() + (a.b - b.b).abs()
 }
 
+/// The fill alpha, times the layer's effective opacity, at which a layer
+/// that also blurs what is under it hides the text: frosted glass leaves it
+/// a smear. shinebythara.lovable.app's fixed nav, `bg-background/80
+/// backdrop-blur-md` (0.8 and 12px), over its 14px promo row
+/// (observations-1006 row 8). A translucent layer with no blur is not
+/// taken: blueeyes.com.tw's cookie bar at `rgba(0, 0, 0, 0.8)` dims the
+/// buttons under it, and the judges read them (row 6).
+const SCRIM_BLURRED_MIN_ALPHA: f64 = 0.75;
+
+/// The least backdrop blur that counts as glass, whatever the text.
+const SCRIM_MIN_BLUR_PX: f64 = 8.0;
+
+/// How much of the text's font size the backdrop blur has to reach: a blur
+/// smears glyphs about its own size and leaves larger ones readable (a 40px
+/// heading under a 4px frosted header reads clearly).
+const SCRIM_BLUR_PER_FONT_PX: f64 = 1.0 / 3.0;
+
 /// Whether a layer above the text hides it at `(x, y)`: an image, a video, a
-/// canvas, or an opaque fill, at full opacity, where the capture put it.
-/// Raster backgrounds are not counted, because a transparent texture drawn
-/// over a hero is one too.
-fn covers(dom: &dyn Dom, node: ElId, x: f64, y: f64) -> bool {
+/// canvas, or an opaque fill, at full opacity, or frosted glass
+/// ([`SCRIM_BLURRED_MIN_ALPHA`]) whose blur reaches [`SCRIM_MIN_BLUR_PX`] and
+/// a third of `font_px`, the text's font size (glass is not taken when the
+/// size is unknown), where the capture put it. Raster backgrounds are not
+/// counted, because a transparent texture drawn over a hero is one too.
+fn covers(dom: &dyn Dom, node: ElId, x: f64, y: f64, font_px: f64) -> bool {
     if is_document_surface(dom, node) || !rect_holds_point(&dom.rect(node), x, y) {
         return false;
     }
-    if js::trim(&dom.style(node, "visibility")) == "hidden"
-        || effective_opacity_dom(dom, node) < COVER_MIN_OPACITY
-    {
+    if js::trim(&dom.style(node, "visibility")) == "hidden" {
         return false;
     }
-    MEDIA_TAGS.contains(&tag_lower(dom, node).as_str())
-        || parse_rgb_or_any(&dom.style(node, "backgroundColor"))
-            .map_or(false, |c| c.alpha_or_one() >= COVER_MIN_ALPHA)
+    let opacity = effective_opacity_dom(dom, node);
+    let fill = parse_rgb_or_any(&dom.style(node, "backgroundColor"));
+    if opacity >= COVER_MIN_OPACITY
+        && (MEDIA_TAGS.contains(&tag_lower(dom, node).as_str())
+            || fill.is_some_and(|c| c.alpha_or_one() >= COVER_MIN_ALPHA))
+    {
+        return true;
+    }
+    if !(font_px.is_finite() && font_px > 0.0) {
+        return false;
+    }
+    let blur = blur_radius_px(&dom.style(node, "backdropFilter"));
+    fill.is_some_and(|c| c.alpha_or_one() * opacity >= SCRIM_BLURRED_MIN_ALPHA)
+        && blur >= SCRIM_MIN_BLUR_PX
+        && blur >= font_px * SCRIM_BLUR_PER_FONT_PX
 }
 
 /// What a box that is nobody's ancestor paints under the text.
@@ -396,6 +425,134 @@ fn moves_surface(paint: &[Rgba], resolved: Option<Rgba>) -> Option<bool> {
     )
 }
 
+/// The first layer in `above` (the stack above the text at `(x, y)`,
+/// topmost first) that is not the text's ancestor and [`covers`] it there.
+/// With `stays`, only a layer that stays over the text as the page scrolls
+/// counts ([`stays_over_the_text`]).
+fn cover_above(dom: &dyn Dom, el: ElId, above: &[ElId], x: f64, y: f64, stays: bool) -> Option<ElId> {
+    let font_px = js::parse_float(&dom.style(el, "fontSize"));
+    above
+        .iter()
+        .copied()
+        .find(|&node| !dom.contains(node, el) && covers(dom, node, x, y, font_px) && (!stays || stays_over_the_text(dom, node, el)))
+}
+
+/// Whether a covering layer stays over the text when the visitor scrolls:
+/// neither it nor an ancestor is `fixed` or `sticky`, so it moves with the
+/// page, or the first such box and the layer itself are pinned to the
+/// viewport's top (each box starts within 1px of it) with the page at its
+/// top, so scrolling only carries the text further under it (metlife.com's
+/// mobile nav over its breadcrumbs). A cookie bar fixed to the bottom of the
+/// window lies over whatever text the capture left there, and a scroll
+/// brings that text out (ytbulktranscript.app's paragraph, tau.ac.il's 9px
+/// price); so does one placed at the bottom of a full-window fixed wrapper,
+/// whose own top is 0.
+///
+/// A cover that scrolls with the page does not stay over text that is itself
+/// `fixed` or `sticky`: scrolling carries the cover away and leaves the text
+/// in the window.
+fn stays_over_the_text(dom: &dyn Dom, node: ElId, text: ElId) -> bool {
+    let pinned = |start: ElId| {
+        let mut cur = Some(start);
+        while let Some(n) = cur {
+            if Some(n) == dom.body() || Some(n) == dom.document_element() {
+                return false;
+            }
+            if matches!(dom.style(n, "position").as_str(), "fixed" | "sticky") {
+                return true;
+            }
+            cur = dom.parent(n);
+        }
+        false
+    };
+    let at_top = |n: ElId| {
+        let r = dom.rect(n);
+        r.all_finite() && r.top <= 1.0
+    };
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if Some(n) == dom.body() || Some(n) == dom.document_element() {
+            return !pinned(text);
+        }
+        if matches!(dom.style(n, "position").as_str(), "fixed" | "sticky") {
+            let scroll = dom.scroll_y();
+            return at_top(n) && at_top(node) && scroll.is_finite() && scroll <= 1.0;
+        }
+        cur = dom.parent(n);
+    }
+    !pinned(text)
+}
+
+/// The share of a run's text a single covering layer has to hold for a
+/// split grid to count as covered: bordeaux-metropole.fr's consent modal
+/// holds 87% of a link whose top grid row lies just above it, and
+/// searchvoro.com's card holds all of a paragraph whose box runs past it.
+const COVERED_TEXT_MIN_SHARE: f64 = 0.85;
+
+/// Whether one layer that covers the text at a deciding point holds at
+/// least [`COVERED_TEXT_MIN_SHARE`] of the run's direct text box. A run with
+/// no direct text box (a field's placeholder), or a layer the capture did
+/// not measure, holds nothing.
+fn covering_layer_holds_text(
+    dom: &dyn Dom,
+    el: ElId,
+    points: &[(f64, f64)],
+    answers: &[AtPoint],
+    stays: bool,
+) -> bool {
+    let Some(text) = dom.direct_text_rect(el).filter(|r| r.all_finite() && r.width > 0.0 && r.height > 0.0) else {
+        return false;
+    };
+    let area = text.width * text.height;
+    let mut seen: Vec<ElId> = Vec::new();
+    for (&(x, y), answer) in points.iter().zip(answers) {
+        if *answer != AtPoint::Covered {
+            continue;
+        }
+        let stack = dom.elements_from_point(x, y);
+        let Some(first) = stack.iter().position(|&n| dom.contains(el, n)) else {
+            continue;
+        };
+        let Some(layer) = cover_above(dom, el, &stack[..first], x, y, stays) else {
+            continue;
+        };
+        if seen.contains(&layer) {
+            continue;
+        }
+        seen.push(layer);
+        // A clipped, masked or rotated layer paints less than its box, so
+        // its box says nothing about the share it hides.
+        if masked_or_clipped(dom, layer) || !moves_only(&dom.style(layer, "transform")) {
+            continue;
+        }
+        let r = dom.rect(layer);
+        if !r.all_finite() {
+            continue;
+        }
+        let w = js::math_min(r.right, text.right) - js::math_max(r.left, text.left);
+        let h = js::math_min(r.bottom, text.bottom) - js::math_max(r.top, text.top);
+        if w > 0.0 && h > 0.0 && w * h >= COVERED_TEXT_MIN_SHARE * area {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a computed `transform` leaves the box's shape alone: `none`, or
+/// a matrix that only translates. Anything else, or an unrecorded value,
+/// may not.
+fn moves_only(transform: &str) -> bool {
+    let t = js::trim(transform);
+    if t == "none" {
+        return true;
+    }
+    let Some(inner) = t.strip_prefix("matrix(").and_then(|r| r.strip_suffix(')')) else {
+        return false;
+    };
+    let v: Vec<f64> = inner.split(',').map(|n| js::parse_float(js::trim(n))).collect();
+    v.len() == 6 && v[0] == 1.0 && v[1] == 0.0 && v[2] == 0.0 && v[3] == 1.0
+}
+
 fn at_point(
     dom: &dyn Dom,
     el: ElId,
@@ -403,6 +560,7 @@ fn at_point(
     y: f64,
     host: Option<ElId>,
     resolved: Option<Rgba>,
+    stays: bool,
 ) -> AtPoint {
     let stack = dom.elements_from_point(x, y);
     if stack.is_empty() {
@@ -412,13 +570,8 @@ fn at_point(
     let Some(first) = stack.iter().position(|&n| in_text(n)) else {
         return AtPoint::Silent;
     };
-    for &node in &stack[..first] {
-        if dom.contains(node, el) {
-            continue;
-        }
-        if covers(dom, node, x, y) {
-            return AtPoint::Covered;
-        }
+    if cover_above(dom, el, &stack[..first], x, y, stays).is_some() {
+        return AtPoint::Covered;
     }
     // The element paints its own surface: nothing under it is read.
     if host == Some(el) {
@@ -502,6 +655,19 @@ pub fn layers_at_text(
     host: Option<ElId>,
     resolved: Option<Rgba>,
 ) -> TextLayers {
+    layers(dom, el, host, resolved, false)
+}
+
+/// Whether the stacks show `el`'s text covered ([`TextLayers::Covered`] of
+/// [`layers_at_text`]) by layers that stay over it when the page scrolls
+/// ([`stays_over_the_text`]): the test the size, leading and measure rules
+/// read, which a visitor's scroll would otherwise answer. A run below the
+/// fold covered by a later card is read as [`layers_at_text`] reads it.
+pub fn covered_for_good(dom: &dyn Dom, el: ElId) -> bool {
+    layers(dom, el, None, None, true) == TextLayers::Covered
+}
+
+fn layers(dom: &dyn Dom, el: ElId, host: Option<ElId>, resolved: Option<Rgba>, stays: bool) -> TextLayers {
     let (vw, vh) = occlusion_viewport(dom);
     let Some(rect) = occlusion_probe_rect(dom, el, &dom.rect(el)) else {
         return TextLayers::Undecided;
@@ -517,16 +683,22 @@ pub fn layers_at_text(
     }
     let answers: Vec<AtPoint> = points
         .iter()
-        .map(|&(x, y)| at_point(dom, el, x, y, host, resolved))
+        .map(|&(x, y)| at_point(dom, el, x, y, host, resolved, stays))
         .collect();
     if answers.contains(&AtPoint::Unanswered) {
         return TextLayers::Undecided;
     }
-    let deciding: Vec<AtPoint> = answers.into_iter().filter(|a| *a != AtPoint::Silent).collect();
+    let deciding: Vec<AtPoint> = answers.iter().copied().filter(|a| *a != AtPoint::Silent).collect();
     if deciding.is_empty() || deciding.len() * 2 < points.len() {
         return TextLayers::Undecided;
     }
-    if deciding.iter().all(|a| *a == AtPoint::Covered) {
+    // The grid probes the element's box, which can run past its text (a
+    // paragraph wider than the card it sits in) or straddle a cover's edge
+    // by a row: a layer that covers the text at one deciding point and
+    // holds most of the text's own box covers it.
+    if deciding.iter().all(|a| *a == AtPoint::Covered)
+        || (deciding.contains(&AtPoint::Covered) && covering_layer_holds_text(dom, el, &points, &answers, stays))
+    {
         TextLayers::Covered
     } else if deciding.iter().all(|a| matches!(a, AtPoint::Covered | AtPoint::Unread)) {
         TextLayers::UnreadSurface

@@ -733,7 +733,7 @@ fn containing_block(dom: &dyn Dom, host: ElId) -> Option<Rect> {
 /// inside the box but may not fill it). `None` where the capture does not
 /// place it (a fixed pseudo, a size or offsets it did not resolve to pixels,
 /// a 3D transform).
-fn pseudo_box(dom: &dyn Dom, node: ElId, which: &str) -> Option<(Rect, bool)> {
+pub(crate) fn pseudo_box(dom: &dyn Dom, node: ElId, which: &str) -> Option<(Rect, bool)> {
     let get = |prop: &str| dom.pseudo_style(node, which, prop).unwrap_or_default();
     if js::trim(&get("position")) != "absolute" {
         return None;

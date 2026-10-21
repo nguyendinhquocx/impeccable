@@ -622,6 +622,152 @@ pub fn strip_js_comments(content: &str, jsx: bool) -> String {
     output
 }
 
+/// A markup-only view using the comment scanner's literal and JSX parsers.
+/// Code literals are blanked; JSX attributes/text and template expressions
+/// containing real elements remain visible. Other rules keep their original view.
+fn mask_js_literals(content: &str, jsx: bool) -> String {
+    struct Mask<'a> {
+        chars: &'a [char],
+        hidden: Vec<bool>,
+        jsx: bool,
+    }
+    impl Mask<'_> {
+        fn hide(&mut self, start: usize, end: usize) {
+            self.hidden[start..end].fill(true);
+        }
+        fn template(&mut self, start: usize) -> usize {
+            let mut p = start + 1;
+            let mut text = start;
+            while p < self.chars.len() {
+                match self.chars[p] {
+                    '\\' => p = (p + 2).min(self.chars.len()),
+                    '`' => {
+                        self.hide(text, p + 1);
+                        return p + 1;
+                    }
+                    '$' if self.chars.get(p + 1) == Some(&'{') => {
+                        self.hide(text, p + 2);
+                        p = self.code(p + 2, true);
+                        text = p;
+                    }
+                    _ => p += 1,
+                }
+            }
+            self.hide(text, p);
+            p
+        }
+        fn element(&mut self, start: usize, tag: ParsedJsxTag) -> usize {
+            let mut p = start + 1;
+            // Literal attributes belong to markup. Expressions can contain
+            // code strings, regexes, or nested JSX and need the code scanner.
+            while p < tag.end {
+                match self.chars[p] {
+                    '\'' | '"' => p = find_quoted_string_end(self.chars, p, self.chars[p])
+                        .map(|end| end + 1).unwrap_or(tag.end),
+                    '{' => p = self.code(p + 1, true),
+                    _ => p += 1,
+                }
+            }
+            p = tag.end + 1;
+            if tag.self_closing || tag.closing { return p; }
+            while p < self.chars.len() {
+                if self.chars[p] == '<' {
+                    if let Some(child) = parse_jsx_tag(self.chars, p) {
+                        if child.closing && child.name == tag.name { return child.end + 1; }
+                        p = self.element(p, child);
+                        continue;
+                    }
+                } else if self.chars[p] == '{' {
+                    p = self.code(p + 1, true);
+                    continue;
+                }
+                p += 1;
+            }
+            p
+        }
+        fn code(&mut self, start: usize, expression: bool) -> usize {
+            let mut p = start;
+            let mut sig = Significant::default();
+            let mut braces = Vec::new();
+            let mut parens = Vec::new();
+            let mut last_brace = "";
+            while p < self.chars.len() {
+                let ch = self.chars[p];
+                let next = self.chars.get(p + 1).copied();
+                if ch == '/' && matches!(next, Some('/') | Some('*')) {
+                    let end = if next == Some('/') {
+                        self.chars[p..].iter().position(|c| *c == '\n')
+                            .map(|end| p + end).unwrap_or(self.chars.len())
+                    } else {
+                        find_sub(self.chars, p + 2, &['*', '/'])
+                            .map(|end| end + 2).unwrap_or(self.chars.len())
+                    };
+                    self.hide(p, end);
+                    p = end;
+                    continue;
+                }
+                if matches!(ch, '\'' | '"') {
+                    let end = find_quoted_string_end(self.chars, p, ch)
+                        .map(|end| end + 1).unwrap_or(self.chars.len());
+                    self.hide(p, end);
+                    p = end;
+                    sig.record(')');
+                    continue;
+                }
+                if ch == '`' {
+                    p = self.template(p);
+                    sig.record(')');
+                    continue;
+                }
+                if ch == '/' && sig.regex_can_start(last_brace) {
+                    if let Some(end) = find_regex_literal_end(self.chars, p) {
+                        self.hide(p, end + 1);
+                        p = end + 1;
+                        sig.record(')');
+                        continue;
+                    }
+                }
+                if self.jsx && ch == '<' && sig.regex_can_start(last_brace) {
+                    if let Some(tag) = parse_jsx_tag(self.chars, p) {
+                        p = self.element(p, tag);
+                        sig.record(')');
+                        continue;
+                    }
+                }
+                if ch == '{' {
+                    braces.push(sig.brace_kind(false, true));
+                } else if ch == '}' {
+                    if expression && braces.is_empty() { return p + 1; }
+                    last_brace = braces.pop().unwrap_or("");
+                } else if ch == '(' {
+                    parens.push(matches!(sig.current_word.as_str(), "if" | "while" | "for" | "with" | "switch" | "catch"));
+                } else if ch == ')' && parens.pop() == Some(true) {
+                    // A control condition is followed by a statement, where
+                    // `/.../` is a regex, unlike division after a function call.
+                    sig.record(';');
+                    p += 1;
+                    continue;
+                }
+                sig.record(ch);
+                p += 1;
+            }
+            p
+        }
+    }
+    let chars: Vec<char> = content.chars().collect();
+    let mut mask = Mask { chars: &chars, hidden: vec![false; chars.len()], jsx };
+    mask.code(0, false);
+    let mut out = String::with_capacity(content.len());
+    for (ch, hidden) in chars.iter().zip(mask.hidden) {
+        if hidden && !matches!(ch, '\n' | '\r') {
+            out.extend(std::iter::repeat(' ').take(ch.len_utf8()));
+        } else {
+            out.push(*ch);
+        }
+    }
+    out
+}
+
 re!(CSS_COMMENT_RE, format!("/\\*{ANY}*?\\*/"));
 
 /// JS `stripCssComments`: blank comment bodies (each UTF-16 unit that is not
@@ -1745,6 +1891,12 @@ pub fn run_regex_matchers(
     sheet: Option<&FileSheet>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
+    let ext = ext_from_file_path(file_path);
+    // The image rule reads tags that may span lines, so it walks one joined
+    // text from each line's start, with JS/TS literals masked. Only it uses
+    // this view: other rules intentionally inspect strings (copy, CSS-in-JS,
+    // design tokens).
+    let image_source = once_cell::unsync::OnceCell::new();
     // The joined text the side-tab scope reader walks, built once per file,
     // and the stylesheet index over it, built on the first accent it gates.
     let source = once_cell::unsync::OnceCell::new();
@@ -1753,8 +1905,65 @@ pub fn run_regex_matchers(
     for matcher in REGEX_MATCHERS.iter() {
         let run = || {
             let mut matches = Vec::new();
+            let image = matcher.id == "broken-image";
+            if image
+                && (phase != "source"
+                    || !lines.iter().any(|l| {
+                        l.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"<img"))
+                    }))
+            {
+                return matches;
+            }
+            let mut image_cursor = 0;
             for (i, line) in lines.iter().enumerate() {
-                let ctxs: Vec<MatchCtx> = (matcher.find_all)(line);
+                let (line, ctxs): (&str, Vec<MatchCtx>) = if image {
+                    let (text, starts, markup) = image_source.get_or_init(|| {
+                        let joined = lines.join("\n");
+                        // Masking keeps every byte offset and newline.
+                        let text = if JS_SOURCE_EXTS.contains(&ext.as_str()) {
+                            mask_js_literals(&joined, matches!(ext.as_str(), ".js" | ".jsx" | ".tsx"))
+                        } else {
+                            joined
+                        };
+                        let mut starts = Vec::with_capacity(lines.len());
+                        let mut at = 0;
+                        for (i, l) in text.split('\n').enumerate() {
+                            starts.push(at);
+                            at += l.len() + usize::from(i + 1 < lines.len());
+                        }
+                        let jsx = matches!(ext.as_str(), ".js" | ".jsx" | ".tsx");
+                        let template = matches!(ext.as_str(), ".svelte" | ".vue" | ".astro");
+                        let css = CSS_LIKE_EXTS.contains(&ext.as_str());
+                        let markup = crate::regex_matchers::scan_markup_context(
+                            &text,
+                            crate::regex_matchers::MarkupScanOptions {
+                                jsx,
+                                expressions: jsx || template,
+                                nested_tags: jsx || ext == ".astro",
+                                raw_text: !JS_SOURCE_EXTS.contains(&ext.as_str()) && !css,
+                                markup: !css,
+                            },
+                        );
+                        (text, starts, markup)
+                    });
+                    let line_start = starts[i];
+                    let line_end = text[line_start..]
+                        .find('\n')
+                        .map(|end| line_start + end)
+                        .unwrap_or(text.len());
+                    (
+                        &text[line_start..line_end],
+                        crate::regex_matchers::find_broken_images_in_line(
+                            text,
+                            markup,
+                            &mut image_cursor,
+                            line_start,
+                            line_end,
+                        ),
+                    )
+                } else {
+                    (line, (matcher.find_all)(line))
+                };
                 if ctxs.is_empty() {
                     continue;
                 }
@@ -1782,6 +1991,8 @@ pub fn run_regex_matchers(
                     // declarations around the match read square, and in
                     // stylesheet text the stylesheet agrees.
                     if (matcher.test)(&m, &scope)
+                        && (matcher.id != "broken-image"
+                            || crate::regex_matchers::image_source_is_missing(m.whole(), &ext))
                         && (matcher.id != "side-tab" || is_stripe_child_match(&m) || {
                             let source = source.get_or_init(|| SourceText::new(lines));
                             side_tab_rounded_in_scope(&m, source, i, sass)

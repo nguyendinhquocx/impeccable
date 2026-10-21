@@ -709,9 +709,15 @@ pub fn check_quality(q: &QualityInput<'_, '_>) -> Vec<RuleHit> {
                 sv(style, "webkitHyphens")
             }
         };
-        let narrow = declared_measure_px(el, font_size)
-            .is_some_and(|w| chars_per_line(w, font_size) <= JUSTIFY_NARROW_CHARS_PER_LINE);
-        if hyphens != "auto" && narrow && !justifies_without_word_spaces_text(&el.direct_text()) {
+        // Text short enough to fit one line of the measure renders on one
+        // line, and the one line of a justified block is set ragged: no word
+        // space is stretched (a short heading in a narrow column).
+        let direct = el.direct_text();
+        let narrow = declared_measure_px(el, font_size).is_some_and(|w| {
+            let per_line = chars_per_line(w, font_size);
+            per_line <= JUSTIFY_NARROW_CHARS_PER_LINE && utf16_len(js::trim(&direct)) as f64 > per_line
+        });
+        if hyphens != "auto" && narrow && !justifies_without_word_spaces_text(&direct) {
             findings.push(RuleHit::new(
                 "justified-text",
                 "text-align: justify without hyphens: auto".to_string(),

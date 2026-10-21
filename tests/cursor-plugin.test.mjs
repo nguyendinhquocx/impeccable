@@ -45,7 +45,8 @@ describe('Cursor native plugin', () => {
       const text = fs.readFileSync(path.join(output, rel), 'utf8');
       assert.doesNotMatch(text, /\.cursor\/skills|fallback only/);
       assert.match(text, /"<skill-base-dir>\/scripts\/impeccable" context/);
-      assert.match(text, /"<skill-base-dir>\/scripts\/impeccable\.cmd" context/);
+      assert.match(text, /& "<skill-base-dir>\/scripts\/impeccable\.cmd" context/);
+      assert.doesNotMatch(text, /& "<skill-base-dir>\/scripts\/impeccable"/);
     }
     assert.match(fs.readFileSync(path.join(output, 'agents/impeccable-asset-producer.md'), 'utf8'), /supplied in the handoff/);
     assert.equal(fs.statSync(path.join(output, 'skills/impeccable/scripts/impeccable')).mode & 0o111, 0o111);

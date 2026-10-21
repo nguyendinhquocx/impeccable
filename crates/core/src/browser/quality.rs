@@ -490,6 +490,13 @@ fn direct_text_insets(dom: &dyn Dom, el: ElId, rect: &Rect, border: &[f64; 4]) -
         }
         _ => t,
     };
+    // Above and below, the glyphs are measured, not the font's content area:
+    // a Range rect runs the face's ascent plus descent, which leaves room
+    // over the capitals and under the descenders that a reader sees as air
+    // (ktk.de's 37px cookie title bar holds 19.2px text 4px off by its
+    // content area and about 8px off by its glyphs). The chip path measures
+    // the same band.
+    let t = glyph_band(dom, el, &t);
     // Text that overruns its own box still reads as cramped: the clamped rect
     // lands on the border, an inset of zero.
     let t = clamp_to(&t, rect)?;
@@ -1363,7 +1370,8 @@ const NORMAL_LINE_HEIGHT_EM: f64 = 1.2;
 /// How much of its content box a block's widest line fills before
 /// `body-text-viewport-edge` takes the box's edges as the text's. A wrapped
 /// paragraph's ragged right is under a word short of its column, and the box
-/// is what an author sets.
+/// is what an author sets, unless the glyphs of a block that is not
+/// justified keep the gutter on both sides.
 const TEXT_FILLS_MEASURE: f64 = 0.9;
 
 /// The controls whose labels wide tracking may set: links and buttons.
@@ -1630,8 +1638,21 @@ fn body_text_edge_span(dom: &dyn Dom, q: &QualityInput) -> Option<(f64, f64)> {
                 .line_height_px
                 .filter(|lh| *lh > 0.0)
                 .unwrap_or(q.font_size * NORMAL_LINE_HEIGHT_EM);
+            // A ragged or centred block whose glyphs keep a full gutter on
+            // both sides keeps it, wherever its box runs: its longest line is
+            // where the words stop (mblondel.org's navigation links end 17
+            // to 27px from the edge of a box that reaches it, charter.com's
+            // centred footer line 17px). The full gutter is the desktop
+            // floor, also on a phone: a ragged line a few pixels inside the
+            // phone floor is one word away from the box. Justified lines run
+            // to the box.
+            let floor = BODY_TEXT_GUTTER_PX;
+            let glyphs_keep_gutter = st("textAlign") != "justify"
+                && t.left >= floor
+                && t.right <= viewport_width - floor;
             if text_line_count(t.height, pitch, q.font_size) >= 2.0
                 && t.width >= (content_right - content_left) * TEXT_FILLS_MEASURE
+                && !glyphs_keep_gutter
             {
                 // Wrapped lines that fill the column reach its edges; how
                 // ragged the longest line happens to be is not the gutter.
@@ -2281,6 +2302,58 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
     // --- Justified text (without hyphens) ---
     // Only a narrow column stretches word spaces far enough to open rivers,
     // and only in a script that justifies on word spaces at all.
+    //
+    // Justification spreads the line boxes of a block, so the measure is
+    // the block's. An inline run (a link, `u` or `strong` inheriting
+    // `justify` from its paragraph) is measured by the block it sits in, and
+    // reports only when that block has no text of its own to report on: a
+    // 1,176px paragraph does not become a 200px column because one of its
+    // links is 200px wide. And a single line has no word spaces stretched
+    // (the last line of a justified block is set ragged), so the text must
+    // render on two lines or more, counted over the block's own text and its
+    // inline children's. A text rect the capture did not record keeps the
+    // text, as before.
+    // The block an inline run is measured by, as long as that block has no
+    // text of its own to report on.
+    let justify_block = || -> Option<ElId> {
+        let mut cur = dom.parent(el);
+        while let Some(p) = cur {
+            let display = dom.style(p, "display");
+            if display != "inline" && display != "contents" {
+                return if has_direct_text_longer_than(dom, p, 10) { None } else { Some(p) };
+            }
+            cur = dom.parent(p);
+        }
+        None
+    };
+    let justify_measure = || -> Option<f64> {
+        if st("display") != "inline" {
+            return Some(rect.width);
+        }
+        justify_block().map(|p| dom.rect(p).width)
+    };
+    // A block's lines are counted over all the text it sets in them, its
+    // inline children's included: a one-line lead-in followed by a long
+    // `<em>` is a block of several justified lines. An inline run is
+    // counted over its block's, so a one-line `strong` among its siblings
+    // (or one short word per span) is a justified line like the rest.
+    let line_extent = || {
+        if st("display") == "inline" {
+            match justify_block() {
+                Some(p) => phrasing_text_extent(dom, p).or_else(|| dom.direct_text_rect(el)),
+                None => dom.direct_text_rect(el),
+            }
+        } else {
+            phrasing_text_extent(dom, el).or_else(|| dom.direct_text_rect(el))
+        }
+    };
+    let renders_two_lines = || match line_extent() {
+        Some(t) => {
+            let own = q.line_height_px.unwrap_or(font_size * 1.2);
+            text_line_count(t.height, line_pitch_px(dom, el, own), font_size) >= 2.0
+        }
+        None => true,
+    };
     if has_direct_text && st("textAlign") == "justify" && rect.width > 0.0 && font_size > 0.0 {
         let hyphens = {
             let a = st("hyphens");
@@ -2291,7 +2364,9 @@ pub fn check_quality(dom: &dyn Dom, q: &QualityInput) -> Vec<RuleHit> {
             }
         };
         if hyphens != "auto"
-            && chars_per_line(rect.width, font_size) <= JUSTIFY_NARROW_CHARS_PER_LINE
+            && justify_measure()
+                .is_some_and(|w| w > 0.0 && chars_per_line(w, font_size) <= JUSTIFY_NARROW_CHARS_PER_LINE)
+            && renders_two_lines()
             && !justifies_without_word_spaces_text(&direct_text(dom, el))
         {
             findings.push(RuleHit::new(
@@ -3318,13 +3393,14 @@ mod tests {
                 ("paddingRight", "12px"),
             ],
         );
-        // The glyphs sit 2px under the top edge, as the padding says.
+        // The content area sits 2px under the top edge, as the padding says;
+        // the glyphs are measured, about 2.4px further in.
         d.set_text_rect(p, 52.0, 102.0, 200.0, 40.0);
         let hits = check_element_quality_dom(&d, p, &BrowserConfig::default());
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(
             hits[0].snippet,
-            "2px of space above and below the text (need ≥4.8px for 16px text)"
+            "4.4px of space above and below the text (need ≥4.8px for 16px text)"
         );
     }
 
@@ -3440,7 +3516,7 @@ mod tests {
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(
             hits[0].snippet,
-            "0.5px of space above and below the text (need ≥4.5px for 15px text)"
+            "2px of space above and below the text (need ≥4.5px for 15px text)"
         );
     }
 
@@ -3473,11 +3549,55 @@ mod tests {
         d.set_text_rect(btn, 32.0, 12.0, 160.0, 16.0);
         assert!(check_element_quality_dom(&d, btn, &BrowserConfig::default()).is_empty());
 
-        // Same declared padding, but the label fills the box.
-        d.set_text_rect(btn, 32.0, 1.0, 160.0, 38.0);
+        // Same declared padding, but two lines of the label fill the box:
+        // their content area starts 1px under the top edge, the capitals
+        // about 1.4px under that.
+        d.set_text_rect(btn, 32.0, 1.0, 160.0, 33.6);
         let hits = check_element_quality_dom(&d, btn, &BrowserConfig::default());
         assert_eq!(hits.len(), 1, "{hits:?}");
-        assert_eq!(hits[0].snippet, "1px of space above and below the text (need ≥4.2px for 14px text)");
+        assert_eq!(hits[0].snippet, "2.4px of space above and below the text (need ≥4.2px for 14px text)");
+    }
+
+    /// observations-1006 row 12, ktk.de's cookie title: 4px of padding holds
+    /// a 27px content area (Open Sans at 19.2px) in a 37px bar. The capitals
+    /// sit about 7.9px off the edges, which is air; the same bar with its
+    /// glyphs at the edge stays cramped.
+    #[test]
+    fn cramped_padding_measures_the_glyphs_not_the_content_area() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        d.set_style(body, "backgroundColor", "rgb(255, 255, 255)");
+        let bar = text_el(&mut d, body, "div", "Wir verwenden Cookies", "19.2px");
+        d.set_styles(
+            bar,
+            &[
+                ("lineHeight", "28.8px"),
+                ("backgroundColor", "rgb(253, 202, 47)"),
+                ("borderTopWidth", "0px"),
+                ("borderRightWidth", "0px"),
+                ("borderBottomWidth", "0px"),
+                ("borderLeftWidth", "0px"),
+                ("paddingTop", "4px"),
+                ("paddingBottom", "4px"),
+                ("paddingLeft", "4px"),
+                ("paddingRight", "4px"),
+            ],
+        );
+        d.set_rect(bar, 333.0, 43.0, 614.0, 36.8);
+        d.set_text_rect(bar, 484.4, 47.0, 311.3, 27.0);
+        let cramped = |d: &FakeDom| -> Vec<String> {
+            check_element_quality_dom(d, bar, &BrowserConfig::default())
+                .into_iter()
+                .filter(|h| h.id == "cramped-padding")
+                .map(|h| h.snippet)
+                .collect()
+        };
+        assert!(cramped(&d).is_empty(), "{:?}", cramped(&d));
+        // A face whose content area is no taller than its em: the glyphs
+        // are 4px off, and that is cramped.
+        d.set_text_rect(bar, 484.4, 47.0, 311.3, 19.2);
+        d.set_rect(bar, 333.0, 43.0, 614.0, 31.2);
+        assert_eq!(cramped(&d), vec!["4px of space above and below the text (need ≥5.8px for 19.2px text)"]);
     }
 
     /// `border: 1px solid transparent` (a focus-ring placeholder) draws no
@@ -4111,7 +4231,7 @@ mod tests {
         d.set_text_rect(mark, 40.0, 100.0, 600.0, 194.0);
         assert!(cramped(&d, mark).is_empty(), "{:?}", cramped(&d, mark));
         d.set_style(mark, "display", "inline-block");
-        assert_eq!(cramped(&d, mark), vec!["0px of space above and below the text (need ≥6.6px for 22px text)"]);
+        assert_eq!(cramped(&d, mark), vec!["5.3px of space above and below the text (need ≥6.6px for 22px text)"]);
     }
 
     /// A wrapper with a grey fill and the text at its right edge, inside a
@@ -5525,7 +5645,7 @@ mod tests {
         d.set_style(hl, "display", "inline-block");
         assert_eq!(
             snippets(&d, hl, "cramped-padding"),
-            vec!["0px of space above and below the text (need ≥4.2px for 14px text)"]
+            vec!["1.5px of space above and below the text (need ≥4.2px for 14px text)"]
         );
     }
 
@@ -5728,6 +5848,95 @@ mod tests {
     }
 
     #[test]
+    fn justified_text_measures_the_block_and_needs_two_lines() {
+        let latin = "word ".repeat(24);
+        // `block_text`: whether the block holds text of its own. `inline`:
+        // the run's display. `lines`: the run's rendered line count.
+        let run = |block_width: f64, block_text: bool, inline: bool, lines: f64| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let p = d.add(Some(body), "p");
+            if block_text {
+                d.add_text(p, "Block text long enough to count as its own. ");
+            }
+            d.set_styles(p, &[("display", "block"), ("fontSize", "16px"), ("lineHeight", "26px"), ("textAlign", "justify")]);
+            d.set_rect(p, 40.0, 100.0, block_width, 26.0 * lines);
+            let a = text_el(&mut d, p, "a", &latin, "16px");
+            d.set_styles(
+                a,
+                &[
+                    ("display", if inline { "inline" } else { "block" }),
+                    ("lineHeight", "26px"),
+                    ("textAlign", "justify"),
+                    ("hyphens", "manual"),
+                ],
+            );
+            d.set_rect(a, 40.0, 100.0, 200.0, 26.0 * lines);
+            d.set_text_rect(a, 40.0, 100.0, 200.0, 26.0 * (lines - 1.0) + 19.0);
+            let hits = check_element_quality_dom(&d, a, &BrowserConfig::default());
+            hits.iter().any(|h| h.id == "justified-text")
+        };
+        // A link 200px wide in a 1,176px paragraph: the paragraph's measure.
+        assert!(!run(1176.0, true, true, 2.0));
+        assert!(!run(1176.0, false, true, 2.0));
+        // In a narrow paragraph that has text of its own, the paragraph
+        // reports; the link does not report again.
+        assert!(!run(300.0, true, true, 3.0));
+        // A narrow paragraph whose text is all in the inline run: the run
+        // reports, measured by the paragraph.
+        assert!(run(300.0, false, true, 3.0));
+        // One rendered line stretches no word space.
+        assert!(!run(300.0, false, true, 1.0));
+        assert!(!run(300.0, false, false, 1.0));
+        // A block of its own, narrow and wrapping, reports as before.
+        assert!(run(1176.0, false, false, 3.0));
+
+        // A narrow paragraph whose own lead-in sets one line and whose
+        // `<em>` sets the rest: the paragraph's lines are counted over both.
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let p = d.add(Some(body), "p");
+        d.add_text(p, "See the note below here: ");
+        d.set_styles(p, &[("display", "block"), ("fontSize", "16px"), ("lineHeight", "24px"), ("textAlign", "justify"), ("hyphens", "manual")]);
+        d.set_rect(p, 40.0, 100.0, 240.0, 144.0);
+        d.set_text_rect(p, 40.0, 102.0, 180.0, 19.0);
+        let em = text_el(&mut d, p, "em", &latin, "16px");
+        d.set_styles(em, &[("display", "inline"), ("lineHeight", "24px"), ("textAlign", "justify"), ("hyphens", "manual")]);
+        d.set_rect(em, 40.0, 102.0, 240.0, 139.0);
+        d.set_text_rect(em, 40.0, 102.0, 240.0, 139.0);
+        let flags = |d: &FakeDom, el: ElId| {
+            check_element_quality_dom(d, el, &BrowserConfig::default()).iter().any(|h| h.id == "justified-text")
+        };
+        assert!(flags(&d, p), "the paragraph's six lines");
+        assert!(!flags(&d, em), "reported once, on the paragraph");
+
+        // A narrow paragraph with no text of its own, split into short
+        // inline runs: each run sets one line on its own, the paragraph sets
+        // several, and the runs report as the paragraph's lines.
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let p = d.add(Some(body), "p");
+        d.set_styles(p, &[("display", "block"), ("fontSize", "16px"), ("lineHeight", "24px"), ("textAlign", "justify"), ("hyphens", "manual")]);
+        d.set_rect(p, 40.0, 100.0, 240.0, 72.0);
+        let mut spans = Vec::new();
+        for (i, word) in ["considerations", "approximately", "unfortunately"].iter().enumerate() {
+            let span = text_el(&mut d, p, "span", word, "16px");
+            d.set_styles(span, &[("display", "inline"), ("lineHeight", "24px"), ("textAlign", "justify"), ("hyphens", "manual")]);
+            let y = 100.0 + 24.0 * i as f64;
+            d.set_rect(span, 40.0, y, 120.0, 24.0);
+            d.set_text_rect(span, 40.0, y + 2.0, 120.0, 19.0);
+            spans.push(span);
+        }
+        assert!(flags(&d, spans[0]), "one short word per span still sits in a three-line paragraph");
+        // The same words on one line are one line of a justified block.
+        for span in &spans {
+            d.set_rect(*span, 40.0, 100.0, 120.0, 24.0);
+            d.set_text_rect(*span, 40.0, 102.0, 120.0, 19.0);
+        }
+        assert!(!flags(&d, spans[0]));
+    }
+
+    #[test]
     fn tiny_and_undersized_text() {
         let mut d = FakeDom::new();
         let (_h, body) = d.with_page();
@@ -5863,6 +6072,71 @@ mod tests {
     /// 215445, paseo.sh 217250): a line its own box truncates ends at that
     /// box, and text on a running marquee track stands where the capture
     /// caught it.
+    /// observations-1006 row 11. A ragged or centred block whose box runs
+    /// to the edge while its glyphs keep 16px or more is measured on its
+    /// glyphs; justified lines run to the box. Text a component's
+    /// shadow-tree scroller cuts is not measured against the page's gutter.
+    #[test]
+    fn viewport_edge_reads_ragged_glyphs_and_shadow_scrollers() {
+        let copy = "Research interests: differentiable programming, optimal transport, structured prediction.";
+        let len = utf16_len(copy);
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        d.inner_width = 390.0;
+        let p = text_el(&mut d, body, "p", copy, "16px");
+        d.set_style(p, "lineHeight", "24px");
+        d.set_rect(p, 20.0, 100.0, 370.0, 72.0);
+        // Three ragged lines filling 92% of the box, ending 27px short of
+        // the window.
+        d.set_text_rect(p, 20.0, 102.0, 343.0, 68.0);
+        assert!(snippets(&d, p, "body-text-viewport-edge").is_empty(), "ragged, 27px in");
+        // Justified lines run to the box.
+        d.set_style(p, "textAlign", "justify");
+        assert_eq!(
+            snippets(&d, p, "body-text-viewport-edge"),
+            vec![format!("<p> with {len}-char body bleeds to viewport edge (right 0px)")]
+        );
+        // Ragged glyphs 13px in keep the phone floor but not a full gutter:
+        // the box stands for them, as before.
+        d.set_style(p, "textAlign", "start");
+        d.set_text_rect(p, 20.0, 102.0, 357.0, 68.0);
+        assert_eq!(
+            snippets(&d, p, "body-text-viewport-edge"),
+            vec![format!("<p> with {len}-char body bleeds to viewport edge (right 0px)")]
+        );
+
+        // ibm.com: cards slotted into a shadow-tree scroller; the third runs
+        // past the window and is cut off on the page-level form unless the
+        // flat tree is walked.
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        d.inner_width = 390.0;
+        let host = d.add(Some(body), "c4d-row");
+        d.set_styles(host, &[("display", "grid")]);
+        d.set_rect(host, 0.0, 2221.0, 390.0, 451.0);
+        let scroller = d.add_shadow_child(host, "div");
+        d.set_styles(scroller, &[("display", "flex"), ("overflowX", "scroll"), ("overflow", "scroll hidden")]);
+        d.set_rect(scroller, 0.0, 2221.0, 390.0, 451.0);
+        d.el_mut(scroller).client_width = 390.0;
+        d.el_mut(scroller).scroll_width = 842.0;
+        let slot = d.add(Some(scroller), "slot");
+        d.set_style(slot, "display", "contents");
+        let mut last = None;
+        for x in [16.0, 286.0, 555.0] {
+            let card = d.add(Some(host), "div");
+            d.set_rect(card, x, 2225.0, 254.0, 431.0);
+            d.set_assigned_slot(card, slot);
+            let t = text_el(&mut d, card, "p", copy, "16px");
+            d.set_style(t, "lineHeight", "24px");
+            d.set_rect(t, x, 2400.0, 254.0, 96.0);
+            d.set_text_rect(t, x, 2402.0, 250.0, 92.0);
+            last = Some(t);
+        }
+        let last = last.unwrap();
+        assert!(snippets(&d, last, "body-text-viewport-edge").is_empty());
+        assert!(check_page_overflow_dom(&d).is_empty(), "{:?}", check_page_overflow_dom(&d));
+    }
+
     #[test]
     fn viewport_edge_reads_a_truncated_line_at_its_box_and_skips_running_tracks() {
         let copy = "A long single line that the box truncates with an ellipsis well before the edge";

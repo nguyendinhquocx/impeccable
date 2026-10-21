@@ -127,6 +127,26 @@ function Thumb({ url }: { url?: string }) {
 
     // Flag surface and errors
     { id: 'detect-help', verb: 'detect', args: ['--help'] },
+    { id: 'detect-github-json', verb: 'detect', args: ['--github', '--json'] },
+    { id: 'detect-github-list-rules', verb: 'detect', args: ['--list-rules', '--github'] },
+    {
+      id: 'detect-github', verb: 'detect',
+      setup: (ws) => fs.writeFileSync(
+        path.join(ws, 'card.html'),
+        '<div style="border-left: 4px solid #ff0000; border-radius: 10px">x</div>\n',
+      ),
+      args: ['--no-config', '--github', 'card.html'],
+    },
+    {
+      id: 'detect-github-clean', verb: 'detect',
+      setup: (ws) => fs.writeFileSync(path.join(ws, 'ok.css'), 'body { margin: 0; }\n'),
+      args: ['--no-config', '--github', 'ok.css'],
+    },
+    { id: 'detect-list-rules', verb: 'detect', args: ['--list-rules'] },
+    { id: 'detect-list-rules-json', verb: 'detect', args: ['--list-rules', '--json'] },
+    { id: 'detect-list-rules-quiet', verb: 'detect', args: ['--list-rules', '--quiet'] },
+    { id: 'detect-list-rules-with-target', verb: 'detect', args: ['--list-rules', 'src/'] },
+    { id: 'detect-list-rules-with-cdp', verb: 'detect', args: ['--list-rules', '--cdp', '9222'] },
     { id: 'detect-no-args', verb: 'detect', args: [] },
     { id: 'detect-missing-file', verb: 'detect', args: ['--no-config', 'does-not-exist.html'] },
     { id: 'detect-missing-file-json', verb: 'detect', args: ['--no-config', '--json', 'does-not-exist.html'] },

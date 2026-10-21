@@ -148,6 +148,8 @@ fn nested_cards_read_the_computed_box() {
             "#flag-illustration-inner",
             "#flag-dialog-nested-inner",
             "#flag-mono-button-inner",
+            // observations-1006 row 19: two links are not a strip.
+            "#flag-two-links-inner",
         ],
         &[
             "#pass-band-inner",
@@ -168,6 +170,10 @@ fn nested_cards_read_the_computed_box() {
             "#pass-player-inner",
             "#pass-dialog-inner",
             "#flag-dialog-group",
+            // observations-1006 row 19: a row of three links, and a tab
+            // spanning a clipped column in the card's corner.
+            "#pass-link-strip-inner",
+            "#pass-corner-tab-inner",
         ],
     );
 }
