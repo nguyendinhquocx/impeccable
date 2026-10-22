@@ -6,7 +6,8 @@
 //! against the grey fill under the photo and handed to the pixel pass. Where
 //! the pixels read it, their verdict replaces the element pass's (the copy
 //! passes); where they refuse to (a backdrop filter over the photo), the
-//! element pass's verdict stands as advisory, its text unchanged.
+//! element pass's verdict stands as advisory, and says the copy over the
+//! photo was not measured.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -87,6 +88,8 @@ fn verdicts_the_pixels_could_not_read_are_advisory() {
         .find(|f| f.antipattern == "low-contrast")
         .expect("finding")
         .snippet;
-    assert!(snippet.contains("text #ffffff on #979797"), "{snippet}");
+    // The ratio against the grey fill under the photo measured nothing a
+    // reader sees, so it is not printed.
+    assert_eq!(snippet, "text #ffffff over an image, not measured (need 4.5:1)");
 }
 

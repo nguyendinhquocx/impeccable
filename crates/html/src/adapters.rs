@@ -1473,6 +1473,13 @@ pub fn check_element_glow(
 
 /// JS: detect-html.mjs#checkElementBrokenImage(el)
 pub fn check_element_broken_image(el: &StaticElement<'_>) -> Vec<RuleHit> {
+    // `srcset` is a source too (HTML Standard: an img needs `src` or `srcset`).
+    if el.get_attribute("srcset").is_some_and(|set| {
+        let set = js::trim(set);
+        !set.is_empty() && set != "#"
+    }) {
+        return Vec::new();
+    }
     let Some(src) = el.get_attribute("src") else {
         return vec![RuleHit::new(
             "broken-image",
@@ -1842,4 +1849,24 @@ pub fn check_element_clipped_overflow(el: &StaticElement<'_>, style: &StyleValue
         )];
     }
     Vec::new()
+}
+
+/// Only resolved, visible box shadows participate; reference assets and class
+/// names do not establish whether a neobrutalist treatment is intentional.
+pub fn check_element_hard_offset_shadow(el: &StaticElement<'_>) -> Vec<RuleHit> {
+    let box_shadow = sv(el.style(), "boxShadow");
+    if !impeccable_core::checks::hard_offset_shadow::has_shadow(box_shadow) {
+        return Vec::new();
+    }
+    let mut current = Some(*el);
+    while let Some(node) = current {
+        if node.get_attribute("hidden").is_some() || sv(node.style(), "display") == "none" {
+            return Vec::new();
+        }
+        current = node.parent_element();
+    }
+    if matches!(sv(el.style(), "visibility"), "hidden" | "collapse") { return Vec::new(); }
+    impeccable_core::checks::hard_offset_shadow::check_hard_offset_shadow(
+        box_shadow, sv(el.style(), "color"), static_effective_opacity(el),
+    )
 }

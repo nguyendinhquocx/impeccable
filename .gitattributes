@@ -1,3 +1,11 @@
+# cmd.exe parses batch files by byte offset, and an LF-only `.cmd` breaks
+# `call :label` and `goto` (#1098). Every checkout and `git archive` writes
+# the source launcher and its tracked provider copies with CRLF; the build
+# also emits batch files with CRLF whatever the working tree holds
+# (scripts/lib/utils.js), and `bun run build` fails if any emitted copy has a
+# bare LF.
+*.cmd text eol=crlf
+
 # The oracle replays goldens recorded from a POSIX checkout, and a finding's
 # snippet carries the fixture's own bytes, so these files have to arrive with
 # LF on every platform. `-text` disables end-of-line conversion outright, which

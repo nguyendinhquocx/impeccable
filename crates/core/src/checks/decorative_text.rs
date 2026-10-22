@@ -382,10 +382,47 @@ const MOCKUP_COPY_PARTS: &[&str] = &[
     "licence",
 ];
 
+/// The words a class names page furniture by: a label, a chip, navigation.
+const FURNITURE_WORDS: &[&str] = &[
+    "meta", "label", "badge", "chip", "pill", "tag", "kicker", "eyebrow", "breadcrumb",
+    "timestamp", "category", "caption", "nav",
+];
+
+/// Parts that start with a furniture word and name something else.
+const FURNITURE_FALSE_FRIENDS: &[&str] = &["pillar", "pillars", "navy"];
+
+/// Whether a `class` attribute names page furniture. Each token is split
+/// into its parts ([`token_parts`]: hyphen, underscore, camelCase), and a
+/// part names furniture when it starts with a furniture word (`tagline`,
+/// `taglist`, `navbar`, `navigation`) or ends with one or its plural
+/// (`hottags`, `subnav`, `muibreadcrumbs`, `utilitynavigation`). A word
+/// buried inside a part is not read: portzero.net's `px-stage-compact` was
+/// a tag, and so were `owl-stage`, `instagram`, `vantagens`, `percentage`
+/// and `unavailable` (observations-1006 row 19).
+pub fn class_names_furniture(class: &str) -> bool {
+    class.split_ascii_whitespace().any(|token| {
+        token_parts(token).iter().any(|part| {
+            // Tailwind arbitrary values keep their brackets in a part
+            // (`bg-[var(--navy)]` gives `navy)]`): read letters and digits.
+            let part: String = part.chars().filter(|c| c.is_alphanumeric()).collect();
+            if part.is_empty() || FURNITURE_FALSE_FRIENDS.contains(&part.as_str()) {
+                return false;
+            }
+            FURNITURE_WORDS.iter().any(|w| {
+                part.starts_with(w)
+                    || part.ends_with(w)
+                    || part.strip_suffix('s').is_some_and(|stem| stem.ends_with(w))
+                    || (*w == "nav" && (part.ends_with("navi") || part.ends_with("navigation")))
+                    || (*w == "category" && part.ends_with("categories"))
+            })
+        })
+    })
+}
+
 /// A class or id token's parts: split on `-`, `_`, `:`, `/` and `.`, and
 /// where a lower-case letter meets a capital (`heroIllustration`), lower
 /// cased.
-pub(crate) fn token_parts(token: &str) -> Vec<String> {
+pub fn token_parts(token: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut cur = String::new();
     let mut prev_lower = false;
@@ -690,6 +727,29 @@ mod tests {
         assert!(!is_sentence_copy("Draft saved"));
         assert!(!is_sentence_copy("$ npm run build --watch"));
         assert!(is_sentence_copy("Your export is ready to download."));
+    }
+
+    /// observations-1006 row 19: furniture classes are read by part.
+    #[test]
+    fn furniture_classes_are_read_by_part() {
+        for class in [
+            "meta", "post-meta", "label", "field-label", "tag", "taglist", "tagline",
+            "post__tags", "hottags", "tagChip", "nav", "site-nav", "subnav", "navbar",
+            "mainNavigation", "block-utilitynavigation", "corenavi", "muiBreadcrumbs",
+            "breadcrumb", "badge", "chip", "chips", "pill", "pills", "kicker", "eyebrow",
+            "timestamp", "category", "product-categories", "caption", "figcaption",
+            "card x-badge",
+        ] {
+            assert!(class_names_furniture(class), "{class}");
+        }
+        for class in [
+            "px-stage-compact", "owl-stage", "instagram", "icon-instagram",
+            "footer__vantagens", "subscription-block__avantages", "icon-percentage",
+            "cmp-unavailable", "hotsite-patagonia", "pillars", "text-navy", "bg-[var(--navy)]",
+            "", "hero",
+        ] {
+            assert!(!class_names_furniture(class), "{class}");
+        }
     }
 
     #[test]

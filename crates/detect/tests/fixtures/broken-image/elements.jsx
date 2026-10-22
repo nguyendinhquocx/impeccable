@@ -30,3 +30,4 @@ export const MultiMissing = () => (
     alt=""
   />
 );
+export const Srcset = () => <img srcSet="/a.png 1x" alt="" />;

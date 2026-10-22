@@ -1764,7 +1764,7 @@ pub(crate) fn image_source_is_missing(tag: &str, ext: &str) -> bool {
         if b[p] == b'{' {
             let Some(close) = matching_close(b, p) else { return false; };
             let expression = tag[p + 1..close].trim();
-            if shorthand && (expression == "src" || expression.starts_with("...")) {
+            if shorthand && (matches!(expression, "src" | "srcset") || expression.starts_with("...")) {
                 return false;
             }
             // JSX spreads also leave the source unknown.
@@ -1816,15 +1816,16 @@ pub(crate) fn image_source_is_missing(tag: &str, ext: &str) -> bool {
     true
 }
 
-/// `src`, a binding of it (`:src`, `v-bind:src`, Svelte `bind:src`, Vue
-/// modifiers), or an alias such as lazy loading's `data-src`, all of which
-/// the original `\bsrc\s*=` matcher accepted.
+/// `src` or `srcset` (an `<img>` needs either), a binding of one (`:src`,
+/// `v-bind:src`, Svelte `bind:src`, Vue modifiers), or an alias such as lazy
+/// loading's `data-src`, which the original `\bsrc\s*=` matcher accepted.
 fn names_image_source(name: &str) -> bool {
+    let is_source = |n: &str| n.eq_ignore_ascii_case("src") || n.eq_ignore_ascii_case("srcset");
     let base = name.split('.').next().unwrap_or(name);
-    base.eq_ignore_ascii_case("src")
+    is_source(base)
         || base
             .rsplit_once(|c| c == ':' || c == '-')
-            .is_some_and(|(_, last)| last.eq_ignore_ascii_case("src"))
+            .is_some_and(|(_, last)| is_source(last))
 }
 
 /// How far a tag may run past its `<img`, so an unclosed one costs little.

@@ -44,6 +44,7 @@ const REPO = '<REPO>';
 // Env the recording machine may carry that would leak into output.
 const BASE_ENV = {
   OPENAI_API_KEY: null,
+  CODEX_HOME: null,
   IMPECCABLE_CONTEXT_DIR: null,
   IMPECCABLE_CATALOG_DIR: null,
   IMPECCABLE_API_URL: null,
@@ -93,6 +94,16 @@ const claudeStopHook = (ws, rel) => write(
   }) + '\n',
 );
 
+// A user-scope Codex Stop hook as `update --user` writes it into
+// `<dir>/hooks.json` (the absolute launcher, guarded).
+const codexUserHook = (ws, dir) => write(
+  ws,
+  path.join(dir, 'hooks.json'),
+  JSON.stringify({
+    hooks: { Stop: [{ hooks: [{ type: 'command', command: `[ ! -f '/u/.agents/skills/impeccable/scripts/impeccable' ] || '/u/.agents/skills/impeccable/scripts/impeccable' hook` }] }] },
+  }, null, 2) + '\n',
+);
+
 // Fixed mtimes so DESIGN.md-vs-sidecar age comparisons never depend on copy
 // order or filesystem timestamp granularity.
 const T_OLD = new Date('2026-01-01T00:00:00Z');
@@ -103,6 +114,11 @@ const sidecarOlder = (ws) => { touch(path.join(ws, 'DESIGN.md'), T_NEW); touch(p
 
 // ctx-legacy carries `.impeccable-live.json` (gitignored in this repo, so it
 // is written at stage time) and a DESIGN.md newer than its legacy sidecar.
+const cursorGateSetup = (ws) => {
+  write(ws, '.cursor/skills/impeccable/scripts/impeccable', '#!/bin/sh\n');
+  write(ws, '.cursor/hooks.json', JSON.stringify({ version: 1, hooks: { preToolUse: [{ command: '[ ! -f ".cursor/skills/impeccable/scripts/impeccable" ] || ".cursor/skills/impeccable/scripts/impeccable" hook-before-edit', timeout: 5 }] } }, null, 2) + '\n');
+};
+
 const legacySetup = (ws) => {
   write(ws, '.impeccable-live.json', JSON.stringify({ port: 4310, sessions: [] }, null, 2) + '\n');
   sidecarOlder(ws);
@@ -219,6 +235,9 @@ const cases = [
   // context
   // ======================================================================
   { id: 'context-empty', verb: 'context', workspace: 'ctx-empty', env: env(), files: IMPECCABLE_FILES },
+  // The Windows .cmd launcher exports its own path as IMPECCABLE_SELF. A path
+  // with spaces is printed with PowerShell's call operator (#744).
+  { id: 'context-cmd-launcher-spaced-path', verb: 'context', workspace: 'ctx-empty', env: env({ IMPECCABLE_SELF: 'C:\\Users\\Oracle User\\skill\\scripts\\impeccable.cmd' }) },
   { id: 'context-visual-only', verb: 'context', workspace: 'ctx-visual-only', env: env(), files: IMPECCABLE_FILES },
   { id: 'context-product-only', verb: 'context', workspace: 'ctx-product-only', env: env(), files: IMPECCABLE_FILES },
   { id: 'context-full', verb: 'context', workspace: 'ctx-full', setup: sidecarNewer, env: env(), files: IMPECCABLE_FILES },
@@ -309,6 +328,23 @@ const cases = [
       write(ws, 'repos/standalone/src/App.jsx', 'export default function App() { return "standalone"; }\n');
     },
     env: env({ IMPECCABLE_PROVIDER_ID: 'claude-code' }),
+  },
+  // #1062: a user-scope Codex install writes `~/.codex/hooks.json`, which
+  // counts as coverage; a non-empty CODEX_HOME replaces that location.
+  {
+    id: 'context-codex-user-hook', verb: 'context', workspace: 'ctx-product-only',
+    setup: (ws) => codexUserHook(ws, '.oracle-home/.codex'),
+    env: env({ IMPECCABLE_PROVIDER_ID: 'codex', IMPECCABLE_NO_STALENESS_CHECK: '1' }),
+  },
+  {
+    id: 'context-codex-home-hook', verb: 'context', workspace: 'ctx-product-only',
+    setup: (ws) => codexUserHook(ws, 'codex-home'),
+    env: env({ IMPECCABLE_PROVIDER_ID: 'agents', CODEX_HOME: `${WS}/codex-home`, IMPECCABLE_NO_STALENESS_CHECK: '1' }),
+  },
+  {
+    id: 'context-codex-home-exclusive', verb: 'context', workspace: 'ctx-product-only',
+    setup: (ws) => codexUserHook(ws, '.oracle-home/.codex'),
+    env: env({ IMPECCABLE_PROVIDER_ID: 'codex', CODEX_HOME: `${WS}/codex-home`, IMPECCABLE_NO_STALENESS_CHECK: '1' }),
   },
   { id: 'context-legacy', verb: 'context', workspace: 'ctx-legacy', setup: legacySetup, env: env(), files: IMPECCABLE_FILES },
   { id: 'context-hook-disabled-env', verb: 'context', workspace: 'ctx-product-only', env: env({ IMPECCABLE_HOOK_DISABLED: 'yes' }), files: IMPECCABLE_FILES },
@@ -426,6 +462,10 @@ const cases = [
   { id: 'doctor-monorepo-roots-match-nothing', verb: 'doctor', workspace: 'ctx-monorepo', setup: (ws) => write(ws, '.impeccable/config.json', JSON.stringify({ projectRoots: ['services/*'] }, null, 2) + '\n'), env: env() },
   { id: 'doctor-legacy-text', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, env: env(), files: IMPECCABLE_FILES },
   { id: 'doctor-legacy-json', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, args: ['--json'], env: env(), files: IMPECCABLE_FILES },
+  // A Cursor manifest still on the retired preToolUse gate is an `auto`
+  // finding; --fix moves the entry to postToolUse in place.
+  { id: 'doctor-cursor-gate-json', verb: 'doctor', workspace: 'ctx-product-only', setup: cursorGateSetup, args: ['--json'], env: env({ IMPECCABLE_PROVIDER_ID: 'cursor' }), files: ['.cursor/hooks.json'] },
+  { id: 'doctor-cursor-gate-fix', verb: 'doctor', workspace: 'ctx-product-only', setup: cursorGateSetup, args: ['--fix'], env: env({ IMPECCABLE_PROVIDER_ID: 'cursor' }), files: ['.cursor/hooks.json'] },
   { id: 'doctor-legacy-fix', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, args: ['--fix'], env: env(), files: IMPECCABLE_FILES },
   { id: 'doctor-legacy-fix-json', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, args: ['--fix', '--json'], env: env(), files: IMPECCABLE_FILES },
   { id: 'doctor-legacy-fix-twice', verb: 'doctor', workspace: 'ctx-legacy', setup: legacySetup, args: ['--fix'], env: env(), files: IMPECCABLE_FILES, steps: [{}, {}, { args: ['--json'] }] },
@@ -453,6 +493,8 @@ const cases = [
   { id: 'doctor-config-malformed', verb: 'doctor', workspace: 'ctx-product-only', setup: (ws) => write(ws, '.impeccable/config.json', '{not json'), env: env() },
   { id: 'doctor-config-array', verb: 'doctor', workspace: 'ctx-product-only', setup: (ws) => write(ws, '.impeccable/config.json', '[1,2]\n'), env: env() },
   { id: 'doctor-hook-script-missing', verb: 'doctor', workspace: 'ctx-product-only', setup: (ws) => write(ws, '.claude/settings.json', JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'node "${CLAUDE_PROJECT_DIR}/.claude/skills/impeccable/scripts/hook.mjs"' }] }] } }, null, 2) + '\n'), args: ['--json'], env: env() },
+  { id: 'doctor-codex-user-hook-script-missing', verb: 'doctor', workspace: 'ctx-product-only', setup: (ws) => codexUserHook(ws, '.oracle-home/.codex'), args: ['--json'], env: env({ IMPECCABLE_PROVIDER_ID: 'codex' }) },
+  { id: 'doctor-codex-home-hook-script-missing', verb: 'doctor', workspace: 'ctx-product-only', setup: (ws) => codexUserHook(ws, 'codex-home'), args: ['--json'], env: env({ IMPECCABLE_PROVIDER_ID: 'codex', CODEX_HOME: `${WS}/codex-home` }) },
   { id: 'doctor-hook-script-present', verb: 'doctor', workspace: 'ctx-product-only', setup: (ws) => { write(ws, '.claude/settings.json', JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'node .claude/skills/impeccable/scripts/hook.mjs' }] }] } }, null, 2) + '\n'); write(ws, '.claude/skills/impeccable/scripts/hook.mjs', '// present\n'); }, args: ['--json'], env: env() },
   {
     id: 'doctor-design-drift', verb: 'doctor', workspace: 'ctx-signals',

@@ -66,8 +66,9 @@ pub(crate) fn self_cmd(io: &Io) -> String {
         && !value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b':') || (cfg!(windows) && b == b'\\'))
     {
         if cfg!(windows) {
-            // cmd.exe treats single quotes as literal filename characters.
-            return format!("\"{value}\"");
+            // cmd.exe treats single quotes as literal filename characters;
+            // a quoted .cmd launcher also needs PowerShell's call operator.
+            return impeccable_common::launcher::with_call_operator(&value, format!("\"{value}\""));
         }
         return format!("'{}'", value.replace('\'', "'\\''"));
     }
@@ -2416,7 +2417,7 @@ fn hash_file(io: &Io, file: &str) -> Option<String> {
     Some(d.iter().map(|b| format!("{b:02x}")).collect::<String>()[..12].to_string())
 }
 
-fn gate_responsive(io: &Io, state: &mut Value, min: f64, out_dir: &str, renderer: Option<&dyn EntryRenderer>) -> Gate {
+fn gate_responsive(io: &Io, state: &mut Value, min: f64, out_dir: &str, artifact: Option<&str>, renderer: Option<&dyn EntryRenderer>) -> Gate {
     let pending = Gate::fail(vec!["responsive comparison has not completed".into()]);
     if let Err(e) = unavailable_report(io, out_dir, &pending, "responsive") {
         return Gate::fail(vec![format!("cannot persist responsive gate evidence: {e}")]);
@@ -2426,7 +2427,7 @@ fn gate_responsive(io: &Io, state: &mut Value, min: f64, out_dir: &str, renderer
         let _ = unavailable_report(io, out_dir, &gate, "responsive");
         return gate;
     }
-    let native=match prepare_native_capture(io,state,None,renderer,EntryStage::Responsive) {Ok(value)=>value,Err(gate)=>{let _=unavailable_report(io,out_dir,&gate,"responsive");return gate;}};
+    let native=match prepare_native_capture(io,state,artifact,renderer,EntryStage::Responsive) {Ok(value)=>value,Err(gate)=>{let _=unavailable_report(io,out_dir,&gate,"responsive");return gate;}};
     let mut gate = gate_responsive_inner(io, state, min, out_dir, native.as_ref());
     if gate.ok && native.is_none() {
         let after = crate::completion::input_hash(&io.cwd);
@@ -2718,7 +2719,7 @@ fn run_gate(io: &Io, state: &mut Value, phase: &str, opts: &GateOpts, organic_sc
             let min = opts.min.unwrap_or(HERO_MIN);
             gate_hero(io, state, &build_path, min, ".impeccable/review/diff/hero", opts.artifact.as_deref(), organic_scan, renderer)
         }
-        "responsive" => gate_responsive(io, state, opts.min.unwrap_or(RESPONSIVE_MIN), ".impeccable/review/diff/desktop", renderer),
+        "responsive" => gate_responsive(io, state, opts.min.unwrap_or(RESPONSIVE_MIN), ".impeccable/review/diff/desktop", opts.artifact.as_deref(), renderer),
         // No measurement here, but the build still stands on the approved comp.
         _ => match comp_refusal(io) { Some(why) => Gate::fail(vec![why]), None => Gate::ok("no mechanical gate".into()) },
     }
@@ -3263,8 +3264,9 @@ mod transparency_guidance_tests {
         for value in [relative.to_string(), launcher.to_string_lossy().into_owned()] {
             let env = [("IMPECCABLE_SELF".into(), value.clone())].into();
             let (io, _) = Io::captured("", dir.clone(), env);
-            let quote = if cfg!(windows) { '"' } else { '\'' };
-            let expected = format!("{quote}{value}{quote}");
+            // Windows spells the quoted .cmd launcher as a PowerShell call
+            // on a literal string (#744); sh quotes the path in single quotes.
+            let expected = if cfg!(windows) { format!("& '{value}'") } else { format!("'{value}'") };
             assert_eq!(self_cmd(&io), expected);
             let next = next_instruction(&io, &json!({"phase": "plates"}));
             assert!(next.contains(&format!("{expected} generate-image --ref")), "{next}");
@@ -3666,7 +3668,7 @@ pub fn run_with_renderer(argv: &[String],io: &mut Io,organic_scan: OrganicScan,r
             if disposition == "ship" && (state["capturePolicy"] == "native-html-v1"
                 || io.env("IMPECCABLE_NATIVE_CAPTURE") == Some("1")) {
                 let gate = gate_responsive(io, &mut state, RESPONSIVE_MIN,
-                    ".impeccable/review/diff/desktop", renderer);
+                    ".impeccable/review/diff/desktop", arg(argv, "artifact"), renderer);
                 let at = now();
                 let responsive = &mut state["phases"]["responsive"];
                 responsive["attempts"] = json!(responsive["attempts"].as_u64().unwrap_or(0) + 1);

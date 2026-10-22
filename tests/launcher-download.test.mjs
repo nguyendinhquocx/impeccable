@@ -220,6 +220,12 @@ test('cmd launcher stages each run under its own name', () => {
   assert.match(source, /mkdir "%staging%" >nul 2>nul\r?\nif errorlevel 1 goto claim_staging/);
 });
 
+test('cmd launcher is checked out with CRLF line endings', () => {
+  const source = fs.readFileSync(path.join(ROOT, 'skill/scripts/impeccable.cmd'));
+  const withoutCrlf = Buffer.from(source.toString('binary').replaceAll('\r\n', ''));
+  assert.equal(withoutCrlf.includes(10), false, 'cmd.exe batch labels require CRLF line endings');
+});
+
 test('cmd launcher forwards engine exit code through cmd /c', { skip: WINDOWS ? false : 'Windows-only cmd /c exit-code forwarding' }, async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-launcher-exit-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

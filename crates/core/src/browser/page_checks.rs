@@ -688,13 +688,90 @@ fn is_media_frame(dom: &dyn Dom, el: ElId, rect: &Rect) -> bool {
 /// A box whose element children are all form controls: the filled, rounded
 /// field Framer and most form kits draw around an input or a select. Its text
 /// is the select's options, not content of its own.
+///
+/// A composer is a field too (observations-1006 row 19, resineda.com's
+/// `form.demo-composer`): beside its fields it may hold a screen-reader
+/// label in a clipped 1px box, hidden inputs, and one row of buttons (a
+/// button, or a box whose element children are all buttons) holding no
+/// heading and at most [`FIELD_BUTTON_ROW_MAX_CHARS`] of text. Only a field
+/// that draws a text box counts (`textarea`, `select`, or an `input` that is
+/// not a hidden input, a checkbox, a radio or a button), and at least one is
+/// needed: a selectable tile around a checkbox, or a plan card that a hidden
+/// input and one big button carry, is still a card.
 fn is_field_box(dom: &dyn Dom, el: ElId) -> bool {
-    let children = dom.children(el);
-    !children.is_empty()
-        && children
-            .iter()
-            .all(|&c| matches!(tag_lower(dom, c).as_str(), "input" | "select" | "textarea"))
+    let tag_of = |c: ElId| tag_lower(dom, c);
+    let input_type = |c: ElId| js::to_lower_case(js::trim(&dom.attr(c, "type").unwrap_or_default()));
+    let is_text_field = |c: ElId| match tag_of(c).as_str() {
+        "textarea" | "select" => true,
+        "input" => !matches!(
+            input_type(c).as_str(),
+            "hidden" | "checkbox" | "radio" | "submit" | "button" | "image" | "reset"
+        ),
+        _ => false,
+    };
+    // A submit input is a button as much as a `<button>` is.
+    let is_button = |c: ElId| {
+        tag_of(c) == "button"
+            || dom.attr(c, "role").is_some_and(|r| r == "button")
+            || (tag_of(c) == "input"
+                && matches!(input_type(c).as_str(), "submit" | "button" | "image" | "reset"))
+    };
+    // Copy written straight into the box is the box's own content.
+    if !js::trim(&direct_text(dom, el)).is_empty() {
+        return false;
+    }
+    // An input button shows its `value` (an image input its `alt`), not
+    // child text; a row holds the labels of the inputs inside it too.
+    let input_label = |c: ElId| {
+        let attr = if input_type(c) == "image" { "alt" } else { "value" };
+        dom.attr(c, attr).unwrap_or_default()
+    };
+    let label_text = |c: ElId| {
+        if tag_of(c) == "input" {
+            return input_label(c);
+        }
+        let mut text = dom.text_content(c);
+        for i in dom.query_all(Some(c), "input").unwrap_or_default() {
+            text.push(' ');
+            text.push_str(&input_label(i));
+        }
+        text
+    };
+    let short_label = |c: ElId| {
+        utf16_len(js::trim(&collapse_ws(&label_text(c)))) <= FIELD_BUTTON_ROW_MAX_CHARS
+            && dom
+                .query_all(Some(c), "h1, h2, h3, h4, h5, h6, [role=\"heading\"]")
+                .unwrap_or_default()
+                .is_empty()
+    };
+    let mut fields = 0;
+    let mut button_rows = 0;
+    for c in dom.children(el) {
+        if is_text_field(c) {
+            fields += 1;
+        } else if (tag_of(c) == "input" && input_type(c) == "hidden")
+            || super::painted::is_visually_hidden_box(dom, c)
+        {
+            continue;
+        } else if (is_button(c) || {
+            let kids = dom.children(c);
+            !kids.is_empty() && kids.iter().all(|&k| is_button(k))
+        }) && short_label(c)
+        {
+            button_rows += 1;
+            if button_rows > 1 {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    fields > 0
 }
+
+/// The most text a field box's button row may hold: a send arrow, "Search",
+/// "Subscribe".
+const FIELD_BUTTON_ROW_MAX_CHARS: usize = 20;
 
 /// Whether `inner` runs along at least three edges of `outer`'s padding box: a
 /// header band or a footer strip of the card itself, which reads as one card
@@ -2058,6 +2135,26 @@ fn rhythm_ends_in_prose(dom: &dyn Dom, block: ElId, heading: ElId, text_size: f6
 }
 
 /// JS: checks.mjs#checkHeadingRhythmDOM()
+/// The widest gap, in px, across which an eyebrow that opens its group still
+/// folds into the heading's cluster: a label further off is detached.
+const RHYTHM_EYEBROW_FOLD_MAX_PX: f64 = 64.0;
+
+/// The widest gap, in px, at which a line above a heading touches it.
+const RHYTHM_TOUCH_GAP_PX: f64 = 2.0;
+
+/// Whether `el`'s text renders on one line: its recorded line boxes share
+/// one top (within 2px). A capture that recorded no lines answers no, and
+/// the line is judged as before.
+fn rhythm_one_line(dom: &dyn Dom, el: ElId) -> bool {
+    match dom.text_line_rects(el) {
+        Some(lines) if !lines.is_empty() => {
+            let first = lines[0].top;
+            lines.iter().all(|l| (l.top - first).abs() <= 2.0)
+        }
+        _ => false,
+    }
+}
+
 pub fn check_heading_rhythm_dom(dom: &dyn Dom) -> Vec<ElFinding> {
     const MIN_VIOLATIONS: usize = 2;
     const CARD_EXEMPT_HEIGHT: f64 = 200.0;
@@ -2097,7 +2194,17 @@ pub fn check_heading_rhythm_dom(dom: &dyn Dom) -> Vec<ElFinding> {
     // emit an eyebrow, and missing them measured the gap to the heading's
     // own label. Only a line that reads as a label folds in: `text_size` is
     // the size of the body text it is set against.
-    let cluster_top = |h: ElId, rect: &Rect, text_size: f64| -> (ElId, f64) {
+    //
+    // Two shapes fold whatever the 28px cap says (observations-1006 row 10).
+    // A short line on one line that opens its group and touches the heading
+    // (a gap of 2px or less) at a size no larger than the heading's is the
+    // heading's own subtitle, however it is set (partner.co.il's 23px Hebrew
+    // line resting on its h2). The last line of a block in a flat flow has a
+    // box before it and is judged as before. And an eyebrow that opens its group sits with the heading
+    // when it is closer to it than the heading is to what it introduces
+    // (a0lang.vercel.app's "01 / Language and tools", 60px above an h2 with
+    // 100px below), up to 64px: `below` is that gap.
+    let cluster_top = |h: ElId, rect: &Rect, text_size: f64, below: f64| -> (ElId, f64) {
         let mut top_el = h;
         let mut top = rect.top;
         let mut cursor = h;
@@ -2130,7 +2237,12 @@ pub fn check_heading_rhythm_dom(dom: &dyn Dom) -> Vec<ElFinding> {
                 break;
             }
             let gap = top - sr.bottom;
-            if gap < 0.0 || gap >= 28.0 || sr.height > 60.0 {
+            if gap < 0.0 || sr.height > 60.0 {
+                break;
+            }
+            let opens_group = previous_box(sib).is_none();
+            let wide_eyebrow = gap >= 28.0;
+            if wide_eyebrow && !(opens_group && gap < below && gap <= RHYTHM_EYEBROW_FOLD_MAX_PX) {
                 break;
             }
             let text = js::trim(&dom.text_content(sib)).to_string();
@@ -2144,8 +2256,15 @@ pub fn check_heading_rhythm_dom(dom: &dyn Dom) -> Vec<ElFinding> {
             if matches!(tag_lower(dom, sib).as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
                 break;
             }
-            let opens_group = previous_box(sib).is_none();
-            if text_len > 80 || !rhythm_reads_as_eyebrow(dom, sib, h, text_size, opens_group) {
+            if text_len > 80 {
+                break;
+            }
+            let subtitle = !wide_eyebrow
+                && opens_group
+                && gap <= RHYTHM_TOUCH_GAP_PX
+                && rhythm_font_size(dom, sib) <= rhythm_font_size(dom, h)
+                && rhythm_one_line(dom, sib);
+            if !subtitle && !rhythm_reads_as_eyebrow(dom, sib, h, text_size, opens_group) {
                 break;
             }
             top_el = sib;
@@ -2322,7 +2441,7 @@ pub fn check_heading_rhythm_dom(dom: &dyn Dom) -> Vec<ElFinding> {
             body.map_or(16.0, |b| rhythm_font_size(dom, b)),
             rhythm_text_size(dom, below_el),
         );
-        let (top_el, top) = cluster_top(h, &rect, text_size);
+        let (top_el, top) = cluster_top(h, &rect, text_size, below_top - rect.bottom);
         let Some((above_bottom, above_el)) = edge_above(h, top_el, top, &rect) else { continue };
         if inside_small_card(h) {
             continue;
@@ -5778,6 +5897,77 @@ mod tests {
         el
     }
 
+    /// observations-1006 row 10. A one-line subtitle touching its h2 at a
+    /// smaller size, set like body copy (partner.co.il), is the heading's
+    /// own; an uppercase eyebrow that opens its group 60px above an h2 with
+    /// 100px below (a0lang.vercel.app) is too. Twins: the same subtitle on
+    /// two lines or 3px off, and an eyebrow that follows a line of its own
+    /// group, stay blocks of their own.
+    #[test]
+    fn heading_rhythm_folds_a_touching_subtitle_and_an_opening_eyebrow() {
+        // Each section: a line of prose, 140px of space, then a group that
+        // holds `label` and the heading, with content `below` under it.
+        // Returns how many headings report.
+        let page = |label: &dyn Fn(&mut FakeDom, ElId, f64) -> f64, below: f64| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let mut y = 0.0;
+            for i in 0..2 {
+                let sec = flow(&mut d, body, "section", (0.0, y, 800.0, 500.0), "");
+                flow(&mut d, sec, "p", (0.0, y, 800.0, 20.0), "The end of the section above, a long sentence of prose.");
+                let group = flow(&mut d, sec, "div", (0.0, y + 160.0, 800.0, 300.0), "");
+                let h_top = label(&mut d, group, y + 160.0);
+                flow(&mut d, group, "h2", (0.0, h_top, 800.0, 30.0), &format!("Heading number {i}"));
+                flow(&mut d, group, "p", (0.0, h_top + 30.0 + below, 800.0, 20.0), "Body paragraph");
+                y += 500.0;
+            }
+            check_heading_rhythm_dom(&d).len()
+        };
+        let subtitle = |gap: f64, lines: usize| {
+            move |d: &mut FakeDom, group: ElId, top: f64| -> f64 {
+                let h = 24.0 * lines as f64;
+                let s = flow(d, group, "span", (0.0, top, 300.0, h), "Pick a plan in one click");
+                d.set_style(s, "fontSize", "20px");
+                let rows: Vec<(f64, f64, f64, f64)> =
+                    (0..lines).map(|n| (0.0, top + 24.0 * n as f64, 300.0, 24.0)).collect();
+                d.set_text_lines(s, &rows);
+                top + h + gap
+            }
+        };
+        assert_eq!(page(&subtitle(0.0, 2), 40.0), 2, "a two-line subtitle");
+        assert_eq!(page(&subtitle(3.0, 1), 40.0), 2, "a one-line subtitle 3px off");
+        assert_eq!(page(&subtitle(0.0, 1), 40.0), 0, "a one-line subtitle touching the h2");
+        // Review of round 12: the same line after a paragraph of its own
+        // group is the tail of that block, not a subtitle.
+        let tail = |d: &mut FakeDom, group: ElId, top: f64| -> f64 {
+            flow(d, group, "p", (0.0, top, 800.0, 48.0), "A paragraph of prose that runs across two full lines of the column.");
+            let s = flow(d, group, "p", (0.0, top + 112.0, 300.0, 24.0), "Read the full report on our site.");
+            d.set_text_lines(s, &[(0.0, top + 112.0, 300.0, 24.0)]);
+            top + 136.0
+        };
+        assert_eq!(page(&tail, 40.0), 2, "a one-line tail after a paragraph");
+        let eyebrow = |after_a_line: bool| {
+            move |d: &mut FakeDom, group: ElId, top: f64| -> f64 {
+                let mut top = top;
+                if after_a_line {
+                    flow(d, group, "p", (0.0, top, 300.0, 20.0), "A line of the group's own");
+                    top += 40.0;
+                }
+                let e = flow(d, group, "p", (0.0, top, 300.0, 16.0), "01 / Language and tools");
+                d.set_styles(e, &[("fontSize", "12px"), ("textTransform", "uppercase")]);
+                top + 16.0 + 60.0
+            }
+        };
+        assert_eq!(page(&eyebrow(false), 100.0), 0, "an eyebrow that opens its group");
+        assert_eq!(page(&eyebrow(true), 100.0), 2, "an eyebrow after a line of its group");
+        let far = |d: &mut FakeDom, group: ElId, top: f64| -> f64 {
+            let e = flow(d, group, "p", (0.0, top, 300.0, 16.0), "01 / Language and tools");
+            d.set_styles(e, &[("fontSize", "12px"), ("textTransform", "uppercase")]);
+            top + 16.0 + 90.0
+        };
+        assert_eq!(page(&far, 140.0), 2, "an eyebrow 90px off is detached");
+    }
+
     /// observations-35 row 12 (kinghost.com.br 218700, 218716): a bare `div`
     /// around a 40px spacer block holds space open as the spacer does. Read
     /// as a block, it put the heading 0px under "the block above".
@@ -8578,6 +8768,138 @@ mod tests {
         assert!(check_layout(&d).is_empty(), "a fill with no border or shadow (r4-p16)");
         outlined(&mut d, field, "10px");
         assert_eq!(check_layout(&d).len(), 1, "a framed box with content beside the control");
+
+        // resineda.com (observations-1006 row 19): a bordered composer
+        // around a textarea, with a screen-reader label in a clipped 1px box
+        // and one row of buttons. A row of text beside them, or a second
+        // button row, makes it a card again.
+        let composer = |extra: &dyn Fn(&mut FakeDom, ElId)| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let panel = d.add(Some(body), "aside");
+            outlined(&mut d, panel, "16px");
+            d.set_rect(panel, 772.0, 358.0, 281.0, 373.0);
+            d.add_text(panel, "Ask anything about resin");
+            let form = d.add(Some(panel), "form");
+            outlined(&mut d, form, "12px");
+            d.set_rect(form, 781.0, 644.0, 264.0, 79.0);
+            let label = d.add(Some(form), "label");
+            d.add_text(label, "Message Resin AI");
+            d.set_styles(
+                label,
+                &[("position", "absolute"), ("clip", "rect(0px, 0px, 0px, 0px)")],
+            );
+            d.set_rect(label, 789.0, 652.0, 1.0, 1.0);
+            let area = d.add(Some(form), "textarea");
+            d.set_rect(area, 790.0, 653.0, 246.0, 35.0);
+            let row = d.add(Some(form), "div");
+            d.set_rect(row, 790.0, 688.0, 246.0, 26.0);
+            let send = d.add(Some(row), "button");
+            d.set_rect(send, 1010.0, 688.0, 26.0, 26.0);
+            extra(&mut d, form);
+            check_layout(&d).len()
+        };
+        assert_eq!(composer(&|_, _| {}), 0, "a composer");
+        assert_eq!(
+            composer(&|d, form| {
+                let note = d.add(Some(form), "p");
+                d.add_text(note, "Answers can be wrong");
+                d.set_rect(note, 790.0, 714.0, 246.0, 16.0);
+            }),
+            1,
+            "a composer with copy of its own"
+        );
+        assert_eq!(
+            composer(&|d, form| {
+                let row = d.add(Some(form), "div");
+                let b = d.add(Some(row), "button");
+                d.add_text(b, "Attach");
+                d.set_rect(row, 790.0, 714.0, 246.0, 26.0);
+            }),
+            1,
+            "two button rows"
+        );
+        assert_eq!(
+            composer(&|d, form| {
+                let b = d.children(form)[2];
+                let send = d.children(b)[0];
+                d.add_text(send, "Send this message to the assistant now");
+            }),
+            1,
+            "a button row holding copy"
+        );
+        // A submit input is a button, whether it sits alone or in a row.
+        let add_submit = |d: &mut FakeDom, parent: ElId| {
+            let submit = d.add(Some(parent), "input");
+            d.set_attr(submit, "type", "submit");
+            d.set_rect(submit, 1000.0, 688.0, 26.0, 26.0);
+        };
+        assert_eq!(
+            composer(&|d, form| {
+                let b = d.children(form)[2];
+                d.set_rect(b, 790.0, 688.0, 220.0, 26.0);
+                add_submit(d, form);
+            }),
+            1,
+            "two button rows, one a submit input"
+        );
+        assert_eq!(
+            composer(&|d, form| {
+                let row = d.children(form)[2];
+                add_submit(d, row);
+            }),
+            0,
+            "a row of a button and a submit input"
+        );
+        assert_eq!(
+            composer(&|d, form| {
+                let row = d.children(form)[2];
+                let long = d.add(Some(row), "input");
+                d.set_attr(long, "type", "submit");
+                d.set_attr(long, "value", "Send this message to the assistant now");
+                d.set_rect(long, 1000.0, 688.0, 26.0, 26.0);
+            }),
+            1,
+            "a submit input whose value is long copy"
+        );
+        assert_eq!(
+            composer(&|d, form| {
+                d.add_text(form, "Answers can be wrong");
+            }),
+            1,
+            "a composer with copy written into the box"
+        );
+
+        // Review of round 12: a plan card carried by a hidden input and one
+        // big button, and a selectable tile around a checkbox, are cards.
+        let tile = |control: &str, kind: &str| {
+            let mut d = FakeDom::new();
+            let (_h, body) = d.with_page();
+            let panel = d.add(Some(body), "section");
+            outlined(&mut d, panel, "16px");
+            d.set_rect(panel, 0.0, 0.0, 800.0, 400.0);
+            d.add_text(panel, "Choose the plan that fits");
+            let card = d.add(Some(panel), "form");
+            outlined(&mut d, card, "12px");
+            d.set_rect(card, 24.0, 80.0, 360.0, 200.0);
+            let input = d.add(Some(card), "input");
+            d.set_attr(input, "type", kind);
+            d.set_rect(input, 40.0, 96.0, 16.0, 16.0);
+            let button = d.add(Some(card), control);
+            if control == "div" {
+                d.set_attr(button, "role", "button");
+            }
+            d.set_rect(button, 40.0, 120.0, 320.0, 140.0);
+            let h = d.add(Some(button), "h3");
+            d.add_text(h, "Team");
+            d.set_rect(h, 40.0, 120.0, 320.0, 28.0);
+            let p = d.add(Some(button), "p");
+            d.add_text(p, "Everything in Starter, for up to ten seats.");
+            d.set_rect(p, 40.0, 160.0, 320.0, 40.0);
+            check_layout(&d).len()
+        };
+        assert_eq!(tile("button", "hidden"), 1, "a plan card with a hidden input");
+        assert_eq!(tile("div", "checkbox"), 1, "a selectable tile around a checkbox");
 
         // clipto.com: a tinted, rounded `<mark>` run; demotv.lol: a bordered
         // frame around a video thumbnail.

@@ -194,6 +194,9 @@ pub fn collect_kicker_candidates_with_elements(dom: &dyn Dom) -> Vec<(ElId, Kick
         if found.levels > 0 && !label_near_heading(dom, kicker, heading) {
             continue;
         }
+        if label_beside_heading(dom, label_type_element(dom, kicker), heading) {
+            continue;
+        }
         if super::dom::closest_or_none(dom, kicker, KICKER_SKIP_SELECTOR).is_some() {
             continue;
         }
@@ -740,6 +743,33 @@ pub fn label_near_heading(dom: &dyn Dom, label: ElId, heading: ElId) -> bool {
     gap <= LABEL_CLIMBED_MAX_GAP_PX
 }
 
+/// Whether the box that sets a label's text (`label_type`, from
+/// [`label_type_element`]) sits beside `heading` or under it rather than
+/// above it: it lies wholly to one side of the heading and does not end
+/// above the heading's top by at least half its own height (cronwatch.dev's
+/// "RUNS" column at the h2's own top, 40px to its left), or it starts at or
+/// below the heading's bottom (pfgc.com's portrait caption in the next
+/// column, whose 480px wrapper starts higher than the heading). A label with
+/// no box is not measured and keeps the candidate.
+///
+/// The kicker collector's own test; [`label_near_heading`] is shared with
+/// the numbered-label and hero-eyebrow rules and stays as it is.
+pub fn label_beside_heading(dom: &dyn Dom, label_type: ElId, heading: ElId) -> bool {
+    let l = dom.rect(label_type);
+    let h = dom.rect(heading);
+    if !l.all_finite() || !h.all_finite() {
+        return false;
+    }
+    if l.width <= 0.0 || l.height <= 0.0 || h.width <= 0.0 || h.height <= 0.0 {
+        return false;
+    }
+    if l.top >= h.bottom - 1.0 {
+        return true;
+    }
+    let to_one_side = l.right <= h.left + 1.0 || l.left >= h.right - 1.0;
+    to_one_side && l.bottom > h.top + l.height / 2.0
+}
+
 /// The element that sets a label's type: the label itself when it has text of
 /// its own, else the one element child that holds its text, at most three
 /// levels down. Framer sets an eyebrow's size, tracking and case on a `p`
@@ -990,6 +1020,45 @@ mod tests {
         d.set_style(h2, "fontSize", "24px");
         d.set_rect(h2, 40.0, 324.0, 600.0, 32.0);
         assert_eq!(check_kicker_above_heading_dom(&d, None).len(), 1);
+    }
+
+    /// observations-1006 row 9. cronwatch.dev sets "RUNS" in a column beside
+    /// its h2, at the same top; pfgc.com's portrait caption sits in the
+    /// column before the heading, below it. Neither is above the heading.
+    /// The same label stacked above (cronwatch's phone layout), or above and
+    /// to the left, is a kicker.
+    #[test]
+    fn kicker_skips_a_label_beside_or_below_its_heading() {
+        let kicker_at = |label: (f64, f64, f64, f64), wrapped: bool| {
+            let mut d = FakeDom::new();
+            let (_html, body) = d.with_page();
+            let sec = d.add(Some(body), "section");
+            let kicker = d.add(Some(sec), "p");
+            d.add_text(kicker, "Runs");
+            d.set_styles(
+                kicker,
+                &[("fontSize", "12px"), ("letterSpacing", "1.2px"), ("textTransform", "uppercase")],
+            );
+            d.set_rect(kicker, label.0, label.1, label.2, label.3);
+            let parent = if wrapped {
+                let w = d.add(Some(sec), "div");
+                d.set_rect(w, 292.0, 894.0, 885.0, 172.0);
+                w
+            } else {
+                sec
+            };
+            let h = d.add(Some(parent), "h2");
+            d.add_text(h, "The dashboard, showing a day");
+            d.set_style(h, "fontSize", "28px");
+            d.set_rect(h, 292.0, 894.0, 885.0, 32.0);
+            check_kicker_above_heading_dom(&d, None).len()
+        };
+        for wrapped in [false, true] {
+            assert_eq!(kicker_at((102.0, 894.0, 150.0, 23.0), wrapped), 0, "beside, wrapped {wrapped}");
+            assert_eq!(kicker_at((102.0, 940.0, 150.0, 23.0), wrapped), 0, "below, wrapped {wrapped}");
+            assert_eq!(kicker_at((292.0, 860.0, 150.0, 23.0), wrapped), 1, "stacked, wrapped {wrapped}");
+            assert_eq!(kicker_at((102.0, 862.0, 150.0, 23.0), wrapped), 1, "above left, wrapped {wrapped}");
+        }
     }
 
     /// The kicker rule hands a label over a display h1 to the hero rule only

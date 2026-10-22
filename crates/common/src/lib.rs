@@ -10,6 +10,7 @@ pub mod fsx;
 pub mod git;
 pub mod http;
 pub mod jsp;
+pub mod launcher;
 pub mod proc;
 #[cfg(feature = "seed")]
 pub mod seed;

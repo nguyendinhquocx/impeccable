@@ -44,21 +44,49 @@ const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_COMPRESSION_RATIO: u64 = 200;
 const RATIO_GUARD_FLOOR: u64 = 1024 * 1024;
 
+/// How long a download may wait to connect.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a download may go without receiving (or sending) a byte before
+/// it is abandoned. There is deliberately no cap on the whole transfer: a
+/// slow but steady connection must finish (#1115, where a 120 s total cap
+/// failed the ~17 MB bundle below ~140 KB/s), and [`MAX_DOWNLOAD_BYTES`]
+/// already bounds what a response can send. ureq's `timeout()` would replace
+/// this per-read limit with a deadline for the whole request, so it is not
+/// set.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn download_agent(connect: std::time::Duration, idle: std::time::Duration) -> ureq::AgentBuilder {
+    impeccable_context::http::agent_builder()
+        .timeout_connect(connect)
+        .timeout_read(idle)
+        .timeout_write(idle)
+}
+
+/// A socket read or write timeout surfaces as `WouldBlock` on Unix and
+/// `TimedOut` on Windows; name it as the stall it is.
+fn describe_io_error(e: &std::io::Error, url: &str, idle: std::time::Duration) -> String {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            format!("no data received for {} s downloading {url}; check the network and retry", idle.as_secs())
+        }
+        _ => e.to_string(),
+    }
+}
+
 /// In-memory GET for the small payloads (`/api/commands`, the engine binary
 /// and its sidecars). Non-2xx → `HTTP <status>`. The bundle itself goes
 /// through `download_file`, which streams to disk. Reads are capped at
 /// [`MAX_DOWNLOAD_BYTES`]; a longer response is an error, not a truncation.
 pub fn download(url: &str) -> Result<Vec<u8>, String> {
-    let agent = impeccable_context::http::agent_builder()
-        .timeout_connect(std::time::Duration::from_secs(30))
-        .build();
+    let agent = download_agent(CONNECT_TIMEOUT, IDLE_TIMEOUT).build();
     match agent.get(url).call() {
         Ok(res) => {
             let mut body = Vec::new();
             res.into_reader()
                 .take(MAX_DOWNLOAD_BYTES + 1)
                 .read_to_end(&mut body)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| describe_io_error(&e, url, IDLE_TIMEOUT))?;
             if body.len() as u64 > MAX_DOWNLOAD_BYTES {
                 return Err(format!("response too large downloading {url} (over {MAX_DOWNLOAD_BYTES} bytes)"));
             }
@@ -79,16 +107,18 @@ pub struct FetchResponse {
 }
 
 fn ureq_fetch(url: &str) -> Result<FetchResponse, String> {
-    let agent = impeccable_context::http::agent_builder()
-        .timeout_connect(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(120))
-        .redirects(0)
-        .build();
+    ureq_fetch_with(url, CONNECT_TIMEOUT, IDLE_TIMEOUT)
+}
+
+/// One transport hop with a connect timeout and an idle timeout, and no cap
+/// on the whole transfer (see [`IDLE_TIMEOUT`]).
+fn ureq_fetch_with(url: &str, connect: std::time::Duration, idle: std::time::Duration) -> Result<FetchResponse, String> {
+    let agent = download_agent(connect, idle).redirects(0).build();
     match agent.get(url).call() {
         Ok(res) => Ok(FetchResponse {
             status: res.status(),
             location: res.header("location").map(str::to_string),
-            body: Box::new(res.into_reader()),
+            body: Box::new(IdleNamedReader { inner: res.into_reader(), url: url.to_string(), idle }),
         }),
         Err(ureq::Error::Status(code, res)) => Ok(FetchResponse {
             status: code,
@@ -96,6 +126,25 @@ fn ureq_fetch(url: &str) -> Result<FetchResponse, String> {
             body: Box::new(res.into_reader()),
         }),
         Err(ureq::Error::Transport(t)) => Err(t.to_string()),
+    }
+}
+
+/// Names a read timeout as a stall (`describe_io_error`) while keeping the
+/// error an `io::Error`, so `download_file_capped`'s cleanup still runs.
+struct IdleNamedReader<R> {
+    inner: R,
+    url: String,
+    idle: std::time::Duration,
+}
+
+impl<R: Read> Read for IdleNamedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, describe_io_error(&e, &self.url, self.idle))
+            }
+            _ => e,
+        })
     }
 }
 
@@ -872,6 +921,52 @@ pub fn link_provider_skills(io: &mut Io, bundle_root: &str, root: &str, targets:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A one-shot HTTP server on 127.0.0.1 that sends `chunks` pieces of a
+    /// `chunks * 1024`-byte body, sleeping `gap` before each.
+    fn slow_server(chunks: usize, gap: std::time::Duration) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while !seen.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+            }
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", chunks * 1024);
+            let _ = stream.write_all(head.as_bytes());
+            for _ in 0..chunks {
+                std::thread::sleep(gap);
+                if stream.write_all(&[b'x'; 1024]).and_then(|_| stream.flush()).is_err() {
+                    return;
+                }
+            }
+        });
+        format!("http://{addr}/bundle.zip")
+    }
+
+    #[test]
+    fn slow_steady_download_outlasts_the_idle_timeout() {
+        // #1115: the whole transfer takes ~3 s, three times the idle limit,
+        // and still completes because bytes keep arriving.
+        let url = slow_server(15, std::time::Duration::from_millis(200));
+        let res = ureq_fetch_with(&url, CONNECT_TIMEOUT, std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(res.status, 200);
+        let mut body = Vec::new();
+        res.body.take(MAX_DOWNLOAD_BYTES).read_to_end(&mut body).unwrap();
+        assert_eq!(body.len(), 15 * 1024);
+    }
+
+    #[test]
+    fn stalled_download_fails_with_an_idle_message() {
+        let url = slow_server(1, std::time::Duration::from_secs(3));
+        let res = ureq_fetch_with(&url, CONNECT_TIMEOUT, std::time::Duration::from_millis(500)).unwrap();
+        let mut body = Vec::new();
+        let err = res.body.take(MAX_DOWNLOAD_BYTES).read_to_end(&mut body).unwrap_err();
+        assert!(err.to_string().starts_with("no data received for 0 s downloading http://127.0.0.1:"), "{err}");
+    }
 
     fn tmp_dir(tag: &str) -> String {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

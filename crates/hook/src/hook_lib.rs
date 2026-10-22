@@ -237,12 +237,13 @@ impl<'a> Runtime<'a> {
         html: &'a dyn HtmlEngine,
     ) -> Self {
         let win32 = cfg!(windows);
+        let self_command = self_command_spelling(self_cmd, win32);
         Runtime {
             proc_cwd,
             env,
             impeccable_command,
-            hook_admin_command: format!("{} hooks", quote_command_arg(self_cmd, win32)),
-            self_command: quote_command_arg(self_cmd, win32),
+            hook_admin_command: format!("{self_command} hooks"),
+            self_command,
             html,
             win32,
             canonical_cache: std::cell::RefCell::new(HashMap::new()),
@@ -958,7 +959,9 @@ pub fn split_findings_by_tier(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Find
 /// JS: perEditTieringActive(config, harness) — Claude Code, Codex, and
 /// Grok Build dispatch our Stop hook; Cursor and GitHub Copilot have no
 /// deep pass wired, so deferring for them would silently drop the
-/// non-immediate rules entirely.
+/// non-immediate rules entirely. Cursor's `stop` hook can only answer with a
+/// `followup_message` that Cursor submits as a new user turn, which is not
+/// wired (#1061), so its post-edit hook keeps the full rule set.
 pub fn per_edit_tiering_active(config: &HookConfig, harness: &str) -> bool {
     if harness == "cursor" || harness == "github" {
         return false;
@@ -1043,6 +1046,12 @@ pub fn remember_findings(
 // ── rendering ─────────────────────────────────────────────────────────────
 
 /// JS: quoteCommandArg(value)
+/// How printed hook commands spell the engine: the quoted self path, or
+/// `& '<path>'` when it is the Windows `.cmd` launcher (#744).
+pub fn self_command_spelling(self_cmd: &str, win32: bool) -> String {
+    impeccable_common::launcher::with_call_operator(self_cmd, quote_command_arg(self_cmd, win32))
+}
+
 pub fn quote_command_arg(value: &str, win32: bool) -> String {
     let text = js::trim(value);
     if !text.is_empty()

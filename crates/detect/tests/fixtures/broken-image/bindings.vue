@@ -9,4 +9,5 @@
   <img
     :src="src"
     alt="">
+  <img :srcset="set" alt="">
 </template>

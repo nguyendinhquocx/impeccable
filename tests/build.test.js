@@ -396,6 +396,14 @@ describe('skill scripts payload', () => {
     }
   });
 
+  test('ships the Windows launcher with CRLF line endings (#1098)', () => {
+    // cmd.exe cannot resolve `call :label` in an LF-only batch file, so the
+    // payload is CRLF whatever line endings this checkout holds.
+    const cmd = scripts.find((s) => s.name === 'impeccable.cmd');
+    expect(cmd.content).toContain('\r\n');
+    expect(cmd.content).not.toMatch(/(^|[^\r])\n/);
+  });
+
   test('ships no engine entry points and no bundled detector', () => {
     // The engine verbs live in the binary; the only Node scripts allowed in
     // the payload are the comp-fidelity build pipeline and its libs, which
@@ -732,5 +740,24 @@ describe('agent bodies resolve placeholders on every surface that ships them', (
     // The model name belongs to PROVIDER_PLACEHOLDERS and may change; what
     // this pins is that {{model}} resolved to something.
     expect(codexToml).toMatch(/and ask \S+\./);
+  });
+});
+
+describe('batch line endings', () => {
+  const dir = path.join(process.cwd(), 'test-tmp-batch-eol');
+
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  test('toCrlf converts LF and leaves CRLF alone', () => {
+    expect(utils.toCrlf('a\nb\r\nc\n')).toBe('a\r\nb\r\nc\r\n');
+  });
+
+  test('findBatchFilesWithBareLf flags only batch files with a bare LF', () => {
+    fs.mkdirSync(path.join(dir, 'a', 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'a', 'scripts', 'good.cmd'), '@echo off\r\ncall :x\r\n');
+    fs.writeFileSync(path.join(dir, 'a', 'scripts', 'bad.cmd'), '@echo off\r\ncall :x\n');
+    fs.writeFileSync(path.join(dir, 'a', 'scripts', 'impeccable'), '#!/bin/sh\nexit 0\n');
+    const bad = utils.findBatchFilesWithBareLf([dir, path.join(dir, 'missing')]);
+    expect(bad).toEqual([path.join(dir, 'a', 'scripts', 'bad.cmd')]);
   });
 });

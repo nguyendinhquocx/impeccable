@@ -456,6 +456,22 @@ fn decide_hook_install(prompt: &mut Prompt, io: &mut Io, root: &str, targets: &[
     Ok(accepted)
 }
 
+/// Update's hook self-heal (triage E8, and the retired Cursor gate): repairs
+/// the manifests at `hook_root` against the skill at `skill_root`. In user
+/// scope those differ (project manifests, home skill), and the home manifests
+/// are repaired as well, since an older `update --user` wrote Cursor, Codex
+/// and Grok manifests there. They are repaired, never pruned: a home manifest
+/// is global, so removing its entry would drop the hook from every other
+/// project. A home and a project hook firing for one edit is settled inside
+/// the hook (`hook_claim`).
+fn repair_update_hook_manifests(sys: &crate::providers::Sys, hook_root: &str, skill_root: &str, providers: &[&'static str]) -> Result<(), String> {
+    hook_manifest::repair_stale_hook_manifests(sys, hook_root, providers, Some(skill_root))?;
+    if hook_root != skill_root {
+        hook_manifest::repair_stale_hook_manifests(sys, skill_root, providers, None)?;
+    }
+    Ok(())
+}
+
 // ─── link ────────────────────────────────────────────────────────────────────
 
 /// JS: link(flags)
@@ -810,6 +826,11 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
     };
 
     out(io, &format!("Updating the {scope_label} install: {} ({})", sys.format_path_for_display(&root), providers.join(", ")));
+    // Hook manifests follow install's placement: a user-scope install keeps
+    // the skill under home but writes every non-Claude manifest (Cursor,
+    // Codex, Grok, ...) into the project, so update repairs and writes them
+    // there too, against the home skill root.
+    let hook_root = if scope == Some(Scope::User) { project_root.clone() } else { root.clone() };
     let linked_providers = sys.find_linked_providers(&root, &providers, scope);
     let copy_providers: Vec<&'static str> = providers.iter().copied().filter(|p| !linked_providers.contains(p)).collect();
 
@@ -843,10 +864,10 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
         let outcome: R<Vec<&'static str>> = (|| {
             // Repair any stale pre-launcher (`node .../hook.mjs`) manifest a v3
             // install left behind, regardless of hook consent (triage E8).
-            hook_manifest::repair_stale_hook_manifests(&sys, &root, &copy_providers, None).map_err(Flow::Throw)?;
-            let want_hooks = install_hooks && decide_hook_install(&mut prompt, io, &root, &copy_providers, yes)?;
+            repair_update_hook_manifests(&sys, &hook_root, &root, &copy_providers).map_err(Flow::Throw)?;
+            let want_hooks = install_hooks && decide_hook_install(&mut prompt, io, &hook_root, &copy_providers, yes)?;
             let hook_targets = if want_hooks {
-                copy_provider_hooks(&sys, &tmp_dir, &root, &copy_providers, force, None, Some(&project_root)).map_err(Flow::Throw)?
+                copy_provider_hooks(&sys, &tmp_dir, &hook_root, &copy_providers, force, Some(&root), Some(&project_root)).map_err(Flow::Throw)?
             } else {
                 Vec::new()
             };
@@ -899,10 +920,10 @@ fn update(flags: &[String], io: &mut Io) -> R<()> {
         bundle::copy_provider_commands(&sys, &tmp_dir, &root, &copy_providers, scope);
         // Repair any stale pre-launcher (`node .../hook.mjs`) manifest a v3
         // install left behind, regardless of hook consent (triage E8).
-        hook_manifest::repair_stale_hook_manifests(&sys, &root, &copy_providers, None).map_err(Flow::Throw)?;
-        let want_hooks = install_hooks && decide_hook_install(&mut prompt, io, &root, &providers, yes)?;
+        repair_update_hook_manifests(&sys, &hook_root, &root, &copy_providers).map_err(Flow::Throw)?;
+        let want_hooks = install_hooks && decide_hook_install(&mut prompt, io, &hook_root, &providers, yes)?;
         let hook_targets = if want_hooks {
-            copy_provider_hooks(&sys, &tmp_dir, &root, &providers, force, None, Some(&project_root)).map_err(Flow::Throw)?
+            copy_provider_hooks(&sys, &tmp_dir, &hook_root, &providers, force, Some(&root), Some(&project_root)).map_err(Flow::Throw)?
         } else {
             Vec::new()
         };

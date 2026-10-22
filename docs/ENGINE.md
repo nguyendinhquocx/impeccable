@@ -96,7 +96,8 @@ The same rules that run natively run in a page, compiled to WebAssembly.
    generated files. `crates/live/src/browser_assets.rs` embeds the bundle with
    `include_str!` and the live server hands it to the browser as `/detect.js`,
    so the binary has to carry it. `antipatterns.json` is the registry
-   (`[{ id, name, category, description }]`) that a consumer working from a
+   (`[{ id, name, category, description }]`, plus `severity` on a row that
+   declares one, such as `"advisory"`) that a consumer working from a
    source checkout or a repo tarball reads without a Rust toolchain, since
    `extension/detector/` is gitignored; impeccable.style counts and renders
    the rules from it.

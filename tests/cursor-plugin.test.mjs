@@ -61,12 +61,13 @@ describe('Cursor native plugin', () => {
     const relocated = path.join(root, 'installed plugin');
     fs.renameSync(output, relocated);
     const hooks = JSON.parse(fs.readFileSync(path.join(relocated, 'hooks/hooks.json')));
-    assert.deepEqual(Object.keys(hooks.hooks), ['preToolUse']);
-    const command = hooks.hooks.preToolUse[0].command.replaceAll('${CURSOR_PLUGIN_ROOT}', relocated);
+    assert.deepEqual(Object.keys(hooks.hooks), ['postToolUse']);
+    assert.equal(hooks.hooks.postToolUse[0].matcher, '^Write$');
+    const command = hooks.hooks.postToolUse[0].command.replaceAll('${CURSOR_PLUGIN_ROOT}', relocated);
     const result = spawnSync('sh', ['-c', command], { cwd: root, input: '{"tool_name":"Edit"}\n', encoding: 'utf8' });
     assert.equal(result.status, 2, result.stderr);
-    assert.equal(result.stdout, `${fs.realpathSync(root)}\nhook-before-edit\n{"tool_name":"Edit"}\n`);
-    assert.match(buildCursorHooksManifest().hooks.preToolUse[0].command, /\.cursor\/skills\/impeccable/);
+    assert.equal(result.stdout, `${fs.realpathSync(root)}\nhook\n{"tool_name":"Edit"}\n`);
+    assert.match(buildCursorHooksManifest().hooks.postToolUse[0].command, /\.cursor\/skills\/impeccable/);
   });
 
   it('does not add path prose to agents that do not use scripts', () => {

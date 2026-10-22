@@ -118,11 +118,12 @@ export const SUITES = {
     ],
   },
   detector: {
-    description: 'Extension packaging checks (the rule logic itself is covered by the crate tests and the oracle).',
+    description: 'Extension packaging and DevTools report checks (the rule logic itself is covered by the crate tests and the oracle).',
     triggers: [
       ...COMMON_INFRA_PATTERNS,
       /^extension\/(background|content|detector|devtools|offscreen|popup|shared|manifest\.json)/,
       /^scripts\/build-extension\.js$/,
+      /^tests\/extension-(build|devtools)\.test\.mjs$/,
       /^browser-bundle\//,
       // Everything `cargo xtask bundle` reads: the rules and the registry
       // rows (core, foundation), the wasm module (wasm), the assembly and the
@@ -137,7 +138,7 @@ export const SUITES = {
     commands: [
       {
         runner: 'node',
-        files: ['tests/extension-build.test.mjs'],
+        files: ['tests/extension-build.test.mjs', 'tests/extension-devtools.test.mjs'],
       },
     ],
   },
