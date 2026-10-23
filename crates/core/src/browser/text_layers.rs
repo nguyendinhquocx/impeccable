@@ -676,7 +676,11 @@ fn layers(dom: &dyn Dom, el: ElId, host: Option<ElId>, resolved: Option<Rgba>, s
     if points.is_empty() || points.len() * 2 < occlusion_grid_size(&rect) {
         // Below the fold no point is answered, but one layer can be read off
         // the tree: a loaded picture a later sibling lays over the text.
-        if rect.top >= vh && (covered_by_a_later_picture(dom, el) || covered_by_a_later_fill(dom, el)) {
+        if rect.top >= vh
+            && (covered_by_a_later_picture(dom, el)
+                || covered_by_a_later_fill(dom, el)
+                || covered_by_a_higher_sibling(dom, el))
+        {
             return TextLayers::Covered;
         }
         return TextLayers::Undecided;
@@ -862,6 +866,78 @@ fn covered_by_a_later_fill(dom: &dyn Dom, el: ElId) -> bool {
     false
 }
 
+/// The z-index `e` stacks at among its siblings: a number, on a box where
+/// it applies (positioned, or a flex or grid item). `None` otherwise.
+fn stack_z(dom: &dyn Dom, e: ElId) -> Option<f64> {
+    let z = dom.style(e, "zIndex");
+    let z = js::parse_float(&z).is_finite().then(|| js::parse_float(&z))?;
+    let positioned = !matches!(dom.style(e, "position").as_str(), "static" | "");
+    let item = dom.parent(e).is_some_and(|p| {
+        matches!(dom.style(p, "display").as_str(), "flex" | "grid" | "inline-flex" | "inline-grid")
+    });
+    (positioned || item).then_some(z)
+}
+
+/// Whether a sibling ranked above the text's layer lays an opaque fill over
+/// all of `el`'s text: apple.com's stacked gallery, five tab panels in one
+/// grid cell, the active one at `z-index: 2` with a white fill over panels
+/// 2 to 5 at 0; cursor.com's Slack demo window (z 10) under its CLI window
+/// (z 15). From the first ancestor-or-self of `el` (within
+/// [`FILL_COVER_MAX_DEPTH`]) whose z-index applies ([`stack_z`]), a sibling,
+/// earlier or later, at a strictly higher z-index, painted at capture, that
+/// holds a box passing [`fill_covers`] (the sibling's own z-index allowed,
+/// and the rank standing for the positioned layer) covers it. Equal ranks
+/// fall to document order, which [`covered_by_a_later_fill`] reads.
+fn covered_by_a_higher_sibling(dom: &dyn Dom, el: ElId) -> bool {
+    let text = dom
+        .direct_text_rect(el)
+        .filter(|r| r.all_finite() && r.width > 0.0 && r.height > 0.0)
+        .unwrap_or_else(|| dom.rect(el));
+    if !text.all_finite() || text.width <= 0.0 || text.height <= 0.0 {
+        return false;
+    }
+    let body = dom.body();
+    let mut held = el;
+    let mut ranked = None;
+    for _ in 0..FILL_COVER_MAX_DEPTH {
+        if Some(held) == body || dom.document_element() == Some(held) {
+            return false;
+        }
+        if let Some(z) = stack_z(dom, held) {
+            ranked = Some((held, z));
+            break;
+        }
+        let Some(parent) = dom.parent(held) else { return false };
+        held = parent;
+    }
+    let Some((held, z)) = ranked else { return false };
+    let Some(parent) = dom.parent(held) else { return false };
+    let z_auto = |e: ElId| matches!(dom.style(e, "zIndex").as_str(), "auto" | "");
+    let positioned = |e: ElId| !matches!(dom.style(e, "position").as_str(), "static" | "");
+    let opaque = |e: ElId| {
+        let o = js::parse_float(&dom.style(e, "opacity"));
+        o.is_finite() && o >= FILL_COVER_MIN_ALPHA
+    };
+    let mut read = 0usize;
+    for sib in dom.children(parent) {
+        if sib == held || !stack_z(dom, sib).is_some_and(|zs| zs > z) || !super::painted::painted_at_capture(dom, sib) {
+            continue;
+        }
+        let mut boxes = vec![sib];
+        boxes.extend(dom.query_all(Some(sib), "*").unwrap_or_default());
+        for fill in boxes {
+            read += 1;
+            if read > FILL_COVER_BUDGET {
+                return false;
+            }
+            if fill_covers_ranked(dom, fill, sib, &text, &z_auto, &positioned, &opaque, true) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// [`covered_by_a_later_fill`]'s test of one box `fill` inside `sib`.
 fn fill_covers(
     dom: &dyn Dom,
@@ -871,6 +947,23 @@ fn fill_covers(
     z_auto: &dyn Fn(ElId) -> bool,
     positioned: &dyn Fn(ElId) -> bool,
     opaque: &dyn Fn(ElId) -> bool,
+) -> bool {
+    fill_covers_ranked(dom, fill, sib, text, z_auto, positioned, opaque, false)
+}
+
+/// [`fill_covers`], where `ranked` says `sib` stacks above the text by its
+/// own z-index ([`covered_by_a_higher_sibling`]): its z-index is allowed,
+/// and its rank stands for the positioned layer.
+#[allow(clippy::too_many_arguments)]
+fn fill_covers_ranked(
+    dom: &dyn Dom,
+    fill: ElId,
+    sib: ElId,
+    text: &crate::browser::Rect,
+    z_auto: &dyn Fn(ElId) -> bool,
+    positioned: &dyn Fn(ElId) -> bool,
+    opaque: &dyn Fn(ElId) -> bool,
+    ranked: bool,
 ) -> bool {
     let Some(bg) = parse_rgb_or_any(&dom.style(fill, "backgroundColor")) else {
         return false;
@@ -890,7 +983,7 @@ fn fill_covers(
     if super::page_checks::drawn_tilted(dom, fill) {
         return false;
     }
-    let mut layered = false;
+    let mut layered = ranked;
     // The fill's alpha times every opacity up to the sibling: ten boxes at
     // 0.96 each let 0.34 of the text through between them.
     let mut alpha = bg.alpha_or_one();
@@ -900,7 +993,7 @@ fn fill_covers(
         // under it: a white card at `multiply` leaves it all.
         let blend = dom.style(c, "mixBlendMode");
         let filter = dom.style(c, "filter");
-        if !z_auto(c)
+        if !(z_auto(c) || (ranked && c == sib))
             || !opaque(c)
             || masked_or_clipped(dom, c)
             || !matches!(blend.as_str(), "normal" | "")

@@ -231,6 +231,20 @@ pub trait Dom {
         None
     }
 
+    /// Where the last two words of the element's rendered text sit: the
+    /// rect of the word before the last, then the last word's, each the last
+    /// of the word's client rects (a word hyphenated across two lines ends on
+    /// the lower one). The text is the one `text_line_rects` measures, split
+    /// on white space with soft hyphens and zero-width spaces dropped.
+    ///
+    /// `None` from a DOM that did not measure them: a snapshot records them
+    /// only for the prose blocks `straggler` reads, and only from a capture
+    /// that knew to. A caller stands down there rather than guess where the
+    /// words broke.
+    fn last_word_rects(&self, _el: ElId) -> Option<[Rect; 2]> {
+        None
+    }
+
     /// The CSS properties (`opacity`, `filter`, hyphenated as the CSSOM
     /// spells them) of every animation and transition running on the element
     /// itself at capture: `document.getAnimations()` entries whose effect

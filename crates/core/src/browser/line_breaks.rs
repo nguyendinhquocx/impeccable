@@ -13,8 +13,8 @@
 //! Both are advisory. An uneven break can be the design: a headline that
 //! lands on one word for weight, a poster line, a pull quote.
 
-use super::dom::{renders_no_text, tag_lower, Dom, DomChild, ElId};
-use super::quality::{is_atomic_inline, is_visually_hidden, rendered_text_len, COMBINING_OR_FORMAT_RE};
+use super::dom::{renders_no_text, tag_lower, Dom, DomChild, ElId, Rect};
+use super::quality::{is_atomic_inline, is_visually_hidden, rendered_text_len};
 use super::text_geometry::{holds_only_phrasing, phrasing_holds_break};
 use crate::checks::rules::{is_heading_tag, RuleHit};
 use crate::checks::text_rules::is_cjk_text;
@@ -52,6 +52,10 @@ const HEADING_MIN_COLUMN_CHARS: f64 = 20.0;
 /// and `pretty` move words between lines, and two words have nowhere to go.
 const MIN_WORDS: usize = 3;
 
+/// How far up from a block [`lines_run_past_a_clip`] looks for the box
+/// that clips its lines, as the tight-leading floor looks for a line clamp.
+const CLIP_SEARCH_DEPTH: usize = 4;
+
 /// The widths of the lines `el`'s text rendered on, top to bottom.
 ///
 /// `None` when the lines do not stack in one column. Lines come back sorted
@@ -65,6 +69,9 @@ fn line_widths(dom: &dyn Dom, el: ElId) -> Option<Vec<f64>> {
         .into_iter()
         .filter(|r| r.width > 0.0 && r.height > 0.0)
         .collect();
+    if lines_run_past_a_clip(dom, el, &rects) {
+        return None;
+    }
     let widest = rects.iter().copied().reduce(|a, b| if b.width > a.width { b } else { a });
     if let Some(w) = widest {
         if rects.iter().any(|r| r.right <= w.left || r.left >= w.right) {
@@ -131,6 +138,45 @@ fn push_rendered_text(dom: &dyn Dom, el: ElId, out: &mut String) {
     }
 }
 
+/// Whether `el`'s lines run past a box that clips them: a `-webkit-line-clamp`
+/// box (vercel.com's `p.line-clamp-2`, impeccable.style's release summaries)
+/// or one whose `overflow` clips on y, on `el` or within
+/// [`CLIP_SEARCH_DEPTH`] ancestors. Chromium lays out the lines a clamp
+/// hides below the box, and `Dom::text_line_rects` still returns them, so
+/// the last line measured is not the last line shown. A line whose middle
+/// lies below a clamp's content edge, or below an overflow clip's padding
+/// edge, is hidden. Clips that hide nothing
+/// leave the lines as they are.
+fn lines_run_past_a_clip(dom: &dyn Dom, el: ElId, lines: &[super::dom::Rect]) -> bool {
+    let Some(lowest) = lines.iter().map(|r| r.top + r.height / 2.0).reduce(f64::max) else {
+        return false;
+    };
+    let mut cur = Some(el);
+    for _ in 0..=CLIP_SEARCH_DEPTH {
+        let Some(c) = cur else { break };
+        let clamp = crate::checks::text_rules::is_line_clamp(&dom.style(c, "display"), &dom.style(c, "webkitLineClamp"));
+        let clips = |k: &str| matches!(dom.style(c, k).as_str(), "hidden" | "clip");
+        if clamp || clips("overflowY") || clips("overflow") {
+            let r = dom.rect(c);
+            let px = |k: &str| {
+                let v = js::parse_float(&dom.style(c, k));
+                if v.is_finite() { v } else { 0.0 }
+            };
+            // A clamp hides the lines past its count, so its content edge is
+            // the last line shown; overflow clips at the padding edge, and
+            // text set in the padding (a caption on a padding-hack ratio
+            // card) is in view.
+            let padding = if clamp { px("paddingBottom") } else { 0.0 };
+            let bottom = r.bottom - px("borderBottomWidth") - padding;
+            if bottom.is_finite() && lowest > bottom {
+                return true;
+            }
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+
 /// Whether any of the text `el` sets on its lines does not paint: text in a
 /// box whose computed `visibility` is `hidden` or `collapse`. Such text still
 /// takes its room on a line box, so `Dom::text_line_rects` measures it and
@@ -157,12 +203,13 @@ fn words(dom: &dyn Dom, el: ElId) -> Vec<String> {
         .collect()
 }
 
-/// The characters of `word` that take up room on a line, counted as
-/// `rendered_text_len` counts them: one per character, combining marks and
-/// format characters left out. An emoji is one, not two UTF-16 units.
-fn advancing_len(word: &str) -> f64 {
-    let mut buf = [0u8; 4];
-    word.chars().filter(|c| !COMBINING_OR_FORMAT_RE.is_match(c.encode_utf8(&mut buf))).count() as f64
+/// Whether two rects sit on one row: they overlap by more than half the
+/// shorter one's height, the test `merge_text_rects_into_lines` joins
+/// fragments into a line by.
+fn share_a_row(a: Rect, b: Rect) -> bool {
+    let overlap = a.bottom.min(b.bottom) - a.top.max(b.top);
+    let shorter = a.height.min(b.height);
+    shorter > 0.0 && overlap > shorter / 2.0
 }
 
 /// Characters per pixel of `el`'s lines: the rendered characters
@@ -175,10 +222,10 @@ fn chars_per_px(dom: &dyn Dom, el: ElId, widths: &[f64]) -> Option<f64> {
 
 /// `straggler`: one word alone on the last line of a multi-line paragraph.
 ///
-/// The lines are measured; the words on them are not. The characters divide
-/// between the lines in proportion to their widths, as `line-length` divides
-/// them, and the last line holds one word when its share of the characters
-/// is nearer the last word's length than the last two words'.
+/// The lines and the last two words are both measured: the last word is
+/// alone when the word before it ended on another row. A count of the
+/// characters on the last line could not say so: narrow letters fit two
+/// words in the room the estimate gave one.
 fn check_straggler(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
     if wraps_with(dom, el, "pretty") || breaks_are_authored(dom, el) {
         return None;
@@ -204,12 +251,11 @@ fn check_straggler(dom: &dyn Dom, el: ElId) -> Option<RuleHit> {
     if widest * chars_per_px < STRAGGLER_MIN_COLUMN_CHARS {
         return None;
     }
-    let word = &words[words.len() - 1];
-    let one = advancing_len(word);
-    let two = one + 1.0 + advancing_len(&words[words.len() - 2]);
-    if last * chars_per_px >= (one + two) / 2.0 {
+    let [before, last_word] = dom.last_word_rects(el)?;
+    if share_a_row(before, last_word) {
         return None;
     }
+    let word = &words[words.len() - 1];
     Some(RuleHit::new(
         "straggler",
         format!(
@@ -282,6 +328,10 @@ mod tests {
         let rects: Vec<(f64, f64, f64, f64)> =
             lines.iter().enumerate().map(|(i, w)| (0.0, 100.0 + 24.0 * i as f64, *w, 19.0)).collect();
         d.set_text_lines(el, &rects);
+        // The last word alone: the word before it ends the line above.
+        if let [.., (_, above, w_above, _), (_, y, w, h)] = rects[..] {
+            d.set_last_words(el, (w_above - 40.0, above, 40.0, h), (0.0, y, w, h));
+        }
         el
     }
 
@@ -312,6 +362,35 @@ mod tests {
         assert_eq!(hits[0].snippet, "\"text.\" alone on the last of 3 lines (7% of the measure)");
     }
 
+    /// vercel.com's template cards: `-webkit-line-clamp: 2` on a paragraph
+    /// whose third line Chromium lays out below the box. The visitor reads
+    /// two lines ending in an ellipsis, not a lone last word. Twin: the same
+    /// paragraph unclamped, and a clamp that hides nothing, still report.
+    #[test]
+    fn lines_a_clamp_hides_are_not_judged() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let clamped = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        d.set_styles(clamped, &[("display", "-webkit-box"), ("webkitLineClamp", "2"), ("overflow", "hidden")]);
+        d.set_rect(clamped, 0.0, 100.0, 600.0, 48.0);
+        assert!(ids(&d, clamped).is_empty());
+        // In a clipping wrapper two levels up.
+        let card = d.add(Some(body), "div");
+        d.set_styles(card, &[("overflowY", "hidden"), ("paddingBottom", "0px"), ("borderBottomWidth", "0px")]);
+        d.set_rect(card, 0.0, 100.0, 600.0, 48.0);
+        let inner = d.add(Some(card), "div");
+        let wrapped = block(&mut d, inner, "p", PROSE, &[560.0, 560.0, 40.0]);
+        assert!(ids(&d, wrapped).is_empty());
+
+        let free = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        d.set_rect(free, 0.0, 100.0, 600.0, 72.0);
+        assert_eq!(ids(&d, free), vec!["straggler"]);
+        let roomy = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        d.set_styles(roomy, &[("display", "-webkit-box"), ("webkitLineClamp", "3"), ("overflow", "hidden")]);
+        d.set_rect(roomy, 0.0, 100.0, 600.0, 72.0);
+        assert_eq!(ids(&d, roomy), vec!["straggler"], "a clamp of three shows all three lines");
+    }
+
     /// A soft hyphen paints nothing, so the snippet names the word a reader
     /// sees.
     #[test]
@@ -332,6 +411,44 @@ mod tests {
         let mut d = FakeDom::new();
         let (_h, body) = d.with_page();
         let p = block(&mut d, body, "p", PROSE, &[560.0, 510.0, 80.0]);
+        d.set_last_words(p, (0.0, 148.0, 38.0, 19.0), (42.0, 148.0, 38.0, 19.0));
+        assert!(ids(&d, p).is_empty());
+    }
+
+    /// Issue #1073: in 16px Arial at 711px, "it fills." set on the last
+    /// line in 6% of the measure, which a count of its characters read as
+    /// "fills." alone. Measured, the two words share the row.
+    #[test]
+    fn narrow_letters_on_a_short_last_line_are_two_words() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let text = PROSE.replace("under the text.", "under the line it fills.");
+        let p = block(&mut d, body, "p", &text, &[700.0, 42.0]);
+        d.set_last_words(p, (0.0, 124.0, 9.0, 19.0), (13.0, 124.0, 29.0, 19.0));
+        assert!(ids(&d, p).is_empty());
+    }
+
+    /// A word hyphenated across the last break ends on the last line, its
+    /// tail alone there; its last rect is the one the rule reads.
+    #[test]
+    fn a_word_hyphenated_onto_the_last_line_is_a_straggler() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let text = PROSE.replace("text.", "re\u{AD}turn.");
+        let p = block(&mut d, body, "p", &text, &[560.0, 560.0, 30.0]);
+        // "the" ends line two; "re-" ends it too, and "turn." starts line three.
+        d.set_last_words(p, (500.0, 124.0, 24.0, 19.0), (0.0, 148.0, 30.0, 19.0));
+        assert_eq!(ids(&d, p), ["straggler"]);
+    }
+
+    /// A DOM that did not measure the last two words gets no finding: the
+    /// rule does not fall back on guessing where they broke.
+    #[test]
+    fn no_last_word_rects_no_finding() {
+        let mut d = FakeDom::new();
+        let (_h, body) = d.with_page();
+        let p = block(&mut d, body, "p", PROSE, &[560.0, 560.0, 40.0]);
+        d.el_mut(p).last_word_rects = None;
         assert!(ids(&d, p).is_empty());
     }
 
@@ -564,15 +681,6 @@ mod tests {
         let p = block(&mut d, body, "p", &text, &[560.0, 560.0, 560.0, 560.0, 560.0, 560.0, 560.0, 40.0]);
         d.set_style(p, "textWrapStyle", "balance");
         assert_eq!(ids(&d, p), vec!["straggler"]);
-    }
-
-    /// The word is counted the way the line is: an emoji advances once, not
-    /// as its two UTF-16 units, so a short word plus an emoji tail is two
-    /// words and not one long one.
-    #[test]
-    fn the_word_and_the_line_are_counted_alike() {
-        assert_eq!(advancing_len("go\u{1F680}"), 3.0);
-        assert_eq!(advancing_len("e\u{301}te\u{301}"), 3.0);
     }
 }
 

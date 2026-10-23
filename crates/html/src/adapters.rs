@@ -1136,6 +1136,7 @@ pub fn check_element_colors(
         bg_source,
         bg_source_host,
         same_color_surface_is_unread: true,
+        ink_unread: false,
     };
     // The page's one report of a colour pair goes to an element that will
     // actually print it, so an inline ignore on the first of fifty links

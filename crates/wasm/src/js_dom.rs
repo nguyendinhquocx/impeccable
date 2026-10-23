@@ -70,6 +70,7 @@ extern "C" {
     fn direct_text_rect(el: u32) -> Vec<f64>;
     fn running_animation_properties(el: u32) -> Option<String>;
     fn text_rects(el: u32) -> Vec<f64>;
+    fn last_word_rects(el: u32) -> Vec<f64>;
 }
 
 fn opt(id: u32) -> Option<ElId> {
@@ -426,5 +427,11 @@ impl Dom for JsDom {
         Some(merge_text_rects_into_lines(
             text_rects(el).chunks_exact(8).map(to_rect).collect(),
         ))
+    }
+    /// Two rects in eights, as `text_rects` lays them out; anything else is a
+    /// block with fewer than two words.
+    fn last_word_rects(&self, el: ElId) -> Option<[Rect; 2]> {
+        let v = last_word_rects(el);
+        (v.len() == 16).then(|| [to_rect(&v[..8]), to_rect(&v[8..])])
     }
 }

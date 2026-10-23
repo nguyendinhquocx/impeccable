@@ -254,6 +254,56 @@ test('cmd launcher forwards engine exit code through cmd /c', { skip: WINDOWS ? 
   }
 });
 
+for (const [probeStatus, trusted] of [[0, true], [1, false]]) {
+  test(`sh launcher ${trusted ? 'runs' : 'skips'} a home binary whose engine-probe exits ${probeStatus}`, { skip: WINDOWS ? 'POSIX launcher probe' : false }, async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'impeccable-launcher-probe-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const scripts = path.join(root, 'scripts');
+    const home = path.join(root, 'home');
+    const homeBin = path.join(home, '.impeccable', 'bin');
+    fs.mkdirSync(scripts);
+    fs.mkdirSync(homeBin, { recursive: true });
+    fs.writeFileSync(path.join(scripts, 'VERSION'), '0.0.0-test\n');
+    const launcher = path.join(scripts, 'impeccable');
+    fs.copyFileSync(path.join(ROOT, 'skill/scripts/impeccable'), launcher);
+    // Prints the handshake marker either way; only the exit status differs.
+    fs.writeFileSync(path.join(homeBin, 'impeccable'),
+      `#!/bin/sh\nif [ "$1" = engine-probe ]; then echo impeccable-engine 0.0.0-test; exit ${probeStatus}; fi\necho home-engine-ran\n`,
+      { mode: 0o755 });
+    const requests = [];
+    const server = http.createServer((req, res) => {
+      requests.push(req.url);
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => new Promise(resolve => server.close(resolve)));
+    const env = {
+      PATH: '/usr/bin:/bin',
+      HOME: home,
+      IMPECCABLE_HOME: path.join(root, 'cache'),
+      IMPECCABLE_DOWNLOAD_BASE: `http://127.0.0.1:${server.address().port}`,
+    };
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn('/bin/sh', [launcher, 'detect'], { env, cwd: root, timeout: 20000 });
+      let stdout = '';
+      child.stdout.on('data', data => { stdout += data; });
+      child.on('error', reject);
+      child.on('close', (status, signal) => resolve({ status, signal, stdout }));
+    });
+    assert.equal(result.signal, null, JSON.stringify(result));
+    if (trusted) {
+      assert.equal(result.status, 0, JSON.stringify(result));
+      assert.match(result.stdout, /home-engine-ran/);
+      assert.equal(requests.length, 0, 'a trusted home binary needs no download');
+    } else {
+      assert.equal(result.status, 127, JSON.stringify(result));
+      assert.doesNotMatch(result.stdout, /home-engine-ran/);
+      assert.equal(requests.length, 1, 'a failed probe falls through to the pinned download');
+    }
+  });
+}
+
 for (const scenario of ['removed', 'emptied', 'empty-download', 'no-sidecar', 'empty-sidecar', 'mismatch', 'hash-failure', 'removed-during-hash', 'removed-before-move', 'removed-after-move', 'emptied-after-move', 'move-failure']) {
   test(`launcher refuses ${scenario} with an accurate diagnostic`, async t => {
     const result = await exercise(t, scenario);

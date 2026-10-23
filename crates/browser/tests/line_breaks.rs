@@ -74,7 +74,15 @@ fn the_line_break_rules_read_the_rendered_lines() {
     assert_cases(
         &stragglers,
         "straggler",
-        &["flag-paragraph", "flag-list-item", "flag-quote", "flag-caption", "flag-inline"],
+        &[
+            "flag-paragraph",
+            "flag-list-item",
+            "flag-quote",
+            "flag-caption",
+            "flag-inline",
+            "flag-centered",
+            "flag-right",
+        ],
         &[
             "pass-pretty",
             "pass-balance",
@@ -83,6 +91,7 @@ fn the_line_break_rules_read_the_rendered_lines() {
             "pass-narrow",
             "pass-break",
             "pass-inline-icon",
+            "pass-narrow-letters",
             "pass-one-line",
         ],
     );

@@ -841,13 +841,20 @@ pub fn check_colors(opts: &ColorOpts) -> Vec<RuleHit> {
     if opts.has_direct_text && opts.text_color.is_some() && !opts.is_emoji_only {
         let text_color = opts.text_color.unwrap();
         // Gradient-clipped text paints the gradient, not `color`, so there
-        // is no background to score it against. Text with no letter and no
+        // is no background to score it against: `text`, or one `text` per
+        // layer (stripe.com's stats compute `text, text` under two gradients,
+        // and white was scored against the gradient they paint,
+        // observations-craft-1009 row 6). Where the adapter says the glyphs
+        // paint no colour of their own (`ink_unread`: a transparent fill, or
+        // an ancestor's background clipped to the text), the same holds.
+        // Text with no letter and no
         // digit (a lone circle, a pair of braces) is not read, which the
         // SAFE_TAGS path already says through `paints_own_text`.
         // A surface in exactly the text's own colour is the walk landing on
         // a fill the text does not sit on, the same guard the SAFE_TAGS path
         // applies (`resolved_bg_matches_text`).
-        if bg_clip != "text"
+        if !background_clips_to_text(bg_clip)
+            && !opts.ink_unread
             && !opts.is_glyph_only
             && !(opts.same_color_surface_is_unread && resolved_bg_matches_text(opts, &text_color))
         {
@@ -1067,7 +1074,7 @@ fn safe_tag_text_contrast(opts: &ColorOpts) -> Vec<RuleHit> {
         return Vec::new();
     }
     // Gradient-clipped text paints the gradient, not `color`.
-    if opts.bg_clip.as_deref() == Some("text") {
+    if opts.bg_clip.as_deref().is_some_and(background_clips_to_text) {
         return Vec::new();
     }
     let Some(text_color) = opts.text_color else {
@@ -2956,6 +2963,39 @@ mod tests {
         // layout to say: no verdict.
         assert!(!flags(&opts(true, true)));
         assert!(!flags(&opts(false, false)));
+    }
+
+    /// stripe.com's stats: white `h4`s under two gradients clipped to the
+    /// text compute `background-clip: text, text`. Clipped on every layer,
+    /// the gradient paints the glyphs and white is not scored against it, on
+    /// either path; gradient-text still reads the gradient. A stack that
+    /// clips one layer to a box paints that layer as a fill and is scored.
+    #[test]
+    fn a_text_clip_on_every_layer_takes_no_contrast_verdict() {
+        let white = Rgba::new(255.0, 255.0, 255.0, 1.0);
+        let pale = Rgba::new(216.0, 221.0, 245.0, 1.0);
+        let image = "linear-gradient(90deg, rgb(255, 120, 60), rgb(255, 80, 160)), linear-gradient(rgb(216, 221, 245), rgb(172, 167, 251))";
+        let opts = |tag: &str, clip: &str| ColorOpts {
+            tag: tag.to_string(),
+            text_color: Some(white),
+            effective_bg: Some(pale),
+            font_size: 40.0,
+            font_weight: 600.0,
+            has_direct_text: true,
+            paints_own_text: true,
+            detector_is_browser: true,
+            bg_clip: Some(clip.to_string()),
+            bg_image: Some(image.to_string()),
+            ..Default::default()
+        };
+        let low = |o: &ColorOpts| check_colors(o).iter().any(|h| h.id == "low-contrast");
+        assert!(!low(&opts("h4", "text, text")));
+        assert!(!low(&opts("span", "text, text")));
+        assert!(low(&opts("h4", "text, border-box")));
+        // Glyphs whose fill the adapter says is transparent take none either.
+        let unread = ColorOpts { bg_clip: Some("border-box".into()), ink_unread: true, ..opts("em", "") };
+        assert!(!low(&unread));
+        assert!(low(&ColorOpts { ink_unread: false, ..unread }));
     }
 
     #[test]

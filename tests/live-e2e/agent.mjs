@@ -856,7 +856,18 @@ async function writeWatchedSourceFile(fullPath, body, { moduleUrl = null } = {})
   }
   const previous = await fs.readFile(fullPath, 'utf-8').catch(() => null);
   const servedBefore = moduleUrl && previous !== body ? await fetchServedModule(moduleUrl) : null;
-  await fs.writeFile(fullPath, body, 'utf-8');
+  // Publish atomically: a direct write briefly exposes a truncated file that
+  // the dev server can read mid-Apply and answer with a full reload. The temp
+  // file sits beside the target so the rename stays on one filesystem, and
+  // its `.tmp` extension is no source module any framework resolves.
+  const temporaryPath = `${fullPath}.impeccable-manual-apply-${process.pid}.tmp`;
+  try {
+    await fs.writeFile(temporaryPath, body, 'utf-8');
+    await fs.rename(temporaryPath, fullPath);
+  } catch (err) {
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    throw err;
+  }
   if (servedBefore !== null) {
     const deadline = Date.now() + DEV_MODULE_OBSERVE_TIMEOUT_MS;
     while (Date.now() < deadline) {

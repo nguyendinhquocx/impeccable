@@ -262,7 +262,15 @@ re!(
 
 /// JS: checks.mjs#scanCssTextForGridBackground
 pub fn scan_css_text_for_grid_background(content: &str) -> Vec<IndexedHit> {
-    for blk in GRID_BLOCK_RE.captures_iter(content) {
+    grid_background_hits(content).take(1).collect()
+}
+
+/// Every block of `content` that paints a two-axis grid-line background, in
+/// source order, read lazily: [`scan_css_text_for_grid_background`] keeps
+/// the first, and a walk that picks the first candidate the page shows
+/// reads on only past one it passes over.
+pub fn grid_background_hits(content: &str) -> impl Iterator<Item = IndexedHit> + '_ {
+    GRID_BLOCK_RE.captures_iter(content).filter_map(|blk| {
         let block = blk
             .get(1)
             .or_else(|| blk.get(2))
@@ -282,20 +290,17 @@ pub fn scan_css_text_for_grid_background(content: &str) -> Vec<IndexedHit> {
             bg_joined.push(';');
         }
         if hairline_count == 0 {
-            continue;
+            return None;
         }
         let has_px_cell =
             SIZE_DECL_PX_RE.is_match(block) || SHORTHAND_PX_ANY_RE.is_match(&bg_joined);
         // A single hairline is a line, divider, or rail, not a grid, even
         // when tiled by a 2D px cell (issue #615).
-        if hairline_count >= 2 && has_px_cell {
-            return vec![IndexedHit {
-                index: blk.get(0).unwrap().start(),
-                snippet: "two-axis grid-line gradient background".to_string(),
-            }];
-        }
-    }
-    Vec::new()
+        (hairline_count >= 2 && has_px_cell).then(|| IndexedHit {
+            index: blk.get(0).unwrap().start(),
+            snippet: "two-axis grid-line gradient background".to_string(),
+        })
+    })
 }
 
 // ─── scanCssTextForRadialHalo ───────────────────────────────────────────────
@@ -2393,6 +2398,41 @@ fn sample_arc(
         .collect()
 }
 
+/// The vertex count of a `polygon()` body (the text between its
+/// parentheses) that approximates an organic contour, the shape the
+/// organic-clip-path rule reports: at least [`ORGANIC_POLYGON_MIN_VERTICES`]
+/// comma-separated points (a leading fill rule counts as one, as the rule
+/// has always counted it), every coordinate off a 25% grid on average, and
+/// neither rectilinear nor a zigzag. `None` otherwise.
+pub(crate) fn organic_polygon_vertices(body: &str) -> Option<usize> {
+    let points: Vec<&str> = body
+        .split(',')
+        .map(js::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if points.len() < ORGANIC_POLYGON_MIN_VERTICES {
+        return None;
+    }
+    // Vertices sitting on a coarse grid (multiples of 25%) are geometric;
+    // a contour has arbitrary values.
+    let mut off_grid = 0usize;
+    for p in &points {
+        for n in SIGNED_NUM_RE.find_iter(p) {
+            let v = parse_float(n.as_str());
+            if (v - js::math_round(v / 25.0) * 25.0).abs() > 0.5 {
+                off_grid += 1;
+            }
+        }
+    }
+    if off_grid < points.len() {
+        return None;
+    }
+    if polygon_is_rectilinear(body) || polygon_is_zigzag(body) {
+        return None;
+    }
+    Some(points.len())
+}
+
 /// JS: checks.mjs#scanCssTextForOrganicClipPath
 ///
 /// The same declaration repeated (one inline style per button) reports once
@@ -2425,36 +2465,14 @@ pub fn scan_css_text_for_organic_clip_path(style_text: &str) -> Vec<PatternFindi
             });
             continue;
         }
-        let points: Vec<&str> = body
-            .split(',')
-            .map(js::trim)
-            .filter(|p| !p.is_empty())
-            .collect();
-        if points.len() < ORGANIC_POLYGON_MIN_VERTICES {
+        let Some(vertices) = organic_polygon_vertices(body) else {
             continue;
-        }
-        // Vertices sitting on a coarse grid (multiples of 25%) are geometric;
-        // a contour has arbitrary values.
-        let mut off_grid = 0usize;
-        for p in &points {
-            for n in SIGNED_NUM_RE.find_iter(p) {
-                let v = parse_float(n.as_str());
-                if (v - js::math_round(v / 25.0) * 25.0).abs() > 0.5 {
-                    off_grid += 1;
-                }
-            }
-        }
-        if off_grid < points.len() {
-            continue;
-        }
-        if polygon_is_rectilinear(body) || polygon_is_zigzag(body) {
-            continue;
-        }
+        };
         push(&mut findings, PatternFinding {
             id: "organic-clip-path".to_string(),
             snippet: format!(
                 "clip-path: polygon() with {} vertices approximating an organic contour",
-                points.len()
+                vertices
             ),
             selector: enclosing_css_selector(style_text, index),
             index: None,
@@ -3231,6 +3249,20 @@ mod tests {
                 "{text:?} @ {idx}"
             );
         }
+        // #1076: a quoted brace or semicolon in an at-rule's header does
+        // not cut the header short, so the rule inside keeps its selector.
+        for text in [
+            "@supports (content: \"}\") { .b { c: d } }",
+            "@supports (content: \"{\") { .b { c: d } }",
+            "@supports (content: \"a;b\") { .b { c: d } }",
+            "@media (x) { @supports (content: 'x;y') { .b { c: d } } }",
+        ] {
+            let idx = text.find("c: d").unwrap();
+            assert_eq!(enclosing_css_selector(text, idx).as_deref(), Some(".b"), "{text:?}");
+        }
+        // A quoted semicolon still ends nothing in a rule nested in a style rule.
+        let nested = ".card { content: \"a;b\"; @media (x) { .s { c: d } } }";
+        assert_eq!(enclosing_css_selector(nested, nested.find("c: d").unwrap()), None);
     }
 
     #[test]

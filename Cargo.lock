@@ -717,6 +717,7 @@ dependencies = [
  "impeccable-context",
  "impeccable-core",
  "impeccable-hook",
+ "markup5ever",
  "once_cell",
  "regex",
  "serde",

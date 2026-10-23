@@ -40,6 +40,12 @@
 
       <h2>Flag: a straggler in a paragraph with inline links</h2>
       <p class="copy flag-inline" style="width: 36.5ch">Read the full <a href="#changelog">changelog</a> for every fix in this release, and the <em>migration notes</em> for the two breaking changes.</p>
+
+      <h2>Flag: a centered paragraph whose last word wraps alone</h2>
+      <p class="copy flag-centered" style="width: 39.5ch; text-align: center">Line breaks decide how a block of text sits on the page, and one word alone on the last line leaves a hole under the text.</p>
+
+      <h2>Flag: a right-aligned paragraph whose last word wraps alone</h2>
+      <p class="copy flag-right" style="width: 39.5ch; text-align: right">Line breaks decide how a block of text sits on the page, and one word alone on the last line leaves a hole under the text.</p>
     </div>
 
     <div class="col" data-col="pass">
@@ -69,6 +75,17 @@
       <p class="copy pass-one-line" style="width: 39.5ch">One line of copy, short of the column.</p>
     </div>
 
+  </div>
+
+  <div class="col" data-col="pass">
+    <!-- Issue #1073: narrow letters fooled a count of the last line's
+         characters into reading "it fills." as one word (16px Verdana at
+         840px, mid-band of the widths where it misfired). The no-break
+         space keeps the two words on one line in any face, so the row
+         passes on a machine without Verdana too. It sits under the grid:
+         at 840px it would widen the pass column and wrap the flag headings. -->
+    <h2>Pass: two narrow words on a short last line</h2>
+    <p class="pass-narrow-letters" style="width: 840px; font: 16px/1.6 Verdana, sans-serif; margin: 0">Every room has a shape of its own, and the furniture in it slowly bends toward whatever open space it&nbsp;fills.</p>
   </div>
 </body>
 </html>

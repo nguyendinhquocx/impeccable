@@ -163,10 +163,13 @@ fn shown_opacity(dom: &dyn Dom, el: ElId) -> f64 {
 }
 
 /// The names the site goes by: its host name run together and without its
-/// top-level label (`screen.movie` gives `screenmovie` and `screen`), its
-/// `og:site_name` or `application-name`, its title, and the title's first
-/// and last parts between separators (`Incredible · AI that does tasks`
-/// gives `Incredible`).
+/// top-level label (`screen.movie` gives `screenmovie` and `screen`), and
+/// its `og:site_name` or `application-name`. Where neither meta names it,
+/// the title: whole when it has one part, and otherwise only the parts
+/// between separators that the host name holds (`Incredible · AI that does
+/// tasks` on incredible.ai gives `Incredible`). The other parts name a page
+/// or a section (`Pricing | Acme`), and a faint display heading that
+/// repeats one is not the site's wordmark.
 fn site_names(dom: &dyn Dom) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let host = js::to_lower_case(&dom.hostname());
@@ -178,29 +181,44 @@ fn site_names(dom: &dyn Dom) -> Vec<String> {
             names.push(labels[..labels.len() - 1].concat());
         }
     }
+    let mut declared = false;
     for selector in ["meta[property=\"og:site_name\"]", "meta[name=\"application-name\"]"] {
         for meta in dom.query_all(None, selector).unwrap_or_default() {
-            if let Some(content) = dom.attr(meta, "content") {
+            if let Some(content) = dom.attr(meta, "content").filter(|c| !js::trim(c).is_empty()) {
                 names.push(content);
+                declared = true;
             }
         }
     }
+    if declared {
+        return names;
+    }
     if let Some(title) = dom.query_one(None, "title").ok().flatten() {
         let title = collapsed_text(dom, title);
-        // The site's name opens or closes a title (`Incredible · AI that
-        // does tasks`, `Pricing | Acme`); a part in the middle is a page or
-        // section name. A hyphen joins words (`e-commerce`) and separates
-        // nothing here.
+        // A hyphen joins words (`e-commerce`) and separates nothing here.
         let parts: Vec<String> = title
             .split(['|', '·', '•', '—', '–', ':'])
             .map(|part| js::trim(part).to_string())
             .filter(|part| !part.is_empty())
             .collect();
         if parts.len() > 1 {
-            names.push(parts[0].clone());
-            names.push(parts[parts.len() - 1].clone());
+            let run = |text: &str| -> String {
+                text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+            };
+            // The host read the same way, without its top-level label:
+            // `get-acme-studio.com` holds `Acme Studio`, and a part that only
+            // repeats the TLD (`Studio` on acme.studio) names nothing.
+            let site_labels = if labels.len() > 1 { &labels[..labels.len() - 1] } else { &labels[..] };
+            let host_run = run(&site_labels.concat());
+            for part in parts {
+                let joined = run(&part);
+                if joined.chars().count() >= 3 && host_run.contains(&joined) {
+                    names.push(part);
+                }
+            }
+        } else {
+            names.push(title);
         }
-        names.push(title);
     }
     names
 }
@@ -380,6 +398,46 @@ mod tests {
         d.add_text(other, "Tasks");
         d.set_styles(other, &[("fontSize", "272.102px"), ("color", "rgb(255, 255, 255)")]);
         assert_eq!(decorative_text_shape_dom(&d, other), None);
+    }
+
+    /// #1076: a faint display heading that repeats the page's part of the
+    /// title (a 120px "Pricing" on "Pricing | Acme") is a page name, not
+    /// the site's wordmark. Only the part the host name or an explicit
+    /// site name corroborates names the site.
+    #[test]
+    fn a_title_part_names_the_site_only_where_something_backs_it() {
+        let build = |host: &str, site_name: Option<&str>, title_text: &str, text: &str| {
+            let mut d = FakeDom::new();
+            let (html, body) = d.with_page();
+            d.hostname = host.into();
+            let head = d.add(Some(html), "head");
+            let title = d.add(Some(head), "title");
+            d.add_text(title, title_text);
+            if let Some(name) = site_name {
+                let meta = d.add(Some(head), "meta");
+                d.add_selector(meta, "meta[property=\"og:site_name\"]");
+                d.set_attr(meta, "property", "og:site_name");
+                d.set_attr(meta, "content", name);
+            }
+            let mark = d.add(Some(body), "span");
+            d.add_text(mark, text);
+            d.set_styles(mark, &[("fontSize", "160px"), ("color", "rgba(0, 0, 0, 0.1)")]);
+            d.set_rect(mark, 0.0, 400.0, 900.0, 160.0);
+            decorative_text_shape_dom(&d, mark)
+        };
+        let wordmark = Some(DecorativeShape::Wordmark);
+        assert_eq!(build("", None, "Pricing | Acme", "Pricing"), None);
+        assert_eq!(build("", None, "Pricing | Acme", "Acme"), None, "nothing backs either part");
+        assert_eq!(build("getacme.io", None, "Pricing | Acme", "Acme"), wordmark);
+        assert_eq!(build("getacme.io", None, "Pricing | Acme", "Pricing"), None);
+        assert_eq!(build("get-acme-studio.com", None, "Pricing | Acme Studio", "Acme Studio"), wordmark);
+        assert_eq!(build("acme.studio", None, "Pricing | Studio", "Studio"), None);
+        assert_eq!(build("www.acme.io", None, "Acme | io", "io"), None);
+        assert_eq!(build("www.acme.io", None, "Acme | io", "Acme"), wordmark);
+        assert_eq!(build("", Some("Acme"), "Pricing | Acme", "Acme"), wordmark);
+        assert_eq!(build("", Some("Acme"), "Pricing | Acme", "Pricing"), None);
+        // A title of one part is the site's name, opened word for word.
+        assert_eq!(build("", None, "Screen Movie Blog", "Screen Movie"), wordmark);
     }
 
     #[test]

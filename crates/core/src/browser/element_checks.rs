@@ -590,13 +590,18 @@ pub fn read_pseudo_surface_dom(dom: &dyn Dom, el: ElId, rect: &Rect) -> Option<R
         if position != "absolute" && position != "fixed" {
             continue;
         }
-        // JS `(parseFloat(ps.opacity) || 1) < 0.9`
+        // An explicit 0 is 0, as [`read_pseudo_gradient_face`] reads it:
+        // family.co's secondary buttons park a hover face in the text's own
+        // colour at `opacity: 0`, and read at 1 it became the ground the
+        // label was scored on, `1.0:1` (observations-craft-1009 row 5). Only
+        // an opacity the capture did not read counts as 1.
         let opacity = {
-            let n = parse_float(&pseudo_str(dom, el, which, "opacity"));
-            if num_truthy(n) {
-                n
-            } else {
+            let raw = pseudo_str(dom, el, which, "opacity");
+            let n = parse_float(&raw);
+            if js::trim(&raw).is_empty() || !n.is_finite() {
                 1.0
+            } else {
+                n
             }
         };
         if pseudo_str(dom, el, which, "display") == "none" || opacity < 0.9 {
@@ -1254,7 +1259,312 @@ fn opacity_at_rest(dom: &dyn Dom, el: ElId, opacity: f64) -> bool {
     if crate::browser::painted::declares_transition_of(dom, el, "opacity") && visibly_displaced(dom, el) {
         return false;
     }
+    if parked_inline_for_a_reveal(dom, el, opacity) {
+        return false;
+    }
     opacity >= REVEAL_OPACITY || !is_moving(dom, el)
+}
+
+/// The own opacity under which a box a script or a state holds back reads
+/// as dimmed for a reveal or a state rather than styled faint.
+const STATE_DIM_OPACITY: f64 = 0.5;
+
+/// The value the element's `style` attribute gives `property`, trimmed and
+/// without `!important`, if it declares one: the declaration that wins, the
+/// last one unless an earlier one is `!important` and it is not. A custom
+/// property's name is matched case-sensitively (`--Muted` is not
+/// `--muted`); any other name is not.
+fn inline_value(dom: &dyn Dom, el: ElId, property: &str) -> Option<String> {
+    let style = dom.attr(el, "style")?;
+    let custom = property.starts_with("--");
+    let mut winner: Option<(String, bool)> = None;
+    for (name, value) in style.split(';').filter_map(|decl| decl.split_once(':')) {
+        let name = js::trim(name);
+        let matches = if custom { name == property } else { js::to_lower_case(name) == property };
+        if !matches {
+            continue;
+        }
+        let value = js::trim(value);
+        let (value, important) = match value.rfind('!') {
+            Some(at) if js::trim(&value[at + 1..]).eq_ignore_ascii_case("important") => (js::trim(&value[..at]), true),
+            _ => (value, false),
+        };
+        if winner.as_ref().map_or(true, |(_, held)| important || !held) {
+            winner = Some((value.to_string(), important));
+        }
+    }
+    winner.map(|(value, _)| value)
+}
+
+/// Whether a dimmed box's class list and a bright one's name one component
+/// in its resting and its lit state: the bright box carries every token of
+/// the dimmed one plus exactly one more (`feature` and `feature is-active`,
+/// `key` and `key glowing`). A dimmed box that carries the extra token
+/// (`note` beside `note faint`) is a style modifier, and two identical lists
+/// name no state; neither counts.
+fn bright_state_classes(dim: &[String], bright: &[String]) -> bool {
+    !dim.is_empty() && dim.iter().all(|t| bright.contains(t)) && bright.len() == dim.len() + 1
+}
+
+/// Whether a sibling of `el`, the same tag with its class list in another
+/// state ([`bright_state_classes`]), sits at full opacity: the active item of
+/// a stepper or a tab row beside the dimmed ones. A box with no class has
+/// no component to name, and has no such sibling.
+fn has_bright_sibling_state(dom: &dyn Dom, el: ElId) -> bool {
+    let own = crate::browser::painted::class_tokens(dom, el);
+    if own.is_empty() {
+        return false;
+    }
+    let Some(parent) = dom.parent(el) else { return false };
+    let tag = dom.tag_name(el);
+    dom.children(parent).into_iter().any(|other| {
+        other != el
+            && dom.tag_name(other) == tag
+            && opacity_of(dom, other) >= 0.999
+            && bright_state_classes(&own, &crate::browser::painted::class_tokens(dom, other))
+            // A sibling that is not shown (`display: none`, hidden) shows
+            // no state a reader meets.
+            && is_painted_for_browser_rule(dom, other)
+    })
+}
+
+/// Whether the page shows another box of `el`'s component already
+/// revealed: the same tag, `el`'s class list with exactly one token added
+/// ([`bright_state_classes`]), at full opacity, with an opacity transition of
+/// its own.
+/// raycast.com parks every key of a keyboard at `opacity: 0.2` in its
+/// `style` attribute and lights them as the visitor scrolls; a keyboard
+/// further down, already lit, carries `key glowing` at 1. The same evidence
+/// the paint gate's class-reveal test asks of an image held at 0.
+fn has_revealed_peer_on_page(dom: &dyn Dom, el: ElId) -> bool {
+    let own = crate::browser::painted::class_tokens(dom, el);
+    if own.is_empty() {
+        return false;
+    }
+    let tag = js::to_lower_case(&dom.tag_name(el));
+    dom.query_all(None, &tag).unwrap_or_default().into_iter().any(|other| {
+        if other == el || opacity_of(dom, other) < 0.999 {
+            return false;
+        }
+        bright_state_classes(&own, &crate::browser::painted::class_tokens(dom, other))
+            && crate::browser::painted::declares_transition_of(dom, other, "opacity")
+            // The peer is shown lit: painted (not `display: none`, hidden,
+            // or inside such a box) and faded by no ancestor either.
+            && is_painted_for_browser_rule(dom, other)
+            && effective_opacity_dom(dom, other) >= 0.999
+    })
+}
+
+/// Whether a script parked the box below full opacity in its `style`
+/// attribute, at the start of a reveal it has not played yet:
+///
+/// - the attribute sets `opacity` together with a transform, the box is
+///   displaced, and its `will-change` names a transform or `opacity`: an
+///   animation library holding a card at its start values (framer.com's
+///   `will-change: transform; opacity: 0.2; transform: translateX(-20px)`);
+/// - the box sits under [`STATE_DIM_OPACITY`], declares an `opacity`
+///   transition, is no control and holds or sits in none
+///   ([`touches_a_control`]), has no sibling of its component at full
+///   opacity (that is a state, [`dimmed_by_a_state`]), and either the
+///   attribute's opacity is a value a script scrubs ([`scrubbed_opacity`],
+///   ramp.com's `opacity: max(.2, var(--card-animation-1))`, held at its
+///   floor until the visitor scrolls), or the box is one of a set parked
+///   alike ([`parked_alike`]) while the page shows the same component
+///   already revealed ([`has_revealed_peer_on_page`]; raycast.com's keyboard).
+///
+/// A number written inline with nothing else to show it moves, a design
+/// token written inline (`opacity: var(--muted)`), a lone parked box with a
+/// lit namesake elsewhere, a faded box set by a stylesheet, a dimmed link,
+/// and one with no opacity transition stay at rest.
+fn parked_inline_for_a_reveal(dom: &dyn Dom, el: ElId, opacity: f64) -> bool {
+    if !(opacity < 0.999) {
+        return false;
+    }
+    let Some(inline_opacity) = inline_value(dom, el, "opacity") else {
+        return false;
+    };
+    let inline_moves = ["transform", "translate", "scale", "rotate"]
+        .iter()
+        .any(|p| inline_value(dom, el, p).is_some());
+    let names_motion = dom
+        .style(el, "willChange")
+        .split(',')
+        .map(js::trim)
+        .any(|v| matches!(v, "opacity" | "transform" | "translate" | "scale" | "rotate"));
+    if inline_moves && names_motion && visibly_displaced(dom, el) {
+        return true;
+    }
+    opacity < STATE_DIM_OPACITY
+        && crate::browser::painted::declares_transition_of(dom, el, "opacity")
+        && !touches_a_control(dom, el)
+        && !has_bright_sibling_state(dom, el)
+        && (scrubbed_opacity(dom, el, &inline_opacity)
+            || (parked_alike(dom, el, &inline_opacity) && has_revealed_peer_on_page(dom, el)))
+}
+
+/// Whether an inline `opacity` value is one a script scrubs: it reads a
+/// custom property inside a math function (`max(`, `min(`, `clamp(`,
+/// `calc(`), or it reads one that a `style` attribute on the box or an
+/// ancestor sets (what a script writes as the visitor scrolls). A design
+/// token from a stylesheet, `opacity: var(--muted)`, is neither.
+fn scrubbed_opacity(dom: &dyn Dom, el: ElId, value: &str) -> bool {
+    let lower = js::to_lower_case(value);
+    if !lower.contains("var(") {
+        return false;
+    }
+    if ["max(", "min(", "clamp(", "calc("].iter().any(|f| lower.contains(f)) {
+        return true;
+    }
+    // Custom property names are case-sensitive, so they are read from the
+    // value as written.
+    let names: Vec<String> = value
+        .split("var(")
+        .skip(1)
+        .filter_map(|rest| {
+            let name = js::trim(rest.split(|c| c == ',' || c == ')').next().unwrap_or(""));
+            name.starts_with("--").then(|| name.to_string())
+        })
+        .collect();
+    const MAX_ANCESTORS: usize = 64;
+    let mut cur = Some(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { return false };
+        if names.iter().any(|n| inline_value(dom, c, n).is_some()) {
+            return true;
+        }
+        cur = dom.parent(c);
+    }
+    false
+}
+
+/// How many boxes, `el` included, a reveal parks alike before a set of them
+/// reads as a component waiting for it rather than one box styled faint.
+const PARKED_ALIKE_MIN: usize = 3;
+
+/// Whether `el` is one of at least [`PARKED_ALIKE_MIN`] boxes of its tag and
+/// class list whose `style` attribute parks them at the same opacity, among
+/// its siblings or among its parent's siblings' children (raycast.com parks
+/// all 78 keys of a keyboard, row by row, at `opacity: 0.2`).
+fn parked_alike(dom: &dyn Dom, el: ElId, inline_opacity: &str) -> bool {
+    let own = crate::browser::painted::class_tokens(dom, el);
+    if own.is_empty() {
+        return false;
+    }
+    let tag = dom.tag_name(el);
+    let alike = |other: ElId| {
+        dom.tag_name(other) == tag
+            && inline_value(dom, other, "opacity").as_deref() == Some(inline_opacity)
+            && {
+                let theirs = crate::browser::painted::class_tokens(dom, other);
+                theirs.len() == own.len() && own.iter().all(|t| theirs.contains(t))
+            }
+    };
+    let Some(parent) = dom.parent(el) else { return false };
+    let mut count = dom.children(parent).into_iter().filter(|&c| alike(c)).count();
+    if count >= PARKED_ALIKE_MIN {
+        return true;
+    }
+    if let Some(grand) = dom.parent(parent) {
+        count = dom
+            .children(grand)
+            .into_iter()
+            .flat_map(|p| dom.children(p))
+            .filter(|&c| alike(c))
+            .count();
+    }
+    count >= PARKED_ALIKE_MIN
+}
+
+/// Whether the box is a control ([`names_a_control`]), sits in one, or holds
+/// one: a parked link or button is a control a visitor reads to use, which
+/// keeps its verdict.
+fn touches_a_control(dom: &dyn Dom, el: ElId) -> bool {
+    const MAX_ANCESTORS: usize = 64;
+    let mut cur = Some(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { break };
+        if names_a_control(dom, c) {
+            return true;
+        }
+        cur = dom.parent(c);
+    }
+    // Every descendant, not a selector for the tagged ones: a box that sets
+    // `cursor: pointer` around a short label is a control too.
+    dom.query_all(Some(el), "*")
+        .unwrap_or_default()
+        .into_iter()
+        .any(|c| c != el && names_a_control(dom, c))
+}
+
+/// The most text, in UTF-16 units, a box that sets `cursor: pointer` holds
+/// while it reads as one control with a label (a plan picker, a chip), the
+/// same cap the quality checks put on a focusable box. Past it the box is a
+/// clickable region (arc.net's stepper items hold a heading and a
+/// paragraph), and the text inside it is content.
+const POINTER_CONTROL_MAX_CHARS: usize = 80;
+
+/// Whether the box is a control whose text names it: a button, a field, a
+/// tab, a link, an option or a menu item (checkbox and radio ones too), by
+/// tag or by role, a disclosure's `summary`, a box that carries
+/// `aria-selected`, or a box that sets `cursor: pointer` (its parent
+/// does not) around at most [`POINTER_CONTROL_MAX_CHARS`] of text.
+fn names_a_control(dom: &dyn Dom, el: ElId) -> bool {
+    let tag = js::to_lower_case(&dom.tag_name(el));
+    let role = dom.attr(el, "role");
+    if crate::checks::embedded_content::control_of(&tag, dom.attr(el, "type").as_deref(), role.as_deref()).is_some()
+        || (tag == "a" && dom.attr(el, "href").is_some())
+        || tag == "summary"
+        || dom.attr(el, "aria-selected").is_some()
+    {
+        return true;
+    }
+    if js::trim(&dom.style(el, "cursor")) == "pointer"
+        && dom.parent(el).map_or(true, |p| js::trim(&dom.style(p, "cursor")) != "pointer")
+        && crate::js_ext_b::utf16_len(js::trim(&collapse_ws(&dom.text_content(el)))) <= POINTER_CONTROL_MAX_CHARS
+    {
+        return true;
+    }
+    role.is_some_and(|r| {
+        r.split_ascii_whitespace().any(|t| {
+            matches!(
+                js::to_lower_case(t).as_str(),
+                "link" | "option" | "menuitem" | "menuitemradio" | "menuitemcheckbox" | "treeitem"
+            )
+        })
+    })
+}
+
+/// Whether the text is dimmed by a resting state the visitor changes: a box
+/// between it and its surface, faded under [`STATE_DIM_OPACITY`] at rest,
+/// declares an `opacity` transition and has a sibling of its component at
+/// full opacity ([`has_bright_sibling_state`]). arc.net's stepper holds its
+/// inactive `article.feature` items at 0.3 and the `is-active` one at 1, and
+/// moves the active slot as the visitor scrolls. The text is dim at rest, so
+/// the verdict stands, but it is not the state a reader reads it in, so it
+/// reports as advisory (r13-t1). A row of links all faded alike has no such
+/// sibling, and a faded box with no transition is styled faint; both keep
+/// their severity. So does text in a control between it and the faded box,
+/// or a faded control: an inactive tab's label is the name a visitor reads
+/// to pick it (partner.co.il's tab row at 0.4 beside the selected tab, which
+/// both corpus judges called harmful).
+pub(crate) fn dimmed_by_a_state(dom: &dyn Dom, el: ElId, host: Option<ElId>) -> bool {
+    const MAX_ANCESTORS: usize = 64;
+    let mut cur = Some(el);
+    for _ in 0..MAX_ANCESTORS {
+        let Some(c) = cur else { return false };
+        if Some(c) == host || names_a_control(dom, c) {
+            return false;
+        }
+        if opacity_of(dom, c) < STATE_DIM_OPACITY
+            && fold_opacity_of(dom, c) < 0.999
+            && crate::browser::painted::declares_transition_of(dom, c, "opacity")
+            && has_bright_sibling_state(dom, c)
+        {
+            return true;
+        }
+        cur = dom.flat_parent(c);
+    }
+    false
 }
 
 /// Whether the element or any ancestor is a faded box caught mid-reveal
@@ -1899,6 +2209,179 @@ pub(crate) fn gradient_text_paints_a_ramp(dom: &dyn Dom, el: ElId) -> bool {
     !crate::checks::rules::gradient_stops_are_one_colour(&image)
 }
 
+/// Whether two colours are one, within [`RAMP_MIN_CHANNEL_DELTA`] on every
+/// channel, alpha included.
+fn same_colour(a: &Rgba, b: &Rgba) -> bool {
+    (a.r - b.r).abs() < RAMP_MIN_CHANNEL_DELTA
+        && (a.g - b.g).abs() < RAMP_MIN_CHANNEL_DELTA
+        && (a.b - b.b).abs() < RAMP_MIN_CHANNEL_DELTA
+        && (a.alpha_or_one() - b.alpha_or_one()).abs() * 255.0 < RAMP_MIN_CHANNEL_DELTA
+}
+
+/// Whether the gradient clipped to `el`'s text is a loading shimmer: its
+/// first and last stops are the text's own colour, the layer is wider than
+/// the box (`background-size` over 100% on x), and an animation that runs
+/// forever moves its `background-position`. cursor.com's "Working" labels
+/// (`linear-gradient(90deg, ink 0%, ink 30%, highlight 55%, ink 70%, ink
+/// 100%)` at `200% 100%`, `shimmer` sweeping `background-position-x`): a
+/// highlight passing over plain type, a state of the label rather than a
+/// gradient treatment. The ink has to hold solid over at least half the
+/// layer ([`ink_plateau_share`]): a rainbow headline that sets `color` to
+/// its end stop as a fallback (`#ff0080, #7928ca, #2563eb, #ff0080`) meets
+/// its ink only at the two ends, and stays gradient text. Any part the
+/// capture did not record keeps the finding.
+pub(crate) fn gradient_text_is_a_shimmer(dom: &dyn Dom, el: ElId) -> bool {
+    let image = dom.style(el, "backgroundImage");
+    let stops = parse_gradient_colors(Some(&image));
+    let (Some(first), Some(last), Some(ink)) = (stops.first(), stops.last(), parse_any_color(Some(&dom.style(el, "color"))))
+    else {
+        return false;
+    };
+    if stops.len() < 3 || !same_colour(first, &ink) || !same_colour(last, &ink) {
+        return false;
+    }
+    if !ink_plateau_share(&image, &ink).is_some_and(|share| share >= SHIMMER_INK_MIN_SHARE) {
+        return false;
+    }
+    let size = dom.style(el, "backgroundSize");
+    let width = size.split_whitespace().next().unwrap_or("");
+    let wider = width
+        .strip_suffix('%')
+        .map(parse_float)
+        .is_some_and(|w| w.is_finite() && w > 100.0);
+    if !wider {
+        return false;
+    }
+    let names = dom.style(el, "animationName");
+    let counts = dom.style(el, "animationIterationCount");
+    let counts: Vec<&str> = counts.split(',').map(str::trim).collect();
+    // A paused sweep (a reduced-motion rule, a pause control) leaves the
+    // gradient standing still: that is gradient text.
+    let states = dom.style(el, "animationPlayState");
+    let states: Vec<&str> = states.split(',').map(str::trim).collect();
+    names.split(',').map(str::trim).enumerate().any(|(i, name)| {
+        let count = counts.get(i % counts.len().max(1)).copied().unwrap_or("");
+        let state = states.get(i % states.len().max(1)).copied().unwrap_or("");
+        name != "none"
+            && count == "infinite"
+            && state != "paused"
+            && dom.keyframes(name).is_some_and(|frames| {
+                frames
+                    .iter()
+                    .any(|f| f.decls.iter().any(|(p, _)| p.starts_with("background-position")))
+            })
+    })
+}
+
+/// The least share of a shimmer's layer its ink holds solid
+/// ([`gradient_text_is_a_shimmer`]): cursor.com's holds 60%, the ink from 0
+/// to 30% and from 70 to 100%.
+const SHIMMER_INK_MIN_SHARE: f64 = 0.5;
+
+/// The share of a single `linear-gradient`'s length over which it holds
+/// `ink` solid: the runs between two neighbouring stops that are both
+/// `ink`, and the ends past a first or last stop that is. Stops without a
+/// position are spread as CSS spreads them. `None` for anything else
+/// (several layers, a stop at `px` or `calc()`, a colour that does not
+/// parse).
+fn ink_plateau_share(image: &str, ink: &Rgba) -> Option<f64> {
+    let args = js::trim(image).strip_prefix("linear-gradient(")?.strip_suffix(')')?;
+    if args.contains("gradient(") || args.contains("url(") {
+        return None;
+    }
+    let mut parts = crate::color::split_top_level_commas(args);
+    let head = js::to_lower_case(js::trim(parts.first()?));
+    if head.starts_with("to ") || ["deg", "turn", "rad", "grad"].iter().any(|u| head.ends_with(u)) {
+        parts.remove(0);
+    }
+    let mut stops: Vec<(bool, Option<f64>)> = Vec::new();
+    for part in &parts {
+        let part = js::trim(part);
+        let (color, rest) = match part.find(')') {
+            Some(i) if part[..i].contains('(') => (&part[..=i], &part[i + 1..]),
+            _ => match part.find(char::is_whitespace) {
+                Some(i) => (&part[..i], &part[i..]),
+                None => (part, ""),
+            },
+        };
+        let is_ink = same_colour(&parse_any_color(Some(color))?, ink);
+        let positions = rest
+            .split_whitespace()
+            .map(|p| p.strip_suffix('%').map(parse_float).filter(|v| v.is_finite()))
+            .collect::<Option<Vec<f64>>>()?;
+        match positions.as_slice() {
+            [] => stops.push((is_ink, None)),
+            [a] => stops.push((is_ink, Some(*a))),
+            [a, b] => {
+                stops.push((is_ink, Some(*a)));
+                stops.push((is_ink, Some(*b)));
+            }
+            _ => return None,
+        }
+    }
+    if stops.len() < 2 {
+        return None;
+    }
+    // Positions as CSS resolves them: the ends default to 0 and 100, a
+    // position under an earlier one is raised to it, and a run without
+    // positions is spread evenly between its neighbours.
+    let n = stops.len();
+    let mut at: Vec<Option<f64>> = stops.iter().map(|s| s.1).collect();
+    at[0] = Some(at[0].unwrap_or(0.0));
+    at[n - 1] = Some(at[n - 1].unwrap_or(100.0));
+    let mut max = 0.0f64;
+    for a in at.iter_mut().flatten() {
+        max = max.max(*a);
+        *a = max;
+    }
+    let mut i = 0;
+    while i < n {
+        if at[i].is_none() {
+            let start = i - 1;
+            let end = (i..n).find(|&j| at[j].is_some())?;
+            let (from, to) = (at[start]?, at[end]?);
+            for (k, slot) in at.iter_mut().enumerate().take(end).skip(i) {
+                *slot = Some(from + (to - from) * (k - start) as f64 / (end - start) as f64);
+            }
+            i = end;
+        }
+        i += 1;
+    }
+    let at: Vec<f64> = at.into_iter().collect::<Option<Vec<f64>>>()?;
+    let mut solid = 0.0;
+    if stops[0].0 {
+        solid += at[0].clamp(0.0, 100.0);
+    }
+    if stops[n - 1].0 {
+        solid += (100.0 - at[n - 1]).clamp(0.0, 100.0);
+    }
+    for k in 0..n - 1 {
+        if stops[k].0 && stops[k + 1].0 {
+            solid += (at[k + 1].min(100.0) - at[k].max(0.0)).max(0.0);
+        }
+    }
+    Some(solid / 100.0)
+}
+
+/// Whether every stop of the gradient clipped to `el`'s text is one RGB at
+/// different alphas (resend.com's `#fff` to `rgba(255, 255, 255, .5)`): a
+/// sheen of one colour fading, not a ramp between colours. It still steps
+/// on a dark ground, so it reports, as advisory (taste call r13-t6).
+pub(crate) fn gradient_text_varies_only_in_alpha(dom: &dyn Dom, el: ElId) -> bool {
+    let image = dom.style(el, "backgroundImage");
+    if !crate::checks::rules::gradient_stops_all_readable(&image) {
+        return false;
+    }
+    let stops = parse_gradient_colors(Some(&image));
+    let Some(first) = stops.first() else { return false };
+    stops.len() >= 2
+        && stops.iter().all(|c| {
+            (c.r - first.r).abs() < RAMP_MIN_CHANNEL_DELTA
+                && (c.g - first.g).abs() < RAMP_MIN_CHANNEL_DELTA
+                && (c.b - first.b).abs() < RAMP_MIN_CHANNEL_DELTA
+        })
+}
+
 /// The smallest type [`box_holds_a_text_line`] reads as a line of text.
 const SHORT_LINE_MIN_FONT_PX: f64 = 8.0;
 
@@ -1917,6 +2400,19 @@ pub fn check_element_colors_dom(
     dom: &dyn Dom,
     el: ElId,
     seen: &mut SafeTagTextSeen,
+) -> Vec<RuleHit> {
+    check_element_colors_dom_in(dom, el, seen, None)
+}
+
+/// [`check_element_colors_dom`] with the page's declared mockups: a
+/// `low-contrast` verdict on text inside one is dropped before it claims
+/// the page's one report of its colour pair, so the same pair outside the
+/// mockup still reports.
+pub fn check_element_colors_dom_in(
+    dom: &dyn Dom,
+    el: ElId,
+    seen: &mut SafeTagTextSeen,
+    mockups: Option<&super::hidden_mockup::HiddenMockups<'_>>,
 ) -> Vec<RuleHit> {
     let tag = tag_lower(dom, el);
     let rect = dom.rect(el);
@@ -2195,6 +2691,19 @@ pub fn check_element_colors_dom(
     };
     let (text_color, visible_text, effective_bg, effective_bg_stops, own_bg) = painted_colours
         .unwrap_or((text_color, visible_text, effective_bg, effective_bg_stops, own_bg));
+    // Glyphs whose fill is transparent paint no colour of their own: an
+    // ancestor's background clipped to the text paints them (resend.com's
+    // `em` inside a gradient-clipped `h1` inherits its transparent fill), or
+    // nothing does. Their `color` is not what a reader sees.
+    // Only a fill at the floor nothing is seen through counts: a ghost
+    // numeral at 5% white is still ink (reachmcp.com).
+    let ink_unread = has_direct_text && {
+        let fill = dom.style(ink_el, "webkitTextFillColor");
+        let fill = if js::trim(&fill).is_empty() { dom.style(ink_el, "color") } else { fill };
+        js::trim(&fill) == "transparent"
+            || parse_rgb_or_any(&fill)
+                .is_some_and(|c| c.alpha_or_one() <= crate::checks::rules::TRANSPARENT_INK_FLOOR)
+    };
     let mut color_opts = ColorOpts {
         tag: tag.clone(),
         text_color,
@@ -2219,6 +2728,7 @@ pub fn check_element_colors_dom(
         bg_source,
         bg_source_host,
         same_color_surface_is_unread,
+        ink_unread,
     };
     // Only on the link and span path: a styled control takes the full pass,
     // which keeps its own reading of the page ground.
@@ -2295,7 +2805,7 @@ pub fn check_element_colors_dom(
             TextLayers::UnreadSurface => !own_surface && unread() == UnreadVerdict::Fails,
             layers => {
                 own_surface
-                    || !crate::browser::visual::surface_unread(dom, under(), resolved_surface, layers)
+                    || !crate::browser::visual::surface_unread(dom, el, under(), resolved_surface, layers)
                     || unread() != UnreadVerdict::Passes
             }
         }
@@ -2311,9 +2821,20 @@ pub fn check_element_colors_dom(
     // Text with no reading job (avatar initials, a version stamp, a
     // signature, a mockup's labels) reports as advisory, asked only of an
     // element that failed.
+    // Text dimmed by a resting state the visitor changes (a stepper's
+    // inactive items) reports as advisory the same way, and claims no pair
+    // for the page's failing copies (`dimmed_by_a_state`).
     let decorative = std::cell::OnceCell::new();
-    let is_decorative =
-        || *decorative.get_or_init(|| super::decorative_text::is_decorative_text_dom(dom, el));
+    // Text under a box labelled as a screenshot is advisory too (r13-t5),
+    // decided here so it claims only the advisory pairs and never hides
+    // the page's own text wearing the same colours.
+    let is_decorative = || {
+        *decorative.get_or_init(|| {
+            super::decorative_text::is_decorative_text_dom(dom, el)
+                || dimmed_by_a_state(dom, el, surface_host)
+                || mockups.is_some_and(|m| m.signal(el) == Some(super::hidden_mockup::MockupSignal::Labelled))
+        })
+    };
     // A word caught part way through a scripted colour reveal is not at the
     // colour it rests at, so no contrast verdict is about what a reader
     // reads, and it claims no colour pair. Asked once, only of an element
@@ -2327,6 +2848,13 @@ pub fn check_element_colors_dom(
     // glyphs paint another one (SVG text, a colour filter). Asked once, only
     // of an element that failed.
     let ink_read = |h: &RuleHit| (h.id != "low-contrast" && h.id != "gray-on-color") || painted != InkPaint::Unknown;
+    // Text inside a mockup the page declares is not content (decision 1 of
+    // round 13). Asked only of an element that failed.
+    let in_declared_mockup = std::cell::OnceCell::new();
+    let content = |h: &RuleHit| {
+        h.id != "low-contrast"
+            || !*in_declared_mockup.get_or_init(|| mockups.is_some_and(|m| m.declared(el)))
+    };
     let mut findings = crate::checks::rules::check_colors_deduped_shaped(
         &color_opts,
         seen,
@@ -2339,9 +2867,10 @@ pub fn check_element_colors_dom(
                 })
                 && verdict_stands(h)
                 && at_rest(h)
+                && content(h)
         },
     );
-    findings.retain(|h| ink_read(h) && verdict_stands(h) && at_rest(h));
+    findings.retain(|h| ink_read(h) && verdict_stands(h) && at_rest(h) && content(h));
     // A failing verdict that stands over unread paint far from the walk's
     // surface (dim copy on a dark panel laid beside it, where the walk read
     // the white page) is printed against that paint: the ratio the text
@@ -2351,7 +2880,7 @@ pub fn check_element_colors_dom(
     if findings.iter().any(|h| h.id == "low-contrast")
         && !own_surface
         && (layers_at() == crate::browser::text_layers::TextLayers::UnreadSurface
-            || crate::browser::visual::surface_unread(dom, under(), resolved_surface, layers_at()))
+            || crate::browser::visual::surface_unread(dom, el, under(), resolved_surface, layers_at()))
     {
         if let Some(rescore) = reading().rescore {
             for h in findings.iter_mut().filter(|h| h.id == "low-contrast") {
@@ -2434,8 +2963,14 @@ pub fn check_element_colors_dom(
             }
         }
     }
-    if findings.iter().any(|h| h.id == "gradient-text") && !gradient_text_paints_a_ramp(dom, el) {
-        findings.retain(|h| h.id != "gradient-text");
+    if findings.iter().any(|h| h.id == "gradient-text") {
+        if !gradient_text_paints_a_ramp(dom, el) || gradient_text_is_a_shimmer(dom, el) {
+            findings.retain(|h| h.id != "gradient-text");
+        } else if gradient_text_varies_only_in_alpha(dom, el) {
+            for h in findings.iter_mut().filter(|h| h.id == "gradient-text") {
+                h.severity = Some(crate::checks::rules::ADVISORY_SEVERITY.to_string());
+            }
+        }
     }
     if tag == "input" || tag == "textarea" {
         let placeholder = dom.attr(el, "placeholder").unwrap_or_default();
@@ -2479,6 +3014,7 @@ pub fn check_element_colors_dom(
     if closest_or_none(dom, el, DISABLED_CONTROL_SELECTOR).is_some() {
         findings.retain(|h| h.id != "low-contrast");
     }
+    findings.retain(|h| content(h));
     findings
 }
 
@@ -5262,9 +5798,13 @@ pub fn check_element_text_overflow_dom(dom: &dyn Dom, el: ElId) -> Vec<RuleHit> 
     if is_scroll_region(dom, el) {
         return Vec::new();
     }
+    // A scroll region holds what overflows it, except that code in a page
+    // shell that scrolls (`#app { overflow: auto }` around the whole page)
+    // runs off the screen edge like code on an unwrapped page, so the
+    // shell does not speak for it and the code tests below decide.
     let mut p = dom.parent(el);
     while let Some(pp) = p {
-        if is_scroll_region(dom, pp) {
+        if is_scroll_region(dom, pp) && !(clipping_container_is_page_shell(dom, pp) && is_code_text(dom, el)) {
             return Vec::new();
         }
         p = dom.parent(pp);
@@ -5514,6 +6054,23 @@ pub fn check_element_blinking_cursor_dom(dom: &dyn Dom, el: ElId) -> Vec<Browser
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// cursor.com's shimmer holds its ink over 60% of the layer; a rainbow
+    /// that ends on its fallback colour meets the ink only at its ends; a
+    /// stop the engine cannot place gives no answer.
+    #[test]
+    fn ink_plateau_share_reads_the_solid_runs() {
+        let ink = parse_any_color(Some("rgba(0, 0, 0, 0.38)")).unwrap();
+        let cursor = "linear-gradient(90deg, rgba(0, 0, 0, 0.38) 0%, rgba(0, 0, 0, 0.38) 30%, color(srgb 0.14 0.137 0.111 / 0.913) 55%, rgba(0, 0, 0, 0.38) 70%, rgba(0, 0, 0, 0.38) 100%)";
+        assert!((ink_plateau_share(cursor, &ink).unwrap() - 0.6).abs() < 1e-9);
+        let pink = parse_any_color(Some("rgb(255, 0, 128)")).unwrap();
+        let rainbow = "linear-gradient(90deg, rgb(255, 0, 128), rgb(121, 40, 202), rgb(37, 99, 235), rgb(255, 0, 128))";
+        assert_eq!(ink_plateau_share(rainbow, &pink), Some(0.0));
+        let hard = "linear-gradient(90deg, rgb(255, 0, 128) 40%, rgb(37, 99, 235) 40% 60%, rgb(255, 0, 128) 60%)";
+        assert!((ink_plateau_share(hard, &pink).unwrap() - 0.8).abs() < 1e-9);
+        let px = "linear-gradient(90deg, rgb(255, 0, 128) 10px, rgb(37, 99, 235))";
+        assert_eq!(ink_plateau_share(px, &pink), None);
+    }
     use crate::browser::fake_dom::FakeDom;
 
     /// One element, its own page-level dedupe state.
@@ -5537,6 +6094,68 @@ mod tests {
             );
         }
         (d, body)
+    }
+
+    /// cursor.com's "Working" label: a highlight sweeping over plain type
+    /// is a loading state, not gradient text (row 12). Twins: the same
+    /// shimmer at rest (no infinite animation), and a pink-to-violet ramp.
+    /// resend.com's one-colour sheen reports as advisory (r13-t6).
+    #[test]
+    fn gradient_text_reads_a_shimmer_and_a_one_colour_sheen() {
+        let (mut d, body) = page();
+        d.keyframes.insert(
+            "shimmer".to_string(),
+            vec![crate::browser::dom::KeyframeFrame {
+                decls: vec![("background-position-x".to_string(), "200%".to_string())],
+            }],
+        );
+        let label = |d: &mut FakeDom, ink: &str, gradient: &str, size: &str, count: &str, y: f64| {
+            let s = d.add(Some(body), "span");
+            visible(d, s);
+            d.add_text(s, "Working on it");
+            d.set_styles(
+                s,
+                &[
+                    ("color", ink),
+                    ("backgroundImage", gradient),
+                    ("backgroundClip", "text"),
+                    ("webkitBackgroundClip", "text"),
+                    ("backgroundSize", size),
+                    ("animationName", "shimmer"),
+                    ("animationIterationCount", count),
+                    ("fontSize", "16px"),
+                    ("fontWeight", "400"),
+                ],
+            );
+            d.set_rect(s, 12.0, y, 162.0, 24.0);
+            d.set_text_rect(s, 12.0, y, 120.0, 24.0);
+            s
+        };
+        let gradient = |hits: Vec<RuleHit>| hits.into_iter().filter(|h| h.id == "gradient-text").collect::<Vec<_>>();
+        let shimmer_bg = "linear-gradient(90deg, rgba(0, 0, 0, 0.38) 0%, rgba(0, 0, 0, 0.38) 30%, rgba(36, 35, 28, 0.91) 55%, rgba(0, 0, 0, 0.38) 70%, rgba(0, 0, 0, 0.38) 100%)";
+        let shimmer = label(&mut d, "rgba(0, 0, 0, 0.38)", shimmer_bg, "200% 100%", "infinite", 40.0);
+        assert!(gradient(colors(&d, shimmer)).is_empty(), "a running shimmer");
+        let once = label(&mut d, "rgba(0, 0, 0, 0.38)", shimmer_bg, "200% 100%", "1", 80.0);
+        assert_eq!(gradient(colors(&d, once)).len(), 1, "a sweep that ends is not a running state");
+        let fitted = label(&mut d, "rgba(0, 0, 0, 0.38)", shimmer_bg, "100% 100%", "infinite", 120.0);
+        assert_eq!(gradient(colors(&d, fitted)).len(), 1, "a layer the size of the box shows its whole ramp");
+        let ramp = label(&mut d, "rgba(0, 0, 0, 0)", "linear-gradient(90deg, #db2777, #7c3aed)", "200% 100%", "infinite", 160.0);
+        let hits = gradient(colors(&d, ramp));
+        assert_eq!(hits.len(), 1, "a pink-to-violet ramp");
+        assert_eq!(hits[0].severity, None);
+
+        let sheen = label(
+            &mut d,
+            "rgba(0, 0, 0, 0)",
+            "linear-gradient(to right bottom, rgb(255, 255, 255) 30%, rgba(255, 255, 255, 0.5))",
+            "auto",
+            "1",
+            200.0,
+        );
+        d.set_style(sheen, "animationName", "none");
+        let hits = gradient(colors(&d, sheen));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].severity.as_deref(), Some(crate::checks::rules::ADVISORY_SEVERITY));
     }
 
     /// interplanetaryfund.base44.app's tagline on a solid ground: a pale
@@ -6194,6 +6813,301 @@ mod tests {
         );
         assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
         assert!(!super::caught_mid_reveal(&d, word));
+    }
+
+    fn advisory(hits: &[RuleHit]) -> Vec<bool> {
+        hits.iter()
+            .filter(|h| h.id == "low-contrast")
+            .map(|h| h.severity.as_deref() == Some(crate::checks::rules::ADVISORY_SEVERITY))
+            .collect()
+    }
+
+    /// A stepper item: dark text in a wrapper of class `class` held at
+    /// `opacity`, with an opacity transition, and a sibling of the same tag
+    /// of class `sibling_class` at `sibling_opacity`.
+    fn stepper(class: &str, sibling_class: &str, sibling_opacity: &str) -> (FakeDom, ElId, ElId, ElId) {
+        let (mut d, wrap, word) = muted_text_in_wrapper("span", "Sidebar tabs", "rgb(0, 0, 0)");
+        let body = d.parent(wrap).unwrap();
+        d.set_attr(wrap, "class", class);
+        d.set_styles(
+            wrap,
+            &[("opacity", "0.3"), ("transitionProperty", "opacity"), ("transitionDuration", "0.3s")],
+        );
+        let sibling = d.add(Some(body), "div");
+        visible(&mut d, sibling);
+        d.set_attr(sibling, "class", sibling_class);
+        d.set_styles(
+            sibling,
+            &[("opacity", sibling_opacity), ("transitionProperty", "opacity"), ("transitionDuration", "0.3s")],
+        );
+        (d, wrap, word, sibling)
+    }
+
+    /// arc.net (10133793-99, r13-t1): a stepper's inactive items at 0.3 by
+    /// stylesheet, the `is-active` one at 1, with an opacity transition. The
+    /// text is dim at rest, so it reports, as advisory.
+    #[test]
+    fn a_stepper_item_dimmed_by_its_state_is_advisory() {
+        let (mut d, _wrap, word, _) = stepper("feature", "feature is-active", "1");
+        let hits = colors(&d, word);
+        assert!(
+            low_contrast(&hits).iter().any(|s| s.contains("text #b3b3b3 on #ffffff")),
+            "{hits:?}"
+        );
+        assert_eq!(advisory(&hits), vec![true], "{hits:?}");
+        assert!(!super::caught_mid_reveal(&d, word));
+        // Over a photo the fade goes to the pixel pass, which reads the item
+        // as advisory too (PR #1148 review): its candidate carries the
+        // decorative key, which a footer link faded alike does not.
+        let visual_decorative = |d: &mut FakeDom, word: ElId| {
+            // A paragraph, since the pixel pass leaves inline tags to the
+            // element pass.
+            d.el_mut(word).tag = "p".into();
+            let body = d.body().unwrap();
+            d.set_styles(body, &[("backgroundImage", "url(\"/hero.jpg\")"), ("backgroundSize", "cover")]);
+            crate::browser::visual::collect_visual_contrast_candidates(&*d, &serde_json::json!({}))
+                .iter()
+                .filter(|c| c.get("text").and_then(|t| t.as_str()) == Some("Sidebar tabs"))
+                .map(|c| c.get("decorative").and_then(|v| v.as_bool()) == Some(true))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visual_decorative(&mut d, word), vec![true]);
+        let (mut d, _, word, _) = stepper("feature", "feature", "0.3");
+        assert_eq!(visual_decorative(&mut d, word), vec![false]);
+
+        // Twins that keep their severity: every item faded alike (footer
+        // links at .4 with a hover transition), a faded item with no
+        // transition (styled faint), and a bright sibling that is another
+        // component (two class tokens apart).
+        let (d, _, word, _) = stepper("feature", "feature", "0.3");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        // A bright sibling that is not shown supplies no state (PR #1148
+        // review).
+        let (mut d, _, word, sibling) = stepper("feature", "feature is-active", "1");
+        d.set_style(sibling, "display", "none");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        d.set_style(sibling, "display", "block");
+        d.set_style(sibling, "visibility", "hidden");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        let (mut d, wrap, word, _) = stepper("feature", "feature is-active", "1");
+        d.set_style(wrap, "transitionDuration", "0s");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        let (d, _, word, _) = stepper("feature", "feature promo wide", "1");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        // A style modifier on the dimmed box (`note` beside `note faint`,
+        // review probe p3b) and identical class lists (p3d) name no state.
+        let (d, _, word, _) = stepper("note faint", "note", "1");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        let (d, _, word, _) = stepper("size", "size", "1");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        // A clickable box with a short label and no role (p3c) is a control;
+        // a clickable item that holds a heading and a paragraph (arc.net's)
+        // is content and stays advisory. `cursor` inherits, so only the box
+        // that sets it counts.
+        let (mut d, wrap, word, _) = stepper("plan-option", "plan-option selected", "1");
+        d.set_style(wrap, "cursor", "pointer");
+        d.set_style(word, "cursor", "pointer");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        let (mut d, wrap, word, _) = stepper("feature", "feature is-active", "1");
+        d.set_style(wrap, "cursor", "pointer");
+        d.set_style(word, "cursor", "pointer");
+        d.add_text(wrap, " Choose Sidebar tabs for the familiar vertical layout. Keep your tabs where you left them.");
+        assert_eq!(advisory(&colors(&d, word)), vec![true]);
+        // partner.co.il (10089911): an inactive tab beside the selected one.
+        // Its label names the control a visitor picks, so it keeps its
+        // severity, whether the tab is a role or the text sits in a link.
+        let (mut d, wrap, word, _) = stepper("tab", "tab selected", "1");
+        d.set_attr(wrap, "role", "tab");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        let (mut d, wrap, word, _) = stepper("tab", "tab selected", "1");
+        d.set_attr(wrap, "aria-selected", "false");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        // A menu's unchecked checkbox item and a disclosure's `summary` are
+        // controls too (PR #1148 review).
+        let (mut d, wrap, word, _) = stepper("item", "item checked", "1");
+        d.set_attr(wrap, "role", "menuitemcheckbox");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        let (mut d, wrap, word, _) = stepper("faq", "faq open", "1");
+        d.el_mut(wrap).tag = "summary".into();
+        let body = d.parent(wrap).unwrap();
+        for c in d.children(body) {
+            if c != wrap {
+                d.el_mut(c).tag = "summary".into();
+            }
+        }
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        let (mut d, _, word, _) = stepper("tab", "tab selected", "1");
+        d.set_attr(word, "href", "#pricing");
+        d.el_mut(word).tag = "a".into();
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+        // A sibling of another tag is not the same component.
+        let (mut d, wrap, word, _) = stepper("feature", "feature is-active", "1");
+        d.set_attr(wrap, "class", "feature");
+        let body = d.parent(wrap).unwrap();
+        let other = d.add(Some(body), "p");
+        visible(&mut d, other);
+        d.set_attr(other, "class", "feature");
+        let sib = d.children(body).into_iter().find(|&c| c != wrap && c != other).unwrap();
+        d.set_attr(sib, "class", "unrelated");
+        assert_eq!(advisory(&colors(&d, word)), vec![false]);
+    }
+
+    /// framer.com (10133521-22): Framer Motion holds a card at its start
+    /// values in its `style` attribute, `will-change: transform; opacity:
+    /// 0.2; transform: translateX(-20px)`. The card is not at rest.
+    #[test]
+    fn a_card_parked_inline_at_its_start_values_is_not_at_rest() {
+        let (mut d, wrap, word) = muted_text_in_wrapper("span", "Design with an agent", "rgb(0, 0, 0)");
+        d.set_attr(wrap, "style", "will-change: transform; opacity: 0.2; transform: translateX(-19.9959px);");
+        d.set_styles(
+            wrap,
+            &[("opacity", "0.2"), ("willChange", "transform"), ("transform", "matrix(1, 0, 0, 1, -19.9959, 0)")],
+        );
+        assert!(low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        assert!(super::caught_mid_reveal(&d, word));
+        // Twins: the same values from a stylesheet, and an inline opacity
+        // with no transform, are at rest and fade.
+        d.set_attr(wrap, "style", "");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        assert!(!super::caught_mid_reveal(&d, word));
+        d.set_attr(wrap, "style", "opacity: 0.2");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        // Not displaced: at rest.
+        d.set_attr(wrap, "style", "will-change: transform; opacity: 0.2; transform: none");
+        d.set_style(wrap, "transform", "none");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+    }
+
+    /// ramp.com (10134263-64): a scroll-scrubbed card text held at its floor,
+    /// `opacity: max(.2, var(--card-animation-1))` in its `style` attribute,
+    /// with an opacity transition. It is not at rest.
+    #[test]
+    fn an_inline_opacity_a_script_scrubs_is_not_at_rest() {
+        let (mut d, wrap, word) = muted_text_in_wrapper("span", "Spend limits", "rgb(10, 10, 10)");
+        d.set_attr(wrap, "class", "max-w-md space-y-2 transition duration-300");
+        d.set_attr(wrap, "style", "opacity:max(.2, var(--card-animation-1));transform:translate(0, calc(var(--card-animation-3) * -50px))");
+        d.set_styles(
+            wrap,
+            &[("opacity", "0.2"), ("transitionProperty", "color, opacity, transform"), ("transitionDuration", "0.3s")],
+        );
+        assert!(low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        assert!(super::caught_mid_reveal(&d, word));
+        // Twins: no opacity transition, a plain number inline with no
+        // revealed peer, and a box at 0.6: at rest, and they fade.
+        d.set_style(wrap, "transitionDuration", "0s");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        d.set_style(wrap, "transitionDuration", "0.3s");
+        d.set_attr(wrap, "style", "opacity:0.2");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        // A design token written inline (review probe p2) is no scrub: at
+        // rest. The same variable set in an ancestor's `style` attribute,
+        // what a script writes, is one.
+        d.set_attr(wrap, "style", "opacity: var(--muted)");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        let body = d.parent(wrap).unwrap();
+        d.set_attr(body, "style", "--muted: 0");
+        assert!(low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        // Custom property names are case-sensitive: `--Muted` set above
+        // does not scrub `var(--muted)` (PR #1148 review).
+        d.set_attr(body, "style", "--Muted: 0");
+        assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        d.set_attr(body, "style", "");
+        // The declaration that wins is read: a later plain number overrides
+        // the scrubbed value, and a later one does not override an
+        // `!important` scrub.
+        d.set_attr(wrap, "style", "opacity: max(.2, var(--p)); opacity: .2");
+        assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        d.set_attr(wrap, "style", "opacity: max(.2, var(--p)) !important; opacity: .2");
+        assert!(low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        // A clickable child with a short label and no role is a control the
+        // box holds (PR #1148 review): the box stays at rest and fades.
+        d.set_style(word, "cursor", "pointer");
+        assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        d.set_style(word, "cursor", "auto");
+        d.set_attr(wrap, "style", "opacity:max(.2, var(--card-animation-1))");
+        d.set_style(wrap, "opacity", "0.6");
+        d.set_style(word, "color", "rgb(150, 150, 150)");
+        assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+    }
+
+    /// raycast.com (10134381-84): every key of a keyboard parked at
+    /// `opacity: 0.2` in its `style` attribute, with an opacity transition,
+    /// while a keyboard further down the page is lit (`key glowing` at 1).
+    /// The parked keys are waiting for that reveal, not at rest.
+    #[test]
+    fn a_key_parked_inline_beside_a_revealed_peer_is_not_at_rest() {
+        let (mut d, wrap, word) = muted_text_in_wrapper("span", "esc", "rgb(20, 20, 20)");
+        let body = d.parent(wrap).unwrap();
+        d.set_attr(wrap, "class", "key");
+        d.set_attr(wrap, "style", "width:167px;opacity:0.2");
+        d.set_styles(
+            wrap,
+            &[("opacity", "0.2"), ("transitionProperty", "opacity, box-shadow"), ("transitionDuration", "0.4s, 0.2s")],
+        );
+        let row = d.add(Some(body), "section");
+        visible(&mut d, row);
+        let lit = d.add(Some(row), "div");
+        visible(&mut d, lit);
+        d.set_attr(lit, "class", "key glowing");
+        d.set_attr(lit, "style", "width:138.5px;--delay:0s");
+        d.set_styles(lit, &[("transitionProperty", "opacity"), ("transitionDuration", "1.5s")]);
+        // A lone parked key with a lit namesake elsewhere on the page is one
+        // box styled faint (review probe p1): at rest, and it fades.
+        assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        // The keyboard parks its keys alike.
+        let mut parked = Vec::new();
+        for _ in 0..2 {
+            let key = d.add(Some(body), "div");
+            visible(&mut d, key);
+            d.set_attr(key, "class", "key");
+            d.set_attr(key, "style", "opacity:0.2");
+            d.set_style(key, "opacity", "0.2");
+            parked.push(key);
+        }
+        assert!(low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        assert!(super::caught_mid_reveal(&d, word));
+        // A parked link is a control a visitor reads (review probe p1b): it
+        // stays at rest and fades.
+        d.set_attr(wrap, "href", "#pricing");
+        d.el_mut(wrap).tag = "a".into();
+        for &k in &parked {
+            d.el_mut(k).tag = "a".into();
+        }
+        d.el_mut(lit).tag = "a".into();
+        assert!(!low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        d.el_mut(wrap).tag = "div".into();
+        for &k in &parked {
+            d.el_mut(k).tag = "div".into();
+        }
+        d.el_mut(lit).tag = "div".into();
+        assert!(low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        // Twins: a lit peer with no opacity transition, or one two class
+        // tokens apart, shows no reveal; the key is at rest and fades.
+        d.set_style(lit, "transitionDuration", "0s");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        d.set_style(lit, "transitionDuration", "1.5s");
+        // A lit peer that is not shown (PR #1148 review): `display: none`,
+        // `visibility: hidden`, or faded by an ancestor. The key is at rest
+        // and fades.
+        d.set_style(lit, "display", "none");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        d.set_style(lit, "display", "block");
+        d.set_style(lit, "visibility", "hidden");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        d.set_style(lit, "visibility", "visible");
+        d.set_style(row, "opacity", "0.2");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        d.set_style(row, "opacity", "1");
+        assert!(low_contrast(&colors(&d, word)).is_empty(), "{:?}", colors(&d, word));
+        d.set_attr(lit, "class", "key glowing wide");
+        assert!(!low_contrast(&colors(&d, word)).is_empty());
+        // A lit sibling in the same row is a state, not a reveal: the key
+        // stays at rest and reports as advisory.
+        d.set_attr(lit, "class", "key glowing");
+        let sibling = d.add(Some(body), "div");
+        visible(&mut d, sibling);
+        d.set_attr(sibling, "class", "key active");
+        assert_eq!(advisory(&colors(&d, word)), vec![true], "{:?}", colors(&d, word));
     }
 
     #[test]
@@ -11017,6 +11931,38 @@ mod tests {
         assert!(!run(&|d, _, cover, _| { d.set_style(cover, "transform", "matrix(1, 0, 0, 1, 0, 4)"); }));
     }
 
+    /// apple.com's stacked gallery below the fold: five tab panels in one
+    /// grid cell, the active one at `z-index: 2` with a white fill, the
+    /// others at 0. A caption in a hidden panel is covered by the active
+    /// one, earlier in the tree. Twins: the caption in the active panel, a
+    /// panel ranked equal, and a higher card that covers part of the
+    /// caption keep their verdicts.
+    #[test]
+    fn a_sibling_ranked_above_the_text_covers_it_below_the_fold() {
+        let run = |active_z: &str, cover_h: f64, in_active: bool| {
+            let (mut d, body) = page();
+            let top = 13311.0;
+            let gallery = bare_box(&mut d, body, "div", (150.0, top, 980.0, 795.0));
+            d.set_styles(gallery, &[("display", "grid"), ("position", "relative")]);
+            let active = bare_box(&mut d, gallery, "div", (150.0, top, 980.0, cover_h));
+            d.set_styles(
+                active,
+                &[("zIndex", active_z), ("opacity", "1"), ("backgroundColor", "rgb(255, 255, 255)"), ("position", "static")],
+            );
+            let hidden = bare_box(&mut d, gallery, "div", (150.0, top, 980.0, 795.0));
+            d.set_styles(hidden, &[("zIndex", "0"), ("opacity", "1"), ("position", "static")]);
+            d.set_attr(hidden, "aria-hidden", "true");
+            let parent = if in_active { active } else { hidden };
+            let caption = faint_copy(&mut d, parent, "rgb(134, 134, 139)", (972.0, top + 596.0, 158.0, 14.0));
+            d.set_styles(caption, &[("zIndex", "auto"), ("position", "static")]);
+            reports_contrast(&colors(&d, caption))
+        };
+        assert!(!run("2", 795.0, false), "a caption under the active panel");
+        assert!(run("2", 795.0, true), "the active panel's own caption");
+        assert!(run("0", 795.0, false), "panels ranked equal fall to document order");
+        assert!(run("2", 600.0, false), "a panel that covers part of the caption");
+    }
+
     /// A transparent grain overlay laid over a section below the fold: the
     /// engine cannot see its alpha, and it is no avatar, so the muted copy
     /// under it keeps its verdict.
@@ -11675,6 +12621,53 @@ mod tests {
         assert!(!run(strip, "auto", white));
         assert!(run(strip, "8px 8px", white), "a small tile is a texture over the fill");
         assert!(run(strip, "auto", "rgb(225, 121, 121)"), "ink in another colour keeps its verdict");
+    }
+
+    /// family.co's `ButtonSecondary`: a hover face in the label's own colour
+    /// parked at `opacity: 0` is not the ground at rest; the same face shown
+    /// is, and a failing label on it still reports.
+    #[test]
+    fn a_hover_face_at_opacity_zero_is_not_the_surface() {
+        let run = |face: &str, opacity: &str| {
+            let (mut d, body) = page();
+            let b = d.add(Some(body), "div");
+            visible(&mut d, b);
+            d.add_text(b, "Download");
+            d.set_rect(b, 40.0, 600.0, 160.0, 44.0);
+            d.set_styles(
+                b,
+                &[
+                    ("backgroundColor", "rgba(0, 0, 0, 0)"),
+                    ("color", "rgb(110, 110, 110)"),
+                    ("fontSize", "16px"),
+                    ("fontWeight", "500"),
+                    ("position", "relative"),
+                ],
+            );
+            for (p, v) in [
+                ("content", "\"\""),
+                ("position", "absolute"),
+                ("display", "block"),
+                ("backgroundColor", face),
+                ("backgroundImage", "none"),
+                ("top", "0px"),
+                ("left", "0px"),
+                ("width", "160px"),
+                ("height", "44px"),
+                ("opacity", opacity),
+            ] {
+                d.set_pseudo_style(b, "::before", p, v);
+            }
+            colors(&d, b).into_iter().filter(|h| h.id == "low-contrast").map(|h| h.snippet).collect::<Vec<_>>()
+        };
+        // The grey label passes on the white page it sits on.
+        assert!(run("rgb(110, 110, 110)", "0").is_empty(), "{:?}", run("rgb(110, 110, 110)", "0"));
+        // Shown, a grey face under it fails, scored on the face.
+        let shown = run("rgb(200, 200, 200)", "1");
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert!(shown[0].contains("on #c8c8c8"), "{}", shown[0]);
+        // An opacity the capture did not read counts as shown.
+        assert_eq!(run("rgb(200, 200, 200)", "").len(), 1);
     }
 
     /// observations-47 row 12, ardainc.com 322246: the CTA paints a conic

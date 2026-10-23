@@ -358,4 +358,12 @@ const __impeccableDom = {
     }
     return out;
   },
+  // Dom::last_word_rects: the word before the last, then the last, in eights
+  // as text_rects lays them out; empty under two words. The walk lives in
+  // 15-snapshot.js, which the in-page bundle concatenates after this file.
+  last_word_rects(el) {
+    const rects = __snapLastWordRects(__el(el), __rendersNoText);
+    if (!rects) return [];
+    return rects.flatMap(r => [r.left, r.top, r.width, r.height, r.top, r.right, r.bottom, r.left]);
+  },
 };

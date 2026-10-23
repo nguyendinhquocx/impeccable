@@ -107,6 +107,7 @@ pub const STYLE_PROPS: &[&str] = &[
     "content",
     "contentVisibility",
     "cssFloat",
+    "cursor",
     "direction",
     "display",
     "filter",
@@ -339,6 +340,11 @@ pub struct SnapNode {
     /// capture recorded them at all.
     #[serde(rename = "dl", default, skip_serializing_if = "Vec::is_empty")]
     pub text_rects: Vec<[f64; 4]>,
+    /// [`Dom::last_word_rects`], each `[x, y, width, height]`: recorded only
+    /// on the prose blocks `straggler` reads, and only where the text holds
+    /// two words.
+    #[serde(rename = "lw", default, skip_serializing_if = "Option::is_none")]
+    pub last_word_rects: Option<[[f64; 4]; 2]>,
     #[serde(rename = "e", default)]
     pub content_editable: bool,
     #[serde(rename = "h", default)]
@@ -1185,6 +1191,9 @@ impl Dom for SnapshotDom {
         let mut rects = Vec::new();
         walk(self, el, &mut rects);
         Some(super::dom::merge_text_rects_into_lines(rects))
+    }
+    fn last_word_rects(&self, el: ElId) -> Option<[Rect; 2]> {
+        self.snap.node(el).last_word_rects.as_ref().map(|[a, b]| [rect4(a), rect4(b)])
     }
 }
 

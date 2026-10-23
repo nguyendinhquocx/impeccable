@@ -190,10 +190,13 @@ fn last_unquoted_delimiter(css: &str, delims: &[u8]) -> Option<usize> {
 /// the header before each unclosed `{` starts with `@`.
 fn enclosed_only_by_at_rules(css: &str) -> bool {
     let bytes = css.as_bytes();
-    let mut open: Vec<usize> = Vec::new();
-    // A brace in a quoted string (`content: "{"`) or escaped (`\{`) opens
-    // and closes nothing.
+    // Each open block as (where its header starts, its `{`).
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    // A brace or semicolon in a quoted string (`content: "{"`, an at-rule
+    // header's `@supports (content: "a;b")`) or escaped (`\{`) opens,
+    // closes and ends nothing.
     let mut quote: Option<u8> = None;
+    let mut head_start = 0;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -202,23 +205,27 @@ fn enclosed_only_by_at_rules(css: &str) -> bool {
             continue;
         }
         match quote {
-            Some(q) if b == q => quote = None,
+            // A newline ends an unterminated string, as in
+            // [`last_unquoted_delimiter`].
+            Some(q) if b == q || b == b'\n' => quote = None,
             Some(_) => {}
             None => match b {
                 b'"' | b'\'' => quote = Some(b),
-                b'{' => open.push(i),
+                b'{' => {
+                    open.push((head_start, i));
+                    head_start = i + 1;
+                }
                 b'}' => {
                     open.pop();
+                    head_start = i + 1;
                 }
+                b';' => head_start = i + 1,
                 _ => {}
             },
         }
         i += 1;
     }
-    open.iter().all(|&brace| {
-        let head_start = css[..brace].rfind(['{', '}', ';']).map(|p| p + 1).unwrap_or(0);
-        js::trim(&css[head_start..brace]).starts_with('@')
-    })
+    open.iter().all(|&(start, brace)| js::trim(&css[start..brace]).starts_with('@'))
 }
 
 // ─── Rule-block helpers ─────────────────────────────────────────────────────

@@ -30,7 +30,7 @@ pub fn hook_manifests_for(provider_id: &str) -> &'static [&'static str] {
     }
 }
 
-/// The user-level manifest a user-scope install writes for this provider:
+/// The user-level hook manifest this provider's harness loads:
 /// Claude's `~/.claude/settings.json`; Codex and agents `$CODEX_HOME/hooks.json`
 /// (relative to cwd), or `~/.codex/hooks.json` when CODEX_HOME is unset or
 /// empty. A non-empty CODEX_HOME is exclusive.

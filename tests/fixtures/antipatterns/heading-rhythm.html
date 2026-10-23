@@ -55,6 +55,9 @@
   .white-module { background: #fff; }
   .shadow-carousel { display: block; }
 
+  /* PASS: a run-in heading set inline beside its paragraph (stripe.com) */
+  .run-in { display: inline; font-size: 16px; line-height: 24px; }
+
   /* PASS: a title band that draws its own rules */
   .banded { border-top: 1px solid #84263f; border-bottom: 1px solid #84263f; padding: 15px 0; }
 
@@ -451,6 +454,12 @@ npx impeccable detect src/</pre>
       <p class="blk">A paragraph before a group that opens with an eyebrow set well apart from its heading.</p>
       <div class="above-160"><p class="eyebrow-plain">01 / Language and tools</p><h2 class="above-60 below-100">Pass Distant Eyebrow</h2></div>
       <p class="blk">The eyebrow opens its group and sits closer to the heading than the heading sits to this paragraph.</p>
+  
+
+    <section class="case">
+      <p class="blk">A paragraph before a run-in heading set inline at the start of the paragraph it leads.</p>
+      <div class="above-10 below-48"><h3 class="run-in">Pass Run In Heading</h3> <p class="run-in">The heading starts this line of prose, so the gap below it is not a gap at all.</p></div>
+      <p class="blk">The next block sits forty-eight pixels below the paragraph the heading opened.</p>
     </section>
   </section>
 </main>

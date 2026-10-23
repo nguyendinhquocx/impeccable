@@ -288,8 +288,8 @@ pub mod origin {
     /// The visual-contrast pass (image and pixel reads), and the rule pass's
     /// `low-contrast` verdicts on text it hands to that pass
     /// (`visual::routed_reason`), which the pixels replace where they give a
-    /// verdict and which stand, as advisory, where they do not. Recorded,
-    /// not replayable.
+    /// verdict and which, where they do not, stand as advisory or, if they
+    /// measured nothing, drop. Recorded, not replayable.
     pub const VISUAL_CONTRAST: &str = "visual-contrast";
 }
 
@@ -313,6 +313,11 @@ struct RawResult {
     /// For a page-level finding, where the evidence step found the element
     /// that carries its declaration ([`Evidence::page_anchors`]).
     anchor: Option<Value>,
+    /// A `low-contrast` verdict handed to the pixels ([`hand_over`]) whose
+    /// ratio was taken against a ground a picture, or paint the scan cannot
+    /// model, covers: it measured nothing, and stands only if the pixels
+    /// measure it ([`settle_handed_over`]).
+    unmeasured: bool,
 }
 
 impl RawResult {
@@ -327,6 +332,7 @@ impl RawResult {
             scan_el: None,
             third_party: None,
             anchor: None,
+            unmeasured: false,
         }
     }
 }
@@ -838,6 +844,7 @@ fn results_from_groups(groups: &[Value]) -> Vec<RawResult> {
                     .and_then(Value::as_str)
                     .map(String::from),
                 anchor: None,
+                unmeasured: false,
             });
         }
     }
@@ -849,8 +856,8 @@ fn results_from_groups(groups: &[Value]) -> Vec<RawResult> {
 /// hands to the pixels ([`impeccable_core::browser::visual::routed_reason`]).
 /// The live scan lets a pixel verdict replace such a verdict, so it is the
 /// visual-contrast pass's to report, and a replay leaves it out. A handed
-/// verdict over a picture carries the text it keeps if the pixels give none
-/// ([`impeccable_core::browser::visual::unmeasured_handed_over_snippet`]).
+/// verdict whose ratio was taken against a ground a picture covers measured
+/// nothing ([`impeccable_core::browser::visual::handed_over_unmeasured`]).
 fn handed_over(dom: &SnapshotDom, groups: &[impeccable_core::browser::FindingGroup]) -> Vec<Handed> {
     let mut out = Vec::new();
     for g in groups {
@@ -861,7 +868,9 @@ fn handed_over(dom: &SnapshotDom, groups: &[impeccable_core::browser::FindingGro
                     impeccable_core::browser::visual::routed_reason(dom, g.el).is_some()
                 });
             out.push(if handed {
-                Handed::Yes(impeccable_core::browser::visual::unmeasured_handed_over_snippet(dom, g.el, &f.detail))
+                Handed::Yes {
+                    unmeasured: impeccable_core::browser::visual::handed_over_unmeasured(dom, g.el, &f.detail),
+                }
             } else {
                 Handed::No
             });
@@ -874,25 +883,23 @@ fn handed_over(dom: &SnapshotDom, groups: &[impeccable_core::browser::FindingGro
 #[derive(Debug, Clone, PartialEq)]
 enum Handed {
     No,
-    /// Handed to the pixels, with the text the verdict keeps if they give
-    /// none (`None`: its own).
-    Yes(Option<String>),
+    /// Handed to the pixels; `unmeasured` where its ratio measured nothing a
+    /// reader sees, so it stands only on a pixel verdict.
+    Yes { unmeasured: bool },
 }
 
 /// Move the verdicts [`handed_over`] marks to [`origin::VISUAL_CONTRAST`],
-/// with the text they keep if the pixels give none (only an unsuperseded
-/// one is ever printed). Results that do not line up with the marks (never
-/// expected) stay in the scan origin, the same way live and in a replay.
+/// marking the ones that measured nothing. Results that do not line up with
+/// the marks (never expected) stay in the scan origin, the same way live and
+/// in a replay.
 fn hand_over(results: &mut [RawResult], handed: &[Handed]) {
     if handed.len() != results.len() {
         return;
     }
     for (r, handed) in results.iter_mut().zip(handed) {
-        if let Handed::Yes(unmeasured) = handed {
+        if let Handed::Yes { unmeasured } = handed {
             r.origin = origin::VISUAL_CONTRAST;
-            if let Some(text) = unmeasured {
-                r.snippet = text.clone();
-            }
+            r.unmeasured = *unmeasured;
         }
     }
 }
@@ -903,12 +910,15 @@ fn hand_over(results: &mut [RawResult], handed: &[Handed]) {
 /// Where the pixels gave a verdict, pass or fail, theirs replaces the element
 /// pass's (`superseded`). Where they gave none (the routed budget was spent,
 /// the read was refused for a blocked reason, the candidate never reached a
-/// slot, the two shots differed), the element pass's verdict stands, but as
-/// advisory: it was computed from styles over paint the walk could not read,
-/// and the check meant to confirm it never ran (corpus decision
-/// r6-t5-unread-pixel-verdicts). Its text is unchanged. Only the verdicts
-/// `hand_over` moved to the visual-contrast origin are touched: the scan
-/// origin is what a replay reproduces, and a replay has no pixels.
+/// slot, the two shots differed), a verdict whose ratio was taken against a
+/// ground a picture, or paint the scan cannot model, covers is dropped: it
+/// measured nothing, and only a measured failing ratio reports (corpus
+/// decision 2 of round 13, which reverses r6-t5-unread-pixel-verdicts for
+/// this case). Any other stands, text unchanged, as advisory: it was computed
+/// from styles over paint the walk could not read, and the check meant to
+/// confirm it never ran (r6-t5). Only the verdicts `hand_over` moved to the
+/// visual-contrast origin are touched: the scan origin is what a replay
+/// reproduces, and a replay has no pixels.
 ///
 /// A selector that names several elements (a repeated id) is told apart by
 /// its match (`[n, count]`): `match_of` gives a result's, and a pixel verdict
@@ -919,15 +929,14 @@ fn settle_handed_over(
     match_of: impl Fn(&RawResult) -> Option<Value>,
 ) {
     let handed = |r: &RawResult| r.origin == origin::VISUAL_CONTRAST && r.id == "low-contrast";
-    if !superseded.is_empty() {
-        results.retain(|r| {
-            !(handed(r)
-                && r.selector.as_deref().is_some_and(|s| {
+    results.retain(|r| {
+        !(handed(r)
+            && (r.unmeasured
+                || r.selector.as_deref().is_some_and(|s| {
                     let m = match_of(r);
                     superseded.iter().any(|k| k.names(s, m.as_ref()))
-                }))
-        });
-    }
+                })))
+    });
     for r in results.iter_mut().filter(|r| handed(r)) {
         r.severity = impeccable_core::checks::rules::ADVISORY_SEVERITY.to_string();
     }
@@ -1414,7 +1423,8 @@ fn scan_loaded(
     // A hidden window paints no frames, and a screenshot of it can wait for
     // one that never comes: an attached page skips the pixel reads while it
     // is hidden, and they stop if one stalls. What they would have read
-    // keeps the element pass's verdict, as advisory.
+    // keeps the element pass's verdict, as advisory, unless that verdict
+    // measured nothing ([`settle_handed_over`]).
     let pixels_off = page.is_attached()
         && page
             .evaluate_value("document.visibilityState === 'hidden'")
@@ -1504,8 +1514,9 @@ const VISUAL_CONTRAST_MAX_ROUTED: f64 = 12.0;
 /// they have spent this long, or once this many in a row gave no verdict (a
 /// page whose carousels repaint every box between the two shots, at about a
 /// second a read on lpga.or.jp). What they leave unread keeps the element
-/// pass's verdict, as advisory ([`settle_handed_over`]). A page whose reads are quick (about
-/// 150ms each) spends under two seconds on all twelve.
+/// pass's verdict, as advisory, or drops one that measured nothing
+/// ([`settle_handed_over`]). A page whose reads are quick (about 150ms each)
+/// spends under two seconds on all twelve.
 const ROUTED_PIXEL_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 const ROUTED_PIXEL_MISSES: usize = 4;
 /// A read that gave no verdict counts toward [`ROUTED_PIXEL_MISSES`] only
@@ -1550,7 +1561,8 @@ fn capped_script_errors<'a>(errors: impl IntoIterator<Item = (&'a str, Option<&'
 /// decision r3-31-script-error-ad-tech). One of React's recoverable
 /// hydration errors reports as advisory with its text unchanged: React
 /// renders the page again on the client and the page shows complete (corpus
-/// decision r5-p13-script-error-hydration).
+/// decision r5-p13-script-error-hydration). So does a `play()` a later
+/// `pause()` interrupted: the video does what the last call asked.
 fn script_error_result(message: &str, source: Option<&str>) -> RawResult {
     let snippet = match source {
         Some(source) => format!("{message} ({source})"),
@@ -1566,10 +1578,14 @@ fn script_error_result(message: &str, source: Option<&str>) -> RawResult {
                 impeccable_core::third_party::tag_detail(&snippet, vendor),
             )
         },
-        None if impeccable_core::script_errors::react_recoverable_hydration_error(message).is_some() => RawResult {
-            severity: "advisory".to_string(),
-            ..RawResult::new(origin::SCRIPT_ERROR, "script-error".to_string(), snippet)
-        },
+        None if impeccable_core::script_errors::react_recoverable_hydration_error(message).is_some()
+            || impeccable_core::script_errors::media_play_interrupted(message) =>
+        {
+            RawResult {
+                severity: "advisory".to_string(),
+                ..RawResult::new(origin::SCRIPT_ERROR, "script-error".to_string(), snippet)
+            }
+        }
         None => RawResult::new(origin::SCRIPT_ERROR, "script-error".to_string(), snippet),
     }
 }
@@ -2393,7 +2409,8 @@ mod tests {
     }
 
     /// r6-t5-unread-pixel-verdicts: a handed-over verdict the pixels read is
-    /// replaced; one they did not read stands as advisory, text unchanged;
+    /// replaced; one they did not read stands as advisory, text unchanged,
+    /// unless it measured nothing (round 13 decision 2), when it drops;
     /// nothing else moves.
     #[test]
     fn unread_handed_over_verdicts_are_advisory() {
@@ -2402,13 +2419,26 @@ mod tests {
             severity: severity.to_string(),
             ..RawResult::new(origin, id.to_string(), format!("{id} on {sel}"))
         };
+        let unmeasured = |sel: &str| RawResult {
+            unmeasured: true,
+            ..result(origin::VISUAL_CONTRAST, "low-contrast", sel, "")
+        };
         let mut results = vec![
             result(origin::VISUAL_CONTRAST, "low-contrast", "#read", ""),
             result(origin::VISUAL_CONTRAST, "low-contrast", "#unread", ""),
+            unmeasured("#over-photo"),
+            unmeasured("#read-over-photo"),
             result(origin::SCAN, "low-contrast", "#scored", ""),
             result(origin::SCAN, "tiny-text", "#unread", ""),
         ];
-        settle_handed_over(&mut results, &[CandidateKey { selector: "#read".into(), matched: None }], |_| None);
+        settle_handed_over(
+            &mut results,
+            &[
+                CandidateKey { selector: "#read".into(), matched: None },
+                CandidateKey { selector: "#read-over-photo".into(), matched: None },
+            ],
+            |_| None,
+        );
         let summary: Vec<(&str, &str, &str)> =
             results.iter().map(|r| (r.origin, r.snippet.as_str(), r.severity.as_str())).collect();
         assert_eq!(

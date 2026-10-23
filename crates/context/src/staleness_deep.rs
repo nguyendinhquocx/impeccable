@@ -308,8 +308,13 @@ pub fn check_hook_installation(
                     ia,
                     broken.iter().map(|c| format!("`{}`", c)).collect::<Vec<_>>().join(", ")
                 ),
-                if *is_user {
-                    "Repoint this user-level manifest at the installed skill: `impeccable update --user` rewrites `~/.claude/settings.json` and `~/.codex/hooks.json`, but a hooks file under a custom `CODEX_HOME` has to be edited by hand."
+                // `update --user` rewrites only Claude's user manifest; other
+                // providers get project hooks, and a launcher entry in their
+                // home file is never repointed.
+                if *is_user && provider_id == "claude-code" {
+                    "Reinstall with `impeccable update --user`, which rewrites this user-level manifest against the skill's current location."
+                } else if *is_user {
+                    "Edit this user-level manifest by hand: point the command at the installed skill's launcher, or remove the Impeccable entry. `impeccable update --user` installs project hooks and does not repoint this file."
                 } else {
                     "Reinstall with `impeccable hooks on`, which rewrites the manifest against the skill's current location."
                 }
@@ -587,7 +592,7 @@ mod tests {
         let findings = check_hook_installation(&project, None, "claude-code", Some(&manifest));
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].id, "hook-script-missing");
-        assert!(findings[0].fix.contains("update --user"), "{:?}", findings[0].fix);
+        assert!(findings[0].fix.starts_with("Reinstall with `impeccable update --user`"), "{:?}", findings[0].fix);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -621,7 +626,7 @@ mod tests {
         let findings = check_hook_installation(&project, None, "codex", Some(&manifest));
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert_eq!(findings[0].id, "hook-script-missing");
-        assert!(findings[0].fix.contains("update --user"), "{:?}", findings[0].fix);
+        assert!(findings[0].fix.contains("by hand"), "{:?}", findings[0].fix);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
