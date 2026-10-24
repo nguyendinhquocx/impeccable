@@ -578,6 +578,15 @@ re!(
     )
 );
 
+/// Whether a selector styles a selection, hover or focus state: a stripe
+/// there marks the chosen item, not a card. The stripe scans skip it.
+pub(crate) fn selector_is_state_indicator(selector: &str) -> bool {
+    STATE_PSEUDO_TARGET_RE.is_match(selector)
+        || ARIA_SELECTED_TRUE_RE.is_match(selector)
+        || has_aria_current_not_false(selector)
+        || selector_has_state_word(selector, false)
+}
+
 // ─── scanCssTextForPseudoStripe ─────────────────────────────────────────────
 re!(COMMENT_RE, format!(r"/\*{ANY}*?\*/"));
 

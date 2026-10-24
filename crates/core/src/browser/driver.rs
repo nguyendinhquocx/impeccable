@@ -2134,15 +2134,23 @@ fn stripe_pseudo(detail: &str) -> Option<&'static str> {
 /// The stylesheet form of a pseudo-element stripe stands unless a host it
 /// resolves to already carries the element form for the same pseudo-element:
 /// that finding read the stripe off the rendered box and names the element,
-/// and the two describe one stripe.
+/// and the two describe one stripe. An inset box-shadow stripe reads the same
+/// way against the element form of an inset stripe.
 fn side_tab_page_form_stands(groups: &[FindingGroup], item: &PatternItem) -> bool {
     const STRIPE: &str = "pseudo-element stripe";
-    if !item.finding.detail.contains(STRIPE) {
-        return true;
-    }
+    const INSET: &str = "inset box-shadow";
     let Some(hosts) = item.matches.as_ref().filter(|m| !m.is_empty()) else {
         return true;
     };
+    if item.finding.detail.contains(INSET) {
+        return !groups
+            .iter()
+            .filter(|g| hosts.contains(&g.el))
+            .any(|g| g.findings.iter().any(|f| f.type_ == "side-tab" && f.detail.contains(INSET)));
+    }
+    if !item.finding.detail.contains(STRIPE) {
+        return true;
+    }
     let Some(pseudo) = stripe_pseudo(&item.finding.detail) else {
         return true;
     };
@@ -2809,6 +2817,7 @@ pub fn collect_browser_findings(dom: &dyn Dom, config: &BrowserConfig) -> Collec
         let mut findings: Vec<BrowserFinding> = Vec::new();
         findings.extend(hits(ec::check_element_borders_dom(dom, el)));
         findings.extend(hits(ec::check_element_pseudo_stripe_dom(dom, el)));
+        findings.extend(hits(ec::check_element_inset_stripe_dom(dom, el)));
         findings.extend(hits(ec::check_element_stripe_child_dom(dom, el)));
         findings.extend(hits(ec::check_element_colors_dom_in(dom, el, &mut color_seen, Some(&mockups))));
         findings.extend(hits(ec::check_element_motion_dom(dom, el)));
