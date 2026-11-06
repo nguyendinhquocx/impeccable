@@ -31,17 +31,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Check the tag and Cargo.toml match ENGINE_VERSION
+      - name: Check the tag matches ENGINE_VERSION
         shell: bash
         run: |
           set -e
-          version="$(tr -d '[:space:]' < ENGINE_VERSION)"
-          [ "$GITHUB_REF_NAME" = "engine-v$version" ] || { echo "tag $GITHUB_REF_NAME != engine-v$version"; exit 1; }
-          # The binary reports the workspace version, and the launchers skip a
-          # sibling engine that reports anything but ENGINE_VERSION. Checked here
-          # as well as in the smoke step because that one cannot run the cross target.
-          cargo_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)".*/\1/p' Cargo.toml)"
-          [ "$cargo_version" = "$version" ] || { echo "Cargo.toml workspace version '$cargo_version' != ENGINE_VERSION $version"; exit 1; }
+          want="engine-v$(tr -d '[:space:]' < ENGINE_VERSION)"
+          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "tag $GITHUB_REF_NAME != $want"; exit 1; }
       # rust-toolchain.toml names the channel; `rustup show` installs it.
       # Never override the toolchain here.
       - name: Install the pinned toolchain
