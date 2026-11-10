@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     outputs:
       core: ${{ steps.plan.outputs.core }}
       rust: ${{ steps.plan.outputs.rust }}
@@ -59,7 +59,7 @@ jobs:
 
   test-matrix:
     name: test (Node ${{ matrix.node-version }})
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: changes
     strategy:
       fail-fast: false
@@ -121,6 +121,17 @@ jobs:
         if: needs.changes.outputs.detector == 'true'
         run: cargo install wasm-pack --locked
 
+      # wasm-pack fetches wasm-bindgen and binaryen (wasm-opt) from GitHub
+      # releases on first use; cached, a GitHub release outage cannot fail the build.
+      - name: Cache wasm-pack tools
+        if: needs.changes.outputs.detector == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/.wasm-pack
+          key: ${{ runner.os }}-wasm-pack-tools-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-wasm-pack-tools-
+
       - name: Build extension
         if: needs.changes.outputs.detector == 'true'
         run: bun run build:extension
@@ -164,7 +175,7 @@ jobs:
   # The Rust workspace: the engine binary, the rule core, and every crate
   # behind them. Everything builds from source with no downloads.
   rust:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     steps:
@@ -220,7 +231,7 @@ jobs:
   # runs on developer laptops: tests/oracle.test.mjs skips cleanly when no
   # binary is present, so the default suite is silent about it on CI.
   oracle:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: changes
     if: needs.changes.outputs.oracle == 'true' || needs.changes.outputs.rust == 'true'
     steps:
@@ -264,7 +275,7 @@ jobs:
   # pin, or the launcher, the npm shim and `impeccable install` dead-end.
   # release.mjs hard-fails `release:skill`/`release:cli` on the same check.
   engine-release-ready:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -285,7 +296,7 @@ jobs:
           echo "::error title=Engine release not ready::The engine release for v$(cat ENGINE_VERSION) is not fully published (engine-v$(cat ENGINE_VERSION) release assets and/or the @impeccable/cli-<os>-<arch> npm platform packages). Publish the engine (bun run release:engine) and the platform packages (bun run release:platform-packages) before bumping ENGINE_VERSION on main or releasing the skill/CLI."
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: test-matrix
     if: always()
     steps:
@@ -298,7 +309,7 @@ jobs:
           echo "test matrix passed"
 
   cli-remote-e2e:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: changes
     if: needs.changes.outputs.cli_remote_e2e == 'true'
     steps:
@@ -333,7 +344,7 @@ jobs:
 
   live-e2e-smoke:
     name: live-e2e smoke (${{ matrix.group }})
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: changes
     if: needs.changes.outputs.live_e2e == 'true' && github.event_name != 'workflow_dispatch' && github.event_name != 'schedule'
     timeout-minutes: 15
@@ -413,7 +424,7 @@ jobs:
 
   live-e2e-full:
     name: live-e2e full (${{ matrix.group }})
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: changes
     if: needs.changes.outputs.live_e2e == 'true' && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     timeout-minutes: 25
@@ -497,7 +508,7 @@ jobs:
           if-no-files-found: ignore
 
   live-e2e-accept-cleanup:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: changes
     if: needs.changes.outputs.live_e2e_accept_cleanup == 'true'
     timeout-minutes: 15
@@ -575,7 +586,7 @@ jobs:
           bun run test:live-e2e-accept-cleanup
 
   live-svelte-adapter-deepseek:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: changes
     if: needs.changes.outputs.live_svelte_adapter_deepseek == 'true'
     timeout-minutes: 25
@@ -646,7 +657,7 @@ jobs:
         run: bun run test:live-svelte-adapter-deepseek
 
   skill-behavior:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     needs: changes
     if: needs.changes.outputs.skill_behavior == 'true' && github.event_name != 'pull_request'
     env:
@@ -679,7 +690,7 @@ jobs:
   skill-workflow:
     # Expensive, manually opted-in completion diagnostics. This does not
     # replace the multi-family skill-behavior protocol suite above.
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-impeccable
     if: github.event_name == 'workflow_dispatch' && inputs.skill_workflow
     timeout-minutes: 70
     env:
