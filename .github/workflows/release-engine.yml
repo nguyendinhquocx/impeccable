@@ -42,7 +42,7 @@ jobs:
       - name: Install the pinned toolchain
         shell: bash
         run: rustup show && rustup target add ${{ matrix.target }}
-      - if: runner.os == 'Linux'
+      - if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - if: matrix.cross
         run: cargo install cross --locked
@@ -120,7 +120,7 @@ jobs:
           if-no-files-found: error
   publish:
     needs: [build, sign-windows]
-    runs-on: namespace-profile-impeccable
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
