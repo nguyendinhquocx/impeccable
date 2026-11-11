@@ -20,30 +20,53 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # GITHUB_TOKEN không có quyền modify workflow files (security restriction).
-          # Merge upstream nhưng preserve .github/workflows/ về pre-merge state hoàn toàn.
           set -e
-          BRANCH="${{ github.event.repository.default_branch }}"
+          FORK_BRANCH="${{ github.event.repository.default_branch }}"
           UPSTREAM=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name')
-          git remote add upstream "https://github.com/$UPSTREAM.git"
-          git fetch upstream "$BRANCH"
+          if [ -z "$UPSTREAM" ] || [ "$UPSTREAM" = "null" ]; then
+            echo "No parent repository found for $GITHUB_REPOSITORY. Skipping."
+            exit 0
+          fi
+
+          echo "Configuring upstream remote: $UPSTREAM..."
+          git remote add upstream "https://github.com/$UPSTREAM.git" || true
+
+          UPSTREAM_BRANCH=$(gh api "repos/$UPSTREAM" --jq '.default_branch // "main"')
+          echo "Fetching upstream/$UPSTREAM_BRANCH..."
+          git fetch upstream "$UPSTREAM_BRANCH"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          PRE_MERGE=$(git rev-parse HEAD)
-          # Merge với -X ours: hunk conflict giữ fork version, non-conflict apply upstream
-          if ! git merge "upstream/$BRANCH" --no-edit -X ours; then
-            # Có conflict (thường modify/delete ở workflow files) → resolve giữ PRE_MERGE
-            git diff --name-only --diff-filter=U | while read f; do
-              git checkout "$PRE_MERGE" -- "$f" 2>/dev/null || rm -f "$f"
-              git add "$f" 2>/dev/null || true
-            done
-            git commit --no-edit --no-verify || true
+
+          # Kiểm tra xem fork có commit tùy biến riêng (ngoài file sync workflow) hay không
+          USER_COMMITS=$(git log "upstream/$UPSTREAM_BRANCH..HEAD" --oneline -- . ':!.github/workflows/sync-upstream.yml' || true)
+
+          if [ -n "$USER_COMMITS" ]; then
+            echo "=== CUSTOM FORK DETECTED ==="
+            echo "Found commits unique to fork (excluding sync workflow):"
+            echo "$USER_COMMITS"
+            echo ""
+            echo "Protecting $FORK_BRANCH branch! Syncing upstream directly to 'upstream' branch..."
+            git push origin "upstream/$UPSTREAM_BRANCH:refs/heads/upstream" --force
+            echo "Sync completed: 'upstream' branch is up-to-date with upstream/$UPSTREAM_BRANCH."
+            echo "Your $FORK_BRANCH branch remains 100% untouched."
+          else
+            echo "=== CLEAN FORK DETECTED ==="
+            echo "No custom code changes found. Syncing $FORK_BRANCH with upstream..."
+            PRE_MERGE=$(git rev-parse HEAD)
+            if ! git merge "upstream/$UPSTREAM_BRANCH" --no-edit -X ours; then
+              git diff --name-only --diff-filter=U | while read f; do
+                git checkout "$PRE_MERGE" -- "$f" 2>/dev/null || rm -f "$f"
+                git add "$f" 2>/dev/null || true
+              done
+              git commit --no-edit --no-verify || true
+            fi
+            # Preserve workflow file
+            git rm -rf .github/workflows/sync-upstream.yml 2>/dev/null || true
+            git checkout "$PRE_MERGE" -- .github/workflows/sync-upstream.yml 2>/dev/null || true
+            git add .github/workflows/sync-upstream.yml 2>/dev/null || true
+            git diff --cached --quiet HEAD || git commit -m "chore: preserve fork sync workflow" --no-verify || true
+            git push origin "$FORK_BRANCH"
+            echo "Sync completed: $FORK_BRANCH updated to match upstream."
           fi
-          # Preserve .github/workflows/ về PRE_MERGE state (loại mọi change của upstream)
-          # git rm -rf để remove cả files mới upstream add (không có ở PRE_MERGE)
-          git rm -rf .github/workflows/ 2>/dev/null || true
-          git checkout "$PRE_MERGE" -- .github/workflows/ 2>/dev/null || true
-          git add -A
-          git diff --cached --quiet HEAD || git commit -m "chore: preserve fork workflow files" --no-verify || true
-          git push origin "$BRANCH"
-          echo "sync ok"
+          echo "All done."
