@@ -8,16 +8,9 @@ name: release-engine
 # ENGINE_VERSION, the npm platform-package pins, and a clean tree, then
 # pushes the tag. Third-party actions are pinned to commit SHAs so a
 # moved tag cannot swap the code this workflow runs.
-#
-# Manual run (workflow_dispatch, no inputs): a build-only rehearsal. It runs the
-# build matrix and smoke checks on the chosen ref and uploads run-scoped
-# artifacts. Signing and publication run only on a tag push, so a manual run
-# never reaches the windows-signing environment, its OIDC identity or
-# contents: write.
 on:
   push:
     tags: ['engine-v*']
-  workflow_dispatch:
 # Same-run artifact transfers use ACTIONS_RUNTIME_TOKEN, not GITHUB_TOKEN;
 # they do not require actions: read/write. Keep downloads scoped to this run.
 permissions:
@@ -68,7 +61,6 @@ jobs:
           if-no-files-found: error
   sign-windows:
     needs: build
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/engine-v')
     runs-on: windows-latest
     timeout-minutes: 15
     environment: windows-signing
