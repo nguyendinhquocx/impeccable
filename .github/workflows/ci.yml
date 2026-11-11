@@ -213,6 +213,8 @@ jobs:
           node-version: 24
       - name: Exercise Windows launcher downloads and verification
         run: node --test tests/launcher-download.test.mjs
+      - name: Exercise Windows plugin hook commands
+        run: node --test tests/hook-build-windows.test.mjs
 
   # Behavior gate: replays the tests/oracle/ goldens against a release build
   # of the engine from THIS checkout (so a PR is judged on its own source,
